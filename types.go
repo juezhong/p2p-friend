@@ -14,9 +14,8 @@ import (
 var appVersion = "dev"
 
 const (
-	protocolMagic   = "P2PF4"
-	protocolVersion = 4
-	defaultPort     = "5000"
+	protocolMagic   = "P2PF6"
+	protocolVersion = 6
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
@@ -35,13 +34,6 @@ const (
 	chunkSize       = 256 * 1024
 	maxFramePayload = 16 * 1024 * 1024
 )
-
-type connectCode struct {
-	Version     int    `json:"v"`
-	Address     string `json:"a"`
-	Token       string `json:"t"`
-	Fingerprint string `json:"f"`
-}
 
 type wireFrame struct {
 	Type    byte
