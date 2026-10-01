@@ -59,8 +59,7 @@ func (s *peerSession) sendPath(fullPath, prefix string) error {
 		if err := w.Flush(); err != nil {
 			return err
 		}
-		consolePrintf("[%s] %s (%s)
-", prefix, fullPath, humanBytes(total))
+		consolePrintf("[%s] %s (%s)\n", prefix, fullPath, humanBytes(total))
 		return sendSessionWriter(w, entries, total, "["+prefix+"]")
 	})
 }
@@ -72,13 +71,10 @@ func (s *peerSession) sendRequested(request string) {
 		_ = s.sendError(fmt.Sprintf("get %q 被拒绝: %v", request, err))
 		return
 	}
-	consolePrintf("
-[GET->SEND] 对方请求: %s
-", request)
+	consolePrintf("\n[GET->SEND] 对方请求: %s\n", request)
 	if err := s.sendPath(full, "GET->SEND"); err != nil {
 		_ = s.sendError(fmt.Sprintf("无法发送 %q: %v", request, err))
-		consolePrintf("[GET->SEND] 失败: %v
-", err)
+		consolePrintf("[GET->SEND] 失败: %v\n", err)
 		return
 	}
 	consolePrintln("[GET->SEND] 完成。")
@@ -124,9 +120,7 @@ func (s *peerSession) readLoop() {
 		typ, err := s.br.ReadByte()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedErr(err) {
-				consolePrintf("
-[连接] 读取失败: %v
-", err)
+				consolePrintf("\n[连接] 读取失败: %v\n", err)
 			}
 			return
 		}
@@ -134,31 +128,22 @@ func (s *peerSession) readLoop() {
 		case msgTransfer:
 			label, err := readText(s.br)
 			if err != nil {
-				consolePrintf("
-[RECV] 无法读取传输信息: %v
-", err)
+				consolePrintf("\n[RECV] 无法读取传输信息: %v\n", err)
 				return
 			}
 			var total uint64
 			if err := binary.Read(s.br, binary.BigEndian, &total); err != nil {
-				consolePrintf("
-[RECV] 无法读取文件大小: %v
-", err)
+				consolePrintf("\n[RECV] 无法读取文件大小: %v\n", err)
 				return
 			}
 			if total > uint64(^uint64(0)>>1) {
-				consolePrintln("
-[RECV] 传输大小超过实现限制。")
+				consolePrintln("\n[RECV] 传输大小超过实现限制。")
 				return
 			}
 			out := s.getCwd()
-			consolePrintf("
-[RECV] %s -> %s
-", label, out)
+			consolePrintf("\n[RECV] %s -> %s\n", label, out)
 			if err := receiveSessionReader(s.br, out, s.getOverwrite(), int64(total), "[RECV]"); err != nil {
-				consolePrintf("
-[RECV] 失败: %v
-", err)
+				consolePrintf("\n[RECV] 失败: %v\n", err)
 				consolePrintln("[RECV] 为避免协议流错位，本次连接将关闭。")
 				return
 			}
@@ -166,31 +151,22 @@ func (s *peerSession) readLoop() {
 		case msgGetRequest:
 			request, err := readText(s.br)
 			if err != nil {
-				consolePrintf("
-[GET] 无法读取请求: %v
-", err)
+				consolePrintf("\n[GET] 无法读取请求: %v\n", err)
 				return
 			}
 			go s.sendRequested(request)
 		case msgError:
 			text, err := readText(s.br)
 			if err != nil {
-				consolePrintf("
-[PEER] 无法读取错误信息: %v
-", err)
+				consolePrintf("\n[PEER] 无法读取错误信息: %v\n", err)
 				return
 			}
-			consolePrintf("
-[PEER] %s
-", text)
+			consolePrintf("\n[PEER] %s\n", text)
 		case msgBye:
-			consolePrintln("
-[连接] 对方已退出会话。")
+			consolePrintln("\n[连接] 对方已退出会话。")
 			return
 		default:
-			consolePrintf("
-[连接] 未知协议消息: %d
-", typ)
+			consolePrintf("\n[连接] 未知协议消息: %d\n", typ)
 			return
 		}
 	}
@@ -269,8 +245,7 @@ func (s *peerSession) listLocal(arg string) error {
 		return err
 	}
 	if !st.IsDir() {
-		consolePrintf("%10s  %s
-", humanBytes(st.Size()), filepath.Base(path))
+		consolePrintf("%10s  %s\n", humanBytes(st.Size()), filepath.Base(path))
 		return nil
 	}
 	entries, err := os.ReadDir(path)
@@ -280,16 +255,13 @@ func (s *peerSession) listLocal(arg string) error {
 	for _, e := range entries {
 		info, err := e.Info()
 		if err != nil {
-			consolePrintf("?          %s
-", e.Name())
+			consolePrintf("?          %s\n", e.Name())
 			continue
 		}
 		if e.IsDir() {
-			consolePrintf("<DIR>      %s%c
-", e.Name(), os.PathSeparator)
+			consolePrintf("<DIR>      %s%c\n", e.Name(), os.PathSeparator)
 		} else {
-			consolePrintf("%10s  %s
-", humanBytes(info.Size()), e.Name())
+			consolePrintf("%10s  %s\n", humanBytes(info.Size()), e.Name())
 		}
 	}
 	return nil
