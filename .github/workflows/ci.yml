@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Linux amd64
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+
+      - name: Compile Windows amd64 tests
+        run: GOOS=windows GOARCH=amd64 go test -c -o /tmp/p2p-friend-windows.test.exe .

@@ -1,66 +1,10 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
-	"hash"
-	"io"
 	"strings"
 	"time"
 )
-
-func writeText(w io.Writer, s string) error {
-	b := []byte(s)
-	if len(b) > maxTextBytes {
-		return fmt.Errorf("text too long: %d bytes", len(b))
-	}
-	if err := binary.Write(w, binary.BigEndian, uint32(len(b))); err != nil {
-		return err
-	}
-	_, err := w.Write(b)
-	return err
-}
-
-func readText(r io.Reader) (string, error) {
-	var n uint32
-	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-		return "", err
-	}
-	if n > maxTextBytes {
-		return "", fmt.Errorf("text too long: %d bytes", n)
-	}
-	b := make([]byte, n)
-	if _, err := io.ReadFull(r, b); err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-func copyExactWithProgress(dst io.Writer, src io.Reader, h hash.Hash, size int64, buf []byte, p *progress) error {
-	remaining := size
-	for remaining > 0 {
-		want := int64(len(buf))
-		if remaining < want {
-			want = remaining
-		}
-		n, err := io.ReadFull(src, buf[:want])
-		if err != nil {
-			return err
-		}
-		chunk := buf[:n]
-		if _, err := dst.Write(chunk); err != nil {
-			return err
-		}
-		if _, err := h.Write(chunk); err != nil {
-			return err
-		}
-		remaining -= int64(n)
-		p.Done += int64(n)
-		p.CurrentDone += int64(n)
-		p.print(false)
-	}
-	return nil
-}
 
 func (p *progress) print(force bool) {
 	now := time.Now()
@@ -77,9 +21,9 @@ func (p *progress) print(force bool) {
 	defer consoleMu.Unlock()
 	if p.Total > 0 {
 		percent := float64(p.Done) * 100 / float64(p.Total)
-		fmt.Printf("\r%s %-28s %6.2f%%  %s / %s  %s/s", p.Prefix, truncate(p.Current, 28), percent, humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
+		fmt.Printf("\r%s %-30s %6.2f%%  %s / %s  %s/s", p.Prefix, truncate(p.Current, 30), percent, humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
 	} else {
-		fmt.Printf("\r%s %-28s %s  %s/s", p.Prefix, truncate(p.Current, 28), humanBytes(p.Done), humanBytes(int64(speed)))
+		fmt.Printf("\r%s %-30s %s  %s/s", p.Prefix, truncate(p.Current, 30), humanBytes(p.Done), humanBytes(int64(speed)))
 	}
 	if force {
 		fmt.Println()
@@ -117,7 +61,9 @@ func isClosedErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "use of closed network connection") || strings.Contains(s, "forcibly closed") || strings.Contains(s, "connection reset")
+	return strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "connection reset")
 }
 
 func consolePrintf(format string, args ...any) {

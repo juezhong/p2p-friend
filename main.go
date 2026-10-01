@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 )
@@ -21,7 +23,7 @@ func main() {
 			fmt.Printf("p2p-friend v%s\n", appVersion)
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "v%s 已改为交互模式，请直接运行：%s\n", appVersion, filepath.Base(os.Args[0]))
+			fmt.Fprintf(os.Stderr, "v%s 使用交互模式，请直接运行：%s\n", appVersion, filepath.Base(os.Args[0]))
 			os.Exit(2)
 		}
 	}
@@ -35,25 +37,23 @@ func main() {
 func printHelp() {
 	fmt.Printf(`p2p-friend v%s - 直接 P2P 文件/目录传输
 
-直接运行程序，然后选择：
-  1. 创建会话（生成连接码）
-  2. 加入会话（输入连接码）
+启动后选择：
+  1. 创建会话（本机监听，需要对方能直连本机）
+  2. 加入会话（本机主动连接）
 
-连接后双方都可使用：
-  put <path>   发送本地文件/目录给对方
-  get <path>   从对方当前目录获取文件/目录
-  ls [path]    查看本地目录
-  cd <path>    修改本地当前目录
-  pwd          显示本地当前目录
-  overwrite on|off  是否允许覆盖收到的同名文件
-  help         显示命令帮助
-  quit / exit  断开并退出
+连接后采用类似 SFTP 的命令：
+  pwd / ls / cd       操作远端目录
+  lpwd / lls / lcd    操作本地目录
+  put <local> [remote] 发送到远端，可指定远端绝对路径
+  get <remote> [local] 获取远端文件/目录，可使用远端绝对路径
+  cancel              取消当前传输
+  Ctrl-C              取消当前传输，不退出会话
+  quit / exit          断开并退出
 
-说明：
-  * 目录会递归传输。
-  * 文件数据通过 TLS/TCP 在两台机器之间直接传输，不经过中继。
-  * get 只能访问对方“当前目录”及其子目录，不能使用绝对路径或 ../ 越界。
-  * 创建会话的一方需要能够被另一方直接连接；公网 IPv6 仍可能受主机/路由器防火墙影响。
+注意：
+  * P2P4 连接码允许会话双方浏览和访问对方当前用户有权限访问的绝对路径。
+  * 不使用 TURN/relay；文件数据始终点对点直传。
+  * 如果一个方向 IPv6 TCP 超时，让能够被直连的一方创建会话，另一方加入。
 `, appVersion)
 }
 
@@ -70,9 +70,11 @@ func runInteractive() error {
 
 	consolePrintf("\nP2P Friend v%s\n", appVersion)
 	consolePrintln("========================================")
-	consolePrintln("1) 创建会话（生成连接码）")
-	consolePrintln("2) 加入会话（输入连接码）")
+	consolePrintln("1) 创建会话（本机监听）")
+	consolePrintln("2) 加入会话（本机主动连接）")
 	consolePrintln("3) 退出")
+	consolePrintln("")
+	consolePrintln("连接提示：如果 A→B 能连接而 B→A 超时，就让 B 创建会话、A 加入。")
 	consolePrintln("")
 
 	for {
@@ -99,20 +101,19 @@ func runInteractive() error {
 }
 
 func runHost(in *bufio.Reader, cwd string) error {
-	listenAddr := ":" + defaultPort
-	ln, token, fingerprintHex, err := openTLSListener(listenAddr)
+	ln, token, fingerprintHex, err := openTLSListener(":" + defaultPort)
 	if err != nil {
 		return fmt.Errorf("创建会话失败（TCP %s）：%w", defaultPort, err)
 	}
 	defer ln.Close()
 
-	consolePrintf("\n[创建会话] 本地目录: %s\n", cwd)
+	consolePrintf("\n[创建会话] 初始目录: %s\n", cwd)
 	consolePrintf("[创建会话] 会话端口: %s\n\n", defaultPort)
 	if err := printConnectionCodes(ln, token, fingerprintHex); err != nil {
 		return err
 	}
-	consolePrintln("把上面一个可用的 P2P3-... 连接码发给朋友。")
-	consolePrintln("等待朋友加入...（Ctrl+C 可取消）")
+	consolePrintln("把上面一个可用的 P2P4-... 连接码发给朋友。")
+	consolePrintln("等待朋友加入...（这里 Ctrl-C 会结束等待）")
 
 	conn, err := ln.Accept()
 	if err != nil {
@@ -127,7 +128,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P3-... 连接码。")
+	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P4-... 连接码。")
 	consolePrintf("连接码: ")
 	line, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -151,149 +152,228 @@ func runJoin(in *bufio.Reader, cwd string) error {
 }
 
 func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
-	s := &peerSession{
-		conn:     conn,
-		br:       bufio.NewReaderSize(conn, copyBufferSize),
-		bw:       bufio.NewWriterSize(conn, copyBufferSize),
-		cwd:      cwd,
-		roleName: roleName,
-		closed:   make(chan struct{}),
-	}
+	s := initPeerSession(conn, roleName, cwd)
 	defer s.close(false)
-
 	go s.readLoop()
 
+	if remote, err := s.remotePwd(); err == nil {
+		s.setRemoteCwd(remote)
+	}
+
 	consolePrintln("")
-	consolePrintln("会话已就绪。双方都可以连续发送/接收，quit/exit 才退出。")
-	consolePrintln("  put <path>  = 发送本地文件/目录")
-	consolePrintln("  get <path>  = 从对方当前目录获取")
-	consolePrintln("  help        = 查看全部命令")
+	consolePrintln("会话已就绪。pwd/ls/cd 操作远端；lpwd/lls/lcd 操作本地。")
+	consolePrintln("put/get 都支持绝对路径；Ctrl-C 只取消当前传输，不退出会话。")
+	consolePrintln("警告：连接码持有者可访问本进程用户权限范围内的绝对路径。")
+	consolePrintln("输入 help 查看命令。")
 	consolePrintln("")
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		for {
+			select {
+			case <-s.closed:
+				return
+			case <-sigCh:
+				if s.cancelActive("用户按 Ctrl-C 取消传输") {
+					consolePrintln("\n[CANCEL] 已请求取消当前传输，会话保持连接。")
+				} else {
+					consolePrintln("\n[CANCEL] 当前没有活动传输；要退出请使用 quit/exit。")
+				}
+			}
+		}
+	}()
 
 	lines := make(chan string)
 	readErr := make(chan error, 1)
 	go func() {
 		for {
 			line, err := in.ReadString('\n')
+			if len(line) > 0 {
+				lines <- line
+			}
 			if err != nil {
-				if len(line) > 0 {
-					lines <- line
-				}
 				readErr <- err
 				return
 			}
-			lines <- line
 		}
 	}()
 
 	for {
-		consolePrintf("p2p[%s|put发送/get接收]> ", s.roleName)
+		remote := s.getRemoteCwd()
+		if remote == "" {
+			remote = "?"
+		}
+		consolePrintf("p2p[%s remote:%s]> ", s.roleName, remote)
+		var line string
 		select {
 		case <-s.closed:
 			consolePrintln("\n连接已关闭。")
 			return nil
 		case err := <-readErr:
 			if errors.Is(err, io.EOF) {
-				_ = s.sendBye()
+				_ = s.writeFrame(frameBye, 0, nil)
 				return nil
 			}
 			return err
-		case line := <-lines:
-			cmd, arg := splitCommand(line)
-			if cmd == "" {
+		case line = <-lines:
+		}
+		args, err := parseCommandLine(line)
+		if err != nil {
+			consolePrintf("命令解析失败: %v\n", err)
+			continue
+		}
+		if len(args) == 0 {
+			continue
+		}
+		cmd := strings.ToLower(args[0])
+		switch cmd {
+		case "pwd":
+			if len(args) != 1 {
+				consolePrintln("用法: pwd")
 				continue
 			}
-			switch strings.ToLower(cmd) {
-			case "put":
-				if arg == "" {
-					consolePrintln("用法: put <本地文件或目录>")
-					continue
-				}
-				if err := s.put(arg); err != nil {
-					consolePrintf("[SEND] 失败: %v\n", err)
-				} else {
-					consolePrintln("[SEND] 完成。")
-				}
-			case "get":
-				if arg == "" {
-					consolePrintln("用法: get <对方当前目录下的相对路径>")
-					continue
-				}
-				if err := s.requestGet(arg); err != nil {
-					consolePrintf("[GET] 请求失败: %v\n", err)
-				} else {
-					consolePrintf("[GET] 已请求: %s\n", arg)
-				}
-			case "pwd":
-				consolePrintln(s.getCwd())
-			case "cd":
-				if arg == "" {
-					consolePrintln("用法: cd <本地目录>")
-					continue
-				}
-				if err := s.changeDir(arg); err != nil {
-					consolePrintf("cd: %v\n", err)
-				} else {
-					consolePrintf("本地目录: %s\n", s.getCwd())
-				}
-			case "ls", "dir":
-				if err := s.listLocal(arg); err != nil {
-					consolePrintf("ls: %v\n", err)
-				}
-			case "overwrite":
-				if err := s.setOverwrite(arg); err != nil {
-					consolePrintln(err.Error())
-				}
-			case "status":
-				consolePrintf("角色: %s\n", s.roleName)
-				consolePrintf("本地目录: %s\n", s.getCwd())
-				consolePrintf("覆盖同名文件: %s\n", onOff(s.getOverwrite()))
-				consolePrintf("连接: %s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
-			case "help", "?":
-				printShellHelp()
-			case "quit", "exit", "bye":
-				_ = s.sendBye()
-				s.close(false)
-				return nil
-			default:
-				consolePrintf("未知命令: %s（输入 help 查看命令）\n", cmd)
+			p, err := s.remotePwd()
+			if err != nil {
+				consolePrintf("pwd: %v\n", err)
+			} else {
+				consolePrintln(p)
 			}
+		case "ls", "dir":
+			if len(args) > 2 {
+				consolePrintln("用法: ls [remote-path]")
+				continue
+			}
+			path := ""
+			if len(args) == 2 {
+				path = args[1]
+			}
+			if err := s.remoteList(path); err != nil {
+				consolePrintf("ls: %v\n", err)
+			}
+		case "cd":
+			if len(args) != 2 {
+				consolePrintln("用法: cd <remote-path|->")
+				continue
+			}
+			if err := s.remoteCd(args[1]); err != nil {
+				consolePrintf("cd: %v\n", err)
+			}
+		case "lpwd":
+			consolePrintln(s.getLocalCwd())
+		case "lls", "ldir":
+			if len(args) > 2 {
+				consolePrintln("用法: lls [local-path]")
+				continue
+			}
+			path := ""
+			if len(args) == 2 {
+				path = args[1]
+			}
+			if err := s.localList(path); err != nil {
+				consolePrintf("lls: %v\n", err)
+			}
+		case "lcd":
+			if len(args) != 2 {
+				consolePrintln("用法: lcd <local-path|->")
+				continue
+			}
+			if err := s.localCd(args[1]); err != nil {
+				consolePrintf("lcd: %v\n", err)
+			}
+		case "put":
+			if len(args) < 2 || len(args) > 3 {
+				consolePrintln("用法: put <local-path> [remote-path]")
+				continue
+			}
+			remoteDest := ""
+			if len(args) == 3 {
+				remoteDest = args[2]
+			}
+			if err := s.put(args[1], remoteDest); err != nil {
+				if errors.Is(err, context.Canceled) {
+					consolePrintf("[SEND] 已取消: %v\n", err)
+				} else {
+					consolePrintf("[SEND] 失败: %v\n", err)
+				}
+			} else {
+				consolePrintln("[SEND] 完成。")
+			}
+		case "get":
+			if len(args) < 2 || len(args) > 3 {
+				consolePrintln("用法: get <remote-path> [local-path]")
+				continue
+			}
+			localDest := ""
+			if len(args) == 3 {
+				localDest = args[2]
+			}
+			if err := s.get(args[1], localDest); err != nil {
+				if errors.Is(err, context.Canceled) {
+					consolePrintf("[GET] 已取消: %v\n", err)
+				} else {
+					consolePrintf("[GET] 失败: %v\n", err)
+				}
+			} else {
+				consolePrintln("[GET] 完成。")
+			}
+		case "cancel":
+			if s.cancelActive("用户执行 cancel") {
+				consolePrintln("[CANCEL] 已请求取消当前传输。")
+			} else {
+				consolePrintln("[CANCEL] 当前没有活动传输。")
+			}
+		case "overwrite":
+			if len(args) != 2 {
+				consolePrintln("用法: overwrite on|off")
+				continue
+			}
+			if err := s.setOverwrite(args[1]); err != nil {
+				consolePrintln(err.Error())
+			}
+		case "status":
+			s.status()
+		case "help", "?":
+			printShellHelp()
+		case "quit", "exit", "bye":
+			_ = s.writeFrame(frameBye, 0, nil)
+			s.close(false)
+			return nil
+		default:
+			consolePrintf("未知命令: %s（输入 help 查看命令）\n", args[0])
 		}
 	}
 }
 
 func printShellHelp() {
-	consolePrintln(`命令：
-  put <path>          发送本地文件或目录，目录自动递归
-  get <path>          获取对方当前目录中的文件或目录
-  ls [path]           查看本地目录
-  cd <path>           修改本地当前目录
-  pwd                 显示本地当前目录
-  overwrite on|off    允许/禁止覆盖收到的同名文件（默认 off）
-  status              显示当前会话状态
-  help                显示帮助
-  quit / exit         断开并退出
+	consolePrintln(`远端命令（类似 SFTP）：
+  pwd                         显示远端当前目录
+  ls [remote-path]            查看远端目录/文件，支持绝对路径
+  cd <remote-path|->          修改远端当前目录，cd - 返回上一个目录
 
-注意：
-  get 的路径必须是对方当前目录下的相对路径，禁止绝对路径和 ../。
-  对方执行 cd 后，会改变其可被 get 的目录范围，也会改变其接收文件的位置。`)
-}
+本地命令：
+  lpwd                        显示本地当前目录
+  lls [local-path]            查看本地目录/文件
+  lcd <local-path|->          修改本地当前目录，lcd - 返回上一个目录
 
-func splitCommand(line string) (string, string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return "", ""
-	}
-	idx := strings.IndexAny(line, " \t")
-	if idx < 0 {
-		return line, ""
-	}
-	cmd := line[:idx]
-	arg := strings.TrimSpace(line[idx+1:])
-	if len(arg) >= 2 {
-		if (arg[0] == '"' && arg[len(arg)-1] == '"') || (arg[0] == '\'' && arg[len(arg)-1] == '\'') {
-			arg = arg[1 : len(arg)-1]
-		}
-	}
-	return cmd, arg
+传输：
+  put <local> [remote]        发送文件/目录；remote 可为绝对路径
+  get <remote> [local]        获取文件/目录；remote 可为绝对路径
+  cancel                      取消当前传输
+  Ctrl-C                      等同 cancel，不退出会话
+
+其他：
+  overwrite on|off            是否允许覆盖本机已有接收文件（默认 off）
+  status                      显示连接和目录状态
+  help                        显示帮助
+  quit / exit                 断开并退出
+
+示例：
+  ls "D:\\BaiduNetdiskDownload"
+  cd "D:\\BaiduNetdiskDownload\\【正点原子】"
+  get "D:\\BaiduNetdiskDownload\\manual.pdf" ./manual.pdf
+  put ./build.tar "D:\\incoming\\build.tar"
+
+安全提示：远端绝对路径访问不再限制在初始目录；请只把连接码交给可信任的人。`)
 }

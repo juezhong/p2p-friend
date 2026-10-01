@@ -35,11 +35,10 @@ func openTLSListener(listenAddr string) (net.Listener, []byte, string, error) {
 		return nil, nil, "", fmt.Errorf("generate token: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
+	ln, err := tls.Listen("tcp", listenAddr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
-	}
-	ln, err := tls.Listen("tcp", listenAddr, tlsConfig)
+	})
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
@@ -122,7 +121,7 @@ func dialPeer(rawCode string) (net.Conn, []byte, error) {
 
 	consolePrintf("正在连接 %s ...\n", code.Address)
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true, // 使用连接码中的 SHA-256 证书指纹校验临时证书。
+		InsecureSkipVerify: true, // 使用连接码中的 SHA-256 指纹固定临时证书。
 		MinVersion:         tls.VersionTLS13,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) != 1 {
@@ -157,7 +156,7 @@ func connectionHint(addr string) string {
 		return "\n提示：这是私有 IPv4，只能用于同一局域网/VPN。公网请优先使用 global IPv6 连接码。"
 	}
 	if ip.To4() == nil {
-		return "\n提示：IPv6 TCP 在文件传输前就失败了，通常是创建会话一方的主机/路由器 IPv6 入站防火墙阻断。让另一方创建会话再试。"
+		return "\n提示：IPv6 TCP 在文件传输前就失败，通常是创建会话一方的主机/路由器 IPv6 入站防火墙阻断。让能够被直连的一方创建会话，另一方选择加入。"
 	}
 	return ""
 }
@@ -232,7 +231,7 @@ func generateCertificate() (tls.Certificate, []byte, error) {
 	now := time.Now()
 	template := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "p2p-file ephemeral"},
+		Subject:      pkix.Name{CommonName: "p2p-friend ephemeral"},
 		NotBefore:    now.Add(-time.Minute),
 		NotAfter:     now.Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -316,16 +315,16 @@ func encodeCode(c connectCode) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "P2P3-" + base64.RawURLEncoding.EncodeToString(b), nil
+	return "P2P4-" + base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func decodeCode(s string) (connectCode, error) {
 	var c connectCode
 	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "P2P3-") {
-		return c, errors.New("缺少 P2P3- 前缀；v0.3 与旧版 P2P1/P2P2 不兼容")
+	if !strings.HasPrefix(s, "P2P4-") {
+		return c, errors.New("缺少 P2P4- 前缀；v0.4 与 P2P3 旧协议不兼容")
 	}
-	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, "P2P3-"))
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, "P2P4-"))
 	if err != nil {
 		return c, err
 	}
