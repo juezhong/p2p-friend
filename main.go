@@ -18,19 +18,16 @@ func main() {
 			printHelp()
 			return
 		case "-v", "--version", "version":
-			fmt.Printf("p2p-friend v%s
-", appVersion)
+			fmt.Printf("p2p-friend v%s\n", appVersion)
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "v%s 已改为交互模式，请直接运行：%s
-", appVersion, filepath.Base(os.Args[0]))
+			fmt.Fprintf(os.Stderr, "v%s 已改为交互模式，请直接运行：%s\n", appVersion, filepath.Base(os.Args[0]))
 			os.Exit(2)
 		}
 	}
 
 	if err := runInteractive(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v
-", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -71,9 +68,7 @@ func runInteractive() error {
 		return err
 	}
 
-	consolePrintf("
-P2P Friend v%s
-", appVersion)
+	consolePrintf("\nP2P Friend v%s\n", appVersion)
 	consolePrintln("========================================")
 	consolePrintln("1) 创建会话（生成连接码）")
 	consolePrintln("2) 加入会话（输入连接码）")
@@ -82,8 +77,7 @@ P2P Friend v%s
 
 	for {
 		consolePrintf("请选择 [1/2/3]: ")
-		line, err := in.ReadString('
-')
+		line, err := in.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
@@ -112,12 +106,8 @@ func runHost(in *bufio.Reader, cwd string) error {
 	}
 	defer ln.Close()
 
-	consolePrintf("
-[创建会话] 本地目录: %s
-", cwd)
-	consolePrintf("[创建会话] 会话端口: %s
-
-", defaultPort)
+	consolePrintf("\n[创建会话] 本地目录: %s\n", cwd)
+	consolePrintf("[创建会话] 会话端口: %s\n\n", defaultPort)
 	if err := printConnectionCodes(ln, token, fingerprintHex); err != nil {
 		return err
 	}
@@ -132,18 +122,14 @@ func runHost(in *bufio.Reader, cwd string) error {
 		conn.Close()
 		return err
 	}
-	consolePrintf("
-已建立直接加密连接：%s <-> %s
-", conn.LocalAddr(), conn.RemoteAddr())
+	consolePrintf("\n已建立直接加密连接：%s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
 	return runPeerShell(conn, "HOST", cwd, in)
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("
-[加入会话] 请粘贴朋友发来的 P2P3-... 连接码。")
+	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P3-... 连接码。")
 	consolePrintf("连接码: ")
-	line, err := in.ReadString('
-')
+	line, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
@@ -160,9 +146,7 @@ func runJoin(in *bufio.Reader, cwd string) error {
 		conn.Close()
 		return err
 	}
-	consolePrintf("
-已建立直接加密连接：%s <-> %s
-", conn.LocalAddr(), conn.RemoteAddr())
+	consolePrintf("\n已建立直接加密连接：%s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
 	return runPeerShell(conn, "JOIN", cwd, in)
 }
 
@@ -190,8 +174,7 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 	readErr := make(chan error, 1)
 	go func() {
 		for {
-			line, err := in.ReadString('
-')
+			line, err := in.ReadString('\n')
 			if err != nil {
 				if len(line) > 0 {
 					lines <- line
@@ -207,8 +190,7 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 		consolePrintf("p2p[%s|put发送/get接收]> ", s.roleName)
 		select {
 		case <-s.closed:
-			consolePrintln("
-连接已关闭。")
+			consolePrintln("\n连接已关闭。")
 			return nil
 		case err := <-readErr:
 			if errors.Is(err, io.EOF) {
@@ -228,8 +210,7 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 					continue
 				}
 				if err := s.put(arg); err != nil {
-					consolePrintf("[SEND] 失败: %v
-", err)
+					consolePrintf("[SEND] 失败: %v\n", err)
 				} else {
 					consolePrintln("[SEND] 完成。")
 				}
@@ -239,11 +220,9 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 					continue
 				}
 				if err := s.requestGet(arg); err != nil {
-					consolePrintf("[GET] 请求失败: %v
-", err)
+					consolePrintf("[GET] 请求失败: %v\n", err)
 				} else {
-					consolePrintf("[GET] 已请求: %s
-", arg)
+					consolePrintf("[GET] 已请求: %s\n", arg)
 				}
 			case "pwd":
 				consolePrintln(s.getCwd())
@@ -253,30 +232,23 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 					continue
 				}
 				if err := s.changeDir(arg); err != nil {
-					consolePrintf("cd: %v
-", err)
+					consolePrintf("cd: %v\n", err)
 				} else {
-					consolePrintf("本地目录: %s
-", s.getCwd())
+					consolePrintf("本地目录: %s\n", s.getCwd())
 				}
 			case "ls", "dir":
 				if err := s.listLocal(arg); err != nil {
-					consolePrintf("ls: %v
-", err)
+					consolePrintf("ls: %v\n", err)
 				}
 			case "overwrite":
 				if err := s.setOverwrite(arg); err != nil {
 					consolePrintln(err.Error())
 				}
 			case "status":
-				consolePrintf("角色: %s
-", s.roleName)
-				consolePrintf("本地目录: %s
-", s.getCwd())
-				consolePrintf("覆盖同名文件: %s
-", onOff(s.getOverwrite()))
-				consolePrintf("连接: %s <-> %s
-", conn.LocalAddr(), conn.RemoteAddr())
+				consolePrintf("角色: %s\n", s.roleName)
+				consolePrintf("本地目录: %s\n", s.getCwd())
+				consolePrintf("覆盖同名文件: %s\n", onOff(s.getOverwrite()))
+				consolePrintf("连接: %s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
 			case "help", "?":
 				printShellHelp()
 			case "quit", "exit", "bye":
@@ -284,8 +256,7 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 				s.close(false)
 				return nil
 			default:
-				consolePrintf("未知命令: %s（输入 help 查看命令）
-", cmd)
+				consolePrintf("未知命令: %s（输入 help 查看命令）\n", cmd)
 			}
 		}
 	}
@@ -313,14 +284,14 @@ func splitCommand(line string) (string, string) {
 	if line == "" {
 		return "", ""
 	}
-	idx := strings.IndexAny(line, " 	")
+	idx := strings.IndexAny(line, " \t")
 	if idx < 0 {
 		return line, ""
 	}
 	cmd := line[:idx]
 	arg := strings.TrimSpace(line[idx+1:])
 	if len(arg) >= 2 {
-		if (arg[0] == '"' && arg[len(arg)-1] == '"') || (arg[0] == ''' && arg[len(arg)-1] == ''') {
+		if (arg[0] == '"' && arg[len(arg)-1] == '"') || (arg[0] == '\'' && arg[len(arg)-1] == '\'') {
 			arg = arg[1 : len(arg)-1]
 		}
 	}
