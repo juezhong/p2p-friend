@@ -13,16 +13,16 @@ import (
 	"time"
 )
 
-func TestConnectionCodeRoundTrip(t *testing.T) {
-	in := connectCode{Version: protocolVersion, Address: "[2001:db8::1]:5000", Token: "abc", Fingerprint: "def"}
-	s, err := encodeCode(in)
+func TestSignalCodeRoundTrip(t *testing.T) {
+	in := signalCode{Version: signalVersion, Kind: "offer", Token: "abc", SDP: "v=0\r\n"}
+	s, err := encodeSignal(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(s, "P2P4-") {
+	if !strings.HasPrefix(s, signalPrefixOffer) {
 		t.Fatalf("unexpected code prefix: %s", s)
 	}
-	out, err := decodeCode(s)
+	out, err := decodeSignal(s, "offer")
 	if err != nil {
 		t.Fatal(err)
 	}
