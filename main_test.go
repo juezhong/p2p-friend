@@ -1,14 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/binary"
+	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestConnectionCodeRoundTrip(t *testing.T) {
@@ -16,6 +18,9 @@ func TestConnectionCodeRoundTrip(t *testing.T) {
 	s, err := encodeCode(in)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.HasPrefix(s, "P2P4-") {
+		t.Fatalf("unexpected code prefix: %s", s)
 	}
 	out, err := decodeCode(s)
 	if err != nil {
@@ -26,203 +31,217 @@ func TestConnectionCodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSplitCommandKeepsWindowsAndUnicodePath(t *testing.T) {
-	cmd, arg := splitCommand(`put "D:\\BaiduNetdiskDownload\\【正点原子】\\手册 2024.pdf"`)
-	if cmd != "put" {
-		t.Fatalf("cmd=%q", cmd)
+func TestParseCommandLinePreservesWindowsUnicodePath(t *testing.T) {
+	args, err := parseCommandLine(`get "D:\BaiduNetdiskDownload\【正点原子】\手册 2024.pdf" "./本地 手册.pdf"`)
+	if err != nil {
+		t.Fatal(err)
 	}
-	want := `D:\\BaiduNetdiskDownload\\【正点原子】\\手册 2024.pdf`
-	if arg != want {
-		t.Fatalf("arg=%q want=%q", arg, want)
+	want := []string{"get", `D:\BaiduNetdiskDownload\【正点原子】\手册 2024.pdf`, "./本地 手册.pdf"}
+	if len(args) != len(want) {
+		t.Fatalf("args=%#v", args)
 	}
-}
-
-func TestSafeDestinationRejectsTraversal(t *testing.T) {
-	base := t.TempDir()
-	bad := []string{"../escape", "a/../../escape", "/absolute"}
-	for _, p := range bad {
-		if _, err := safeDestination(base, p); err == nil {
-			t.Fatalf("expected %q to be rejected", p)
+	for i := range args {
+		if args[i] != want[i] {
+			t.Fatalf("arg[%d]=%q want=%q", i, args[i], want[i])
 		}
 	}
 }
 
-func TestSafeRequestedPathRejectsTraversal(t *testing.T) {
-	base := t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "ok.txt"), []byte("ok"), 0o644); err != nil {
+func TestChangeDirDash(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := safeRequestedPath(base, "ok.txt"); err != nil {
-		t.Fatalf("valid path rejected: %v", err)
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	bad := []string{"../escape", "a/../../escape", "/absolute", "."}
-	for _, p := range bad {
-		if _, err := safeRequestedPath(base, p); err == nil {
-			t.Fatalf("expected %q to be rejected", p)
-		}
+	next, prev, err := changeDir(a, "", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != b || prev != a {
+		t.Fatalf("next=%q prev=%q", next, prev)
+	}
+	next, prev, err = changeDir(next, prev, "-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != a || prev != b {
+		t.Fatalf("dash next=%q prev=%q", next, prev)
 	}
 }
 
-func TestRecursiveUnicodeTransfer(t *testing.T) {
-	srcParent := t.TempDir()
-	src := filepath.Join(srcParent, "资料目录")
-	if err := os.MkdirAll(filepath.Join(src, "子目录", "空目录"), 0o755); err != nil {
+func TestAbsolutePathAllowed(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "x.txt")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wantA := []byte("中文文件名内容\n")
-	wantB := bytes.Repeat([]byte{0x00, 0x11, 0x22, 0x33}, 4096)
-	if err := os.WriteFile(filepath.Join(src, "正点原子产品选型手册_20240826.pdf"), wantA, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "子目录", "data.bin"), wantB, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "子目录", "zero"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	entries, total, err := buildEntries(src)
+	got, err := cleanExistingPath(t.TempDir(), p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst := t.TempDir()
-	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
-
-	sendErr := make(chan error, 1)
-	go func() {
-		bw := bufio.NewWriter(left)
-		sendErr <- sendSessionWriter(bw, entries, total, "[TEST]")
-	}()
-	br := bufio.NewReader(right)
-	if err := receiveSessionReader(br, dst, false, total, "[TEST]"); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-sendErr; err != nil {
-		t.Fatal(err)
-	}
-
-	gotA, err := os.ReadFile(filepath.Join(dst, "资料目录", "正点原子产品选型手册_20240826.pdf"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(gotA, wantA) {
-		t.Fatal("unicode file content mismatch")
-	}
-	gotB, err := os.ReadFile(filepath.Join(dst, "资料目录", "子目录", "data.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(gotB, wantB) {
-		t.Fatal("binary file mismatch")
-	}
-	if st, err := os.Stat(filepath.Join(dst, "资料目录", "子目录", "空目录")); err != nil || !st.IsDir() {
-		t.Fatalf("empty directory missing: %v", err)
+	if got != p {
+		t.Fatalf("got=%q want=%q", got, p)
 	}
 }
 
-func TestTwoTransfersRemainFramedOnOneConnection(t *testing.T) {
-	srcParent := t.TempDir()
-	f1 := filepath.Join(srcParent, "one.txt")
-	f2 := filepath.Join(srcParent, "二号.txt")
-	if err := os.WriteFile(f1, []byte("one"), 0o644); err != nil {
+func TestBidirectionalRemoteFilesystemAndTransfer(t *testing.T) {
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+	bOther := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(aLocal, "资料", "子目录"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(f2, []byte("two"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(aLocal, "资料", "中文.txt"), []byte("hello from A"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e1, n1, err := buildEntries(f1)
+	absRemoteFile := filepath.Join(bOther, "远端绝对路径.bin")
+	wantRemote := bytes.Repeat([]byte{0x11, 0x22, 0x33}, 4096)
+	if err := os.WriteFile(absRemoteFile, wantRemote, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, b := newSessionPair(t, aLocal, bLocal, 0)
+	defer a.close(false)
+	defer b.close(false)
+
+	pwd, err := a.remotePwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	e2, n2, err := buildEntries(f2)
+	if pwd != bLocal {
+		t.Fatalf("remote pwd=%q want=%q", pwd, bLocal)
+	}
+
+	resp, err := a.callRPC("ls", bOther, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
-	dst := t.TempDir()
-
-	sendErr := make(chan error, 1)
-	go func() {
-		bw := bufio.NewWriter(left)
-		for _, x := range []struct {
-			label string
-			e     []sendEntry
-			n     int64
-		}{{"one.txt", e1, n1}, {"二号.txt", e2, n2}} {
-			if err := bw.WriteByte(msgTransfer); err != nil {
-				sendErr <- err
-				return
-			}
-			if err := writeText(bw, x.label); err != nil {
-				sendErr <- err
-				return
-			}
-			if err := binary.Write(bw, binary.BigEndian, uint64(x.n)); err != nil {
-				sendErr <- err
-				return
-			}
-			if err := sendSessionWriter(bw, x.e, x.n, "[TEST]"); err != nil {
-				sendErr <- err
-				return
-			}
-		}
-		sendErr <- nil
-	}()
-
-	br := bufio.NewReader(right)
-	for i := 0; i < 2; i++ {
-		typ, err := br.ReadByte()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if typ != msgTransfer {
-			t.Fatalf("message %d type=%d", i, typ)
-		}
-		if _, err := readText(br); err != nil {
-			t.Fatal(err)
-		}
-		var total uint64
-		if err := binary.Read(br, binary.BigEndian, &total); err != nil {
-			t.Fatal(err)
-		}
-		if err := receiveSessionReader(br, dst, false, int64(total), "[TEST]"); err != nil {
-			t.Fatal(err)
-		}
+	if len(resp.Entries) != 1 || resp.Entries[0].Name != filepath.Base(absRemoteFile) {
+		t.Fatalf("unexpected remote entries: %#v", resp.Entries)
 	}
-	if err := <-sendErr; err != nil {
+
+	remoteDest := filepath.Join(bLocal, "incoming", "renamed-data")
+	if err := a.put("资料", remoteDest); err != nil {
 		t.Fatal(err)
 	}
-	for name, want := range map[string]string{"one.txt": "one", "二号.txt": "two"} {
-		b, err := os.ReadFile(filepath.Join(dst, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(b) != want {
-			t.Fatalf("%s=%q", name, string(b))
-		}
+	got, err := os.ReadFile(filepath.Join(remoteDest, "中文.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello from A" {
+		t.Fatalf("put content=%q", string(got))
+	}
+
+	localDest := filepath.Join(aLocal, "downloaded.bin")
+	if err := a.get(absRemoteFile, localDest); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(localDest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, wantRemote) {
+		t.Fatal("absolute get content mismatch")
+	}
+
+	if err := a.remoteCd(bOther); err != nil {
+		t.Fatal(err)
+	}
+	if a.getRemoteCwd() != bOther {
+		t.Fatalf("cached remote cwd=%q", a.getRemoteCwd())
+	}
+	if err := a.remoteCd("-"); err != nil {
+		t.Fatal(err)
+	}
+	if a.getRemoteCwd() != bLocal {
+		t.Fatalf("remote cd - =%q want=%q", a.getRemoteCwd(), bLocal)
 	}
 }
 
-func TestAuthenticationRoles(t *testing.T) {
-	token := bytes.Repeat([]byte{0x42}, 32)
-	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+type slowConn struct {
+	net.Conn
+	delay time.Duration
+}
 
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- authenticateListener(left, token, roleHost)
-	}()
-	if err := authenticateDialer(right, token, roleJoin); err != nil {
+func (c *slowConn) Write(p []byte) (int, error) {
+	time.Sleep(c.delay)
+	return c.Conn.Write(p)
+}
+
+func TestCancelGetKeepsSessionAndRemovesPartialFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration cancellation test")
+	}
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+	large := filepath.Join(bLocal, "large.bin")
+	f, err := os.Create(large)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := <-serverErr; err != nil {
+	chunk := bytes.Repeat([]byte{0x5a}, 1024*1024)
+	for i := 0; i < 32; i++ {
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+
+	a, b := newSessionPair(t, aLocal, bLocal, 2*time.Millisecond)
+	defer a.close(false)
+	defer b.close(false)
+
+	done := make(chan error, 1)
+	go func() { done <- a.get("large.bin", "cancelled.bin") }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		a.transferMu.Lock()
+		n := len(a.inbound)
+		a.transferMu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !a.cancelActive("test cancel") {
+		t.Fatal("no active transfer to cancel")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("get error=%v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled get did not return")
+	}
+
+	if _, err := os.Stat(filepath.Join(aLocal, "cancelled.bin")); !os.IsNotExist(err) {
+		t.Fatalf("partial destination still exists: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(aLocal, ".p2p-friend-*.part"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files left after cancel: %#v", matches)
+	}
+
+	// 取消传输后同一条连接仍应能继续处理远端命令。
+	pwd, err := a.remotePwd()
+	if err != nil {
+		t.Fatalf("session unusable after cancel: %v", err)
+	}
+	if pwd != bLocal {
+		t.Fatalf("pwd after cancel=%q want=%q", pwd, bLocal)
 	}
 }
 
@@ -238,7 +257,21 @@ func TestRejectSymlinkInSource(t *testing.T) {
 	if err := os.Symlink("/tmp", filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := buildEntries(dir); err == nil {
+	if _, _, _, err := buildEntries(dir); err == nil {
 		t.Fatal("expected symlink source to be rejected")
 	}
+}
+
+func newSessionPair(t *testing.T, aCwd, bCwd string, bWriteDelay time.Duration) (*peerSession, *peerSession) {
+	t.Helper()
+	left, right := net.Pipe()
+	var bConn net.Conn = right
+	if bWriteDelay > 0 {
+		bConn = &slowConn{Conn: right, delay: bWriteDelay}
+	}
+	a := initPeerSession(left, "A", aCwd)
+	b := initPeerSession(bConn, "B", bCwd)
+	go a.readLoop()
+	go b.readLoop()
+	return a, b
 }

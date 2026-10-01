@@ -2,190 +2,329 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"net"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-func (s *peerSession) put(path string) error {
-	full, err := resolveLocalPath(s.getCwd(), path)
-	if err != nil {
-		return err
+func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
+	s := &peerSession{
+		conn:       conn,
+		br:         bufio.NewReaderSize(conn, chunkSize*2),
+		bw:         bufio.NewWriterSize(conn, chunkSize*2),
+		closed:     make(chan struct{}),
+		pendingRPC: make(map[uint64]chan rpcResponse),
+		pendingGet: make(map[uint64]*pendingGet),
+		outbound:   make(map[uint64]*outboundTransfer),
+		inbound:    make(map[uint64]*inboundTransfer),
+		localCwd:   cwd,
+		serveCwd:   cwd,
+		roleName:   roleName,
 	}
-	return s.sendPath(full, "SEND")
-}
-
-func (s *peerSession) requestGet(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return errors.New("empty path")
-	}
-	if filepath.IsAbs(filepath.FromSlash(path)) || filepath.VolumeName(filepath.FromSlash(path)) != "" {
-		return errors.New("get 只接受对方当前目录下的相对路径")
-	}
-	clean := filepath.Clean(filepath.FromSlash(path))
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
-		return errors.New("get 不允许使用 ../ 越出对方当前目录")
-	}
-	return s.writeMessage(func(w *bufio.Writer) error {
-		if err := w.WriteByte(msgGetRequest); err != nil {
-			return err
-		}
-		return writeText(w, filepath.ToSlash(clean))
-	})
-}
-
-func (s *peerSession) sendPath(fullPath, prefix string) error {
-	entries, total, err := buildEntries(fullPath)
-	if err != nil {
-		return err
-	}
-	label := filepath.Base(filepath.Clean(fullPath))
-
-	return s.writeMessage(func(w *bufio.Writer) error {
-		if err := w.WriteByte(msgTransfer); err != nil {
-			return err
-		}
-		if err := writeText(w, label); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.BigEndian, uint64(total)); err != nil {
-			return err
-		}
-		if err := w.Flush(); err != nil {
-			return err
-		}
-		consolePrintf("[%s] %s (%s)\n", prefix, fullPath, humanBytes(total))
-		return sendSessionWriter(w, entries, total, "["+prefix+"]")
-	})
-}
-
-func (s *peerSession) sendRequested(request string) {
-	base := s.getCwd()
-	full, err := safeRequestedPath(base, request)
-	if err != nil {
-		_ = s.sendError(fmt.Sprintf("get %q 被拒绝: %v", request, err))
-		return
-	}
-	consolePrintf("\n[GET->SEND] 对方请求: %s\n", request)
-	if err := s.sendPath(full, "GET->SEND"); err != nil {
-		_ = s.sendError(fmt.Sprintf("无法发送 %q: %v", request, err))
-		consolePrintf("[GET->SEND] 失败: %v\n", err)
-		return
-	}
-	consolePrintln("[GET->SEND] 完成。")
-}
-
-func (s *peerSession) sendError(text string) error {
-	return s.writeMessage(func(w *bufio.Writer) error {
-		if err := w.WriteByte(msgError); err != nil {
-			return err
-		}
-		return writeText(w, text)
-	})
-}
-
-func (s *peerSession) sendBye() error {
-	return s.writeMessage(func(w *bufio.Writer) error {
-		return w.WriteByte(msgBye)
-	})
-}
-
-func (s *peerSession) writeMessage(fn func(*bufio.Writer) error) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	select {
-	case <-s.closed:
-		return errors.New("connection is closed")
-	default:
-	}
-	if err := fn(s.bw); err != nil {
-		s.close(false)
-		return err
-	}
-	if err := s.bw.Flush(); err != nil {
-		s.close(false)
-		return err
-	}
-	return nil
+	return s
 }
 
 func (s *peerSession) readLoop() {
 	defer s.close(false)
 	for {
-		typ, err := s.br.ReadByte()
+		f, err := readFrame(s.br)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedErr(err) {
 				consolePrintf("\n[连接] 读取失败: %v\n", err)
 			}
 			return
 		}
-		switch typ {
-		case msgTransfer:
-			label, err := readText(s.br)
-			if err != nil {
-				consolePrintf("\n[RECV] 无法读取传输信息: %v\n", err)
+		switch f.Type {
+		case frameRPCRequest:
+			go s.handleRPCRequest(f.ID, f.Payload)
+		case frameRPCResponse:
+			if err := s.handleRPCResponse(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] RPC 响应无效: %v\n", err)
 				return
 			}
-			var total uint64
-			if err := binary.Read(s.br, binary.BigEndian, &total); err != nil {
-				consolePrintf("\n[RECV] 无法读取文件大小: %v\n", err)
+		case frameTransferStart:
+			if err := s.handleTransferStart(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 传输开始无效: %v\n", err)
 				return
 			}
-			if total > uint64(^uint64(0)>>1) {
-				consolePrintln("\n[RECV] 传输大小超过实现限制。")
+		case frameEntryStart:
+			if err := s.handleEntryStart(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 文件项无效: %v\n", err)
 				return
 			}
-			out := s.getCwd()
-			consolePrintf("\n[RECV] %s -> %s\n", label, out)
-			if err := receiveSessionReader(s.br, out, s.getOverwrite(), int64(total), "[RECV]"); err != nil {
-				consolePrintf("\n[RECV] 失败: %v\n", err)
-				consolePrintln("[RECV] 为避免协议流错位，本次连接将关闭。")
+		case frameData:
+			if err := s.handleTransferData(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 数据帧无效: %v\n", err)
 				return
 			}
-			consolePrintln("[RECV] 完成。")
-		case msgGetRequest:
-			request, err := readText(s.br)
-			if err != nil {
-				consolePrintf("\n[GET] 无法读取请求: %v\n", err)
+		case frameEntryEnd:
+			if err := s.handleEntryEnd(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 文件结束帧无效: %v\n", err)
 				return
 			}
-			go s.sendRequested(request)
-		case msgError:
-			text, err := readText(s.br)
-			if err != nil {
-				consolePrintf("\n[PEER] 无法读取错误信息: %v\n", err)
+		case frameTransferEnd:
+			if err := s.handleTransferEnd(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 传输结束帧无效: %v\n", err)
 				return
 			}
-			consolePrintf("\n[PEER] %s\n", text)
-		case msgBye:
+		case frameCancel:
+			if err := s.handleCancel(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 取消帧无效: %v\n", err)
+				return
+			}
+		case frameTransferResult:
+			if err := s.handleTransferResult(f.ID, f.Payload); err != nil {
+				consolePrintf("\n[协议] 传输结果无效: %v\n", err)
+				return
+			}
+		case frameBye:
 			consolePrintln("\n[连接] 对方已退出会话。")
 			return
 		default:
-			consolePrintf("\n[连接] 未知协议消息: %d\n", typ)
+			consolePrintf("\n[协议] 未知帧类型: %d\n", f.Type)
 			return
 		}
 	}
 }
 
-func (s *peerSession) close(sendBye bool) {
-	s.closeOnce.Do(func() {
-		if sendBye {
-			_ = s.sendBye()
+func (s *peerSession) handleRPCRequest(id uint64, payload []byte) {
+	var req rpcRequest
+	if err := decodeJSON(payload, &req); err != nil {
+		_ = s.writeJSONFrame(frameRPCResponse, id, rpcResponse{OK: false, Error: err.Error()})
+		return
+	}
+	resp := rpcResponse{}
+	switch req.Op {
+	case "pwd":
+		resp.OK = true
+		resp.Cwd = s.getServeCwd()
+	case "ls":
+		path, entries, err := listPath(s.getServeCwd(), req.Path)
+		if err != nil {
+			resp.Error = err.Error()
+			break
 		}
-		_ = s.conn.Close()
-		close(s.closed)
-	})
+		resp.OK = true
+		resp.Cwd = path
+		resp.Entries = entries
+	case "cd":
+		cur, prev := s.getServeDirs()
+		next, nextPrev, err := changeDir(cur, prev, req.Path)
+		if err != nil {
+			resp.Error = err.Error()
+			break
+		}
+		s.setServeDirs(next, nextPrev)
+		resp.OK = true
+		resp.Cwd = next
+	case "get":
+		source, err := cleanExistingPath(s.getServeCwd(), req.Path)
+		if err != nil {
+			resp.Error = err.Error()
+			break
+		}
+		if _, _, _, err := buildEntries(source); err != nil {
+			resp.Error = err.Error()
+			break
+		}
+		tid := s.nextTransferID()
+		resp.OK = true
+		resp.TransferID = tid
+		resp.Name = filepath.Base(filepath.Clean(source))
+		if err := s.writeJSONFrame(frameRPCResponse, id, resp); err != nil {
+			return
+		}
+		go func() {
+			if err := s.sendTransfer(source, "", id, false, tid); err != nil && !errors.Is(err, context.Canceled) {
+				consolePrintf("\n[GET->SEND] 失败: %v\n", err)
+			}
+		}()
+		return
+	default:
+		resp.Error = "unknown RPC: " + req.Op
+	}
+	if !resp.OK && resp.Error == "" {
+		resp.Error = "operation failed"
+	}
+	_ = s.writeJSONFrame(frameRPCResponse, id, resp)
 }
 
-func (s *peerSession) getCwd() string {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	return s.cwd
+func (s *peerSession) handleRPCResponse(id uint64, payload []byte) error {
+	var resp rpcResponse
+	if err := decodeJSON(payload, &resp); err != nil {
+		return err
+	}
+	s.pendingMu.Lock()
+	ch := s.pendingRPC[id]
+	s.pendingMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- resp:
+		default:
+		}
+	}
+	return nil
+}
+
+func (s *peerSession) callRPC(op, path string, timeout time.Duration) (rpcResponse, error) {
+	id := s.nextRequestID()
+	return s.callRPCWithID(id, op, path, timeout)
+}
+
+func (s *peerSession) callRPCWithID(id uint64, op, path string, timeout time.Duration) (rpcResponse, error) {
+	var zero rpcResponse
+	ch := make(chan rpcResponse, 1)
+	s.pendingMu.Lock()
+	s.pendingRPC[id] = ch
+	s.pendingMu.Unlock()
+	defer func() {
+		s.pendingMu.Lock()
+		delete(s.pendingRPC, id)
+		s.pendingMu.Unlock()
+	}()
+	if err := s.writeJSONFrame(frameRPCRequest, id, rpcRequest{Op: op, Path: path}); err != nil {
+		return zero, err
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	select {
+	case resp := <-ch:
+		if !resp.OK {
+			if resp.Error == "" {
+				resp.Error = "remote operation failed"
+			}
+			return resp, errors.New(resp.Error)
+		}
+		return resp, nil
+	case <-s.closed:
+		return zero, errors.New("connection closed")
+	case <-time.After(timeout):
+		return zero, fmt.Errorf("remote %s timeout", op)
+	}
+}
+
+func (s *peerSession) remotePwd() (string, error) {
+	resp, err := s.callRPC("pwd", "", 10*time.Second)
+	if err != nil {
+		return "", err
+	}
+	s.setRemoteCwd(resp.Cwd)
+	return resp.Cwd, nil
+}
+
+func (s *peerSession) remoteList(path string) error {
+	resp, err := s.callRPC("ls", path, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	consolePrintf("远端: %s\n", resp.Cwd)
+	printEntries(resp.Entries)
+	return nil
+}
+
+func (s *peerSession) remoteCd(path string) error {
+	resp, err := s.callRPC("cd", path, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	s.setRemoteCwd(resp.Cwd)
+	consolePrintf("远端目录: %s\n", resp.Cwd)
+	return nil
+}
+
+func (s *peerSession) get(remotePath, localDest string) error {
+	if strings.TrimSpace(remotePath) == "" {
+		return errors.New("get 需要远端路径")
+	}
+	id := s.nextRequestID()
+	pg := &pendingGet{dest: localDest, done: make(chan error, 1)}
+	s.pendingMu.Lock()
+	s.pendingGet[id] = pg
+	s.pendingMu.Unlock()
+	resp, err := s.callRPCWithID(id, "get", remotePath, 30*time.Second)
+	if err != nil {
+		s.pendingMu.Lock()
+		delete(s.pendingGet, id)
+		s.pendingMu.Unlock()
+		return err
+	}
+	if resp.TransferID == 0 {
+		s.pendingMu.Lock()
+		delete(s.pendingGet, id)
+		s.pendingMu.Unlock()
+		return errors.New("remote get did not return a transfer id")
+	}
+	consolePrintf("[GET] %s -> %s\n", remotePath, localDisplay(localDest))
+	select {
+	case err := <-pg.done:
+		return err
+	case <-s.closed:
+		return errors.New("connection closed during get")
+	}
+}
+
+func localDisplay(dest string) string {
+	if dest == "" {
+		return "<local cwd>"
+	}
+	return dest
+}
+
+func (s *peerSession) getLocalCwd() string {
+	s.localMu.RLock()
+	defer s.localMu.RUnlock()
+	return s.localCwd
+}
+
+func (s *peerSession) getLocalDirs() (string, string) {
+	s.localMu.RLock()
+	defer s.localMu.RUnlock()
+	return s.localCwd, s.localPrevCwd
+}
+
+func (s *peerSession) setLocalDirs(cur, prev string) {
+	s.localMu.Lock()
+	s.localCwd = cur
+	s.localPrevCwd = prev
+	s.localMu.Unlock()
+}
+
+func (s *peerSession) getServeCwd() string {
+	s.serveMu.RLock()
+	defer s.serveMu.RUnlock()
+	return s.serveCwd
+}
+
+func (s *peerSession) getServeDirs() (string, string) {
+	s.serveMu.RLock()
+	defer s.serveMu.RUnlock()
+	return s.serveCwd, s.servePrevCwd
+}
+
+func (s *peerSession) setServeDirs(cur, prev string) {
+	s.serveMu.Lock()
+	s.serveCwd = cur
+	s.servePrevCwd = prev
+	s.serveMu.Unlock()
+}
+
+func (s *peerSession) setRemoteCwd(cwd string) {
+	s.remoteMu.Lock()
+	s.remoteCwd = cwd
+	s.remoteMu.Unlock()
+}
+
+func (s *peerSession) getRemoteCwd() string {
+	s.remoteMu.RLock()
+	defer s.remoteMu.RUnlock()
+	return s.remoteCwd
 }
 
 func (s *peerSession) getOverwrite() bool {
@@ -194,77 +333,78 @@ func (s *peerSession) getOverwrite() bool {
 	return s.overwrite
 }
 
-func (s *peerSession) changeDir(path string) error {
-	full, err := resolveLocalPath(s.getCwd(), path)
-	if err != nil {
-		return err
-	}
-	st, err := os.Stat(full)
-	if err != nil {
-		return err
-	}
-	if !st.IsDir() {
-		return fmt.Errorf("not a directory: %s", path)
-	}
-	s.stateMu.Lock()
-	s.cwd = full
-	s.stateMu.Unlock()
-	return nil
-}
-
 func (s *peerSession) setOverwrite(arg string) error {
 	switch strings.ToLower(strings.TrimSpace(arg)) {
 	case "on", "1", "yes", "true":
 		s.stateMu.Lock()
 		s.overwrite = true
 		s.stateMu.Unlock()
-		consolePrintln("覆盖同名文件: on")
+		consolePrintln("本机接收覆盖: on")
 		return nil
 	case "off", "0", "no", "false":
 		s.stateMu.Lock()
 		s.overwrite = false
 		s.stateMu.Unlock()
-		consolePrintln("覆盖同名文件: off")
+		consolePrintln("本机接收覆盖: off")
 		return nil
 	default:
 		return errors.New("用法: overwrite on|off")
 	}
 }
 
-func (s *peerSession) listLocal(arg string) error {
-	path := s.getCwd()
-	var err error
-	if strings.TrimSpace(arg) != "" {
-		path, err = resolveLocalPath(path, arg)
-		if err != nil {
-			return err
-		}
-	}
-	st, err := os.Stat(path)
+func (s *peerSession) localCd(path string) error {
+	cur, prev := s.getLocalDirs()
+	next, nextPrev, err := changeDir(cur, prev, path)
 	if err != nil {
 		return err
 	}
-	if !st.IsDir() {
-		consolePrintf("%10s  %s\n", humanBytes(st.Size()), filepath.Base(path))
-		return nil
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
-			consolePrintf("?          %s\n", e.Name())
-			continue
-		}
-		if e.IsDir() {
-			consolePrintf("<DIR>      %s%c\n", e.Name(), os.PathSeparator)
-		} else {
-			consolePrintf("%10s  %s\n", humanBytes(info.Size()), e.Name())
-		}
-	}
+	s.setLocalDirs(next, nextPrev)
+	consolePrintf("本地目录: %s\n", next)
 	return nil
+}
+
+func (s *peerSession) localList(path string) error {
+	resolved, entries, err := listPath(s.getLocalCwd(), path)
+	if err != nil {
+		return err
+	}
+	consolePrintf("本地: %s\n", resolved)
+	printEntries(entries)
+	return nil
+}
+
+func printEntries(entries []remoteEntry) {
+	for _, e := range entries {
+		if e.Dir {
+			consolePrintf("<DIR>       %s\n", e.Name)
+		} else {
+			consolePrintf("%10s  %s\n", humanBytes(e.Size), e.Name)
+		}
+	}
+}
+
+func (s *peerSession) close(sendBye bool) {
+	s.closeOnce.Do(func() {
+		if sendBye {
+			_ = s.writeFrame(frameBye, 0, nil)
+		}
+		_ = s.conn.Close()
+		close(s.closed)
+	})
+}
+
+func (s *peerSession) status() {
+	consolePrintf("角色: %s\n", s.roleName)
+	consolePrintf("本地目录: %s\n", s.getLocalCwd())
+	consolePrintf("对方看到的本机目录: %s\n", s.getServeCwd())
+	remote := s.getRemoteCwd()
+	if remote == "" {
+		remote = "<unknown>"
+	}
+	consolePrintf("远端目录: %s\n", remote)
+	consolePrintf("本机接收覆盖: %s\n", onOff(s.getOverwrite()))
+	consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
+	consolePrintf("活动传输 ID: %v\n", s.debugActiveTransfers())
 }
 
 func onOff(v bool) string {
@@ -272,4 +412,53 @@ func onOff(v bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func parseCommandLine(line string) ([]string, error) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil, nil
+	}
+	var args []string
+	var b strings.Builder
+	var quote rune
+	have := false
+	for _, r := range line {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+				have = true
+				continue
+			}
+			b.WriteRune(r)
+			have = true
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+			have = true
+		case ' ', '\t':
+			if have || b.Len() > 0 {
+				args = append(args, b.String())
+				b.Reset()
+				have = false
+			}
+		default:
+			b.WriteRune(r)
+			have = true
+		}
+	}
+	if quote != 0 {
+		return nil, errors.New("引号没有闭合")
+	}
+	if have || b.Len() > 0 {
+		args = append(args, b.String())
+	}
+	return args, nil
+}
+
+func formatJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
