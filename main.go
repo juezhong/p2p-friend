@@ -35,27 +35,30 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Printf(`p2p-friend v%s - 直接 P2P 文件/目录传输
+	fmt.Printf(`p2p-friend v%s - UDP P2P 文件/目录传输
 
 启动后选择：
-  1. 创建会话（本机监听，需要对方能直连本机）
-  2. 加入会话（本机主动连接）
+  1. 创建会话：生成 OFFER，收到朋友的 ANSWER 后建立连接
+  2. 加入会话：输入 OFFER，生成 ANSWER 发回创建方
+
+连接阶段会自动收集 IPv6 / IPv4 ICE 候选并执行 UDP 连通性检查；
+IPv4 位于 NAT 后时会通过 STUN 辅助 UDP hole punching，不使用 TURN/relay。
+只有 ICE、DTLS 和数据通道全部建立成功后才进入文件命令行。
 
 连接后采用类似 SFTP 的命令：
-  pwd / ls / cd       操作远端目录
-  lpwd / lls / lcd    操作本地目录
-  put <local> [remote] 发送到远端，可指定远端绝对路径
-  get <remote> [local] 获取远端文件/目录，可使用远端绝对路径
-  Tab                 自动补全命令、本地路径和远端路径
-  cancel              取消当前传输
-  Ctrl-C              取消当前传输，不退出会话
-  quit / exit          断开并退出
+  pwd / ls / cd         操作远端目录
+  lpwd / lls / lcd      操作本地目录
+  put <local> [remote]  发送到远端
+  get <remote> [local]  获取远端文件/目录
+  Tab                   自动补全本地/远端路径
+  cancel / Ctrl-C       取消当前传输，不退出会话
+  quit / exit           断开并退出
 
-注意：
-  * v0.5 仍使用 P2P4 协议，可与 v0.4 建立连接；Tab 补全是本地 CLI 功能。
-  * P2P4 连接码允许会话双方浏览和访问对方当前用户有权限访问的绝对路径。
-  * 不使用 TURN/relay；文件数据始终点对点直传。
-  * 如果 A→B 连接超时，就让 B 创建会话、A 加入；也就是让“超时方向的目标端”监听。
+传输：
+  * 底层是 UDP + ICE + DTLS + SCTP DataChannel。
+  * 4 条可靠数据 stream 并行传输，UDP 丢包由传输层自动重传。
+  * 发送文件前计算 SHA-256；接收端落盘后重新计算，匹配才报告完成。
+  * 不配置 TURN/relay；全部候选失败时会明确报连接失败。
 `, appVersion)
 }
 
@@ -72,11 +75,11 @@ func runInteractive() error {
 
 	consolePrintf("\nP2P Friend v%s\n", appVersion)
 	consolePrintln("========================================")
-	consolePrintln("1) 创建会话（本机监听）")
-	consolePrintln("2) 加入会话（本机主动连接）")
+	consolePrintln("1) 创建会话（生成 OFFER）")
+	consolePrintln("2) 加入会话（输入 OFFER / 生成 ANSWER）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
-	consolePrintln("连接提示：如果 A→B 连接超时，就让 B 创建会话、A 加入（让超时方向的目标端监听）。")
+	consolePrintln("网络：UDP/ICE 自动尝试 IPv6 直连与 IPv4 NAT 打洞；不使用 TURN/relay。")
 	consolePrintln("")
 
 	for {
@@ -103,53 +106,70 @@ func runInteractive() error {
 }
 
 func runHost(in *bufio.Reader, cwd string) error {
-	ln, token, fingerprintHex, err := openTLSListener(":" + defaultPort)
+	peer, offer, err := createHostOffer()
 	if err != nil {
-		return fmt.Errorf("创建会话失败（TCP %s）：%w", defaultPort, err)
+		return fmt.Errorf("创建 UDP/ICE 会话失败: %w", err)
 	}
-	defer ln.Close()
-
 	consolePrintf("\n[创建会话] 初始目录: %s\n", cwd)
-	consolePrintf("[创建会话] 会话端口: %s\n\n", defaultPort)
-	if err := printConnectionCodes(ln, token, fingerprintHex); err != nil {
+	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选。")
+	consolePrintln("")
+	consolePrintln("把下面的 OFFER 发给朋友：")
+	consolePrintln(offer)
+	consolePrintln("")
+	consolePrintln("朋友会返回一个 P2P6-ANSWER-...，粘贴后开始 UDP/ICE 连通性检查。")
+	consolePrintf("ANSWER: ")
+	answer, err := readSignalLine(in)
+	if err != nil {
+		_ = peer.pc.Close()
 		return err
 	}
-	consolePrintln("把上面一个可用的 P2P4-... 连接码发给朋友。")
-	consolePrintln("等待朋友加入...（这里 Ctrl-C 会结束等待）")
-
-	conn, err := ln.Accept()
+	if answer == "" {
+		_ = peer.pc.Close()
+		return errors.New("ANSWER 为空")
+	}
+	consolePrintln("正在建立 P2P UDP 连接（IPv6 direct / IPv4 hole punching）...")
+	conn, token, err := peer.acceptAnswer(answer)
 	if err != nil {
-		return fmt.Errorf("accept peer: %w", err)
+		_ = peer.pc.Close()
+		return err
 	}
 	if err := authenticateListener(conn, token, roleHost); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return err
 	}
-	consolePrintf("\n已建立直接加密连接：%s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
+	consolePrintln("已建立 P2P UDP 加密连接：ICE + DTLS + SCTP，多数据 stream 已就绪。")
 	return runPeerShell(conn, "HOST", cwd, in)
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P4-... 连接码。")
-	consolePrintf("连接码: ")
-	line, err := in.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	code := strings.TrimSpace(line)
-	if code == "" {
-		return errors.New("连接码为空")
-	}
-
-	conn, token, err := dialPeer(code)
+	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P6-OFFER-...。")
+	consolePrintf("OFFER: ")
+	offer, err := readSignalLine(in)
 	if err != nil {
 		return err
 	}
-	if err := authenticateDialer(conn, token, roleJoin); err != nil {
-		conn.Close()
+	if offer == "" {
+		return errors.New("OFFER 为空")
+	}
+	peer, answer, token, err := createJoinAnswer(offer)
+	if err != nil {
 		return err
 	}
-	consolePrintf("\n已建立直接加密连接：%s <-> %s\n", conn.LocalAddr(), conn.RemoteAddr())
+	consolePrintln("")
+	consolePrintln("把下面的 ANSWER 发回创建方：")
+	consolePrintln(answer)
+	consolePrintln("")
+	consolePrintln("等待创建方粘贴 ANSWER，并自动执行 UDP/ICE 连通性检查...")
+	conn, err := peer.waitConn()
+	if err != nil {
+		_ = peer.pc.Close()
+		return err
+	}
+	if err := authenticateDialer(conn, token, roleJoin); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	consolePrintln("已建立 P2P UDP 加密连接：ICE + DTLS + SCTP，多数据 stream 已就绪。")
 	return runPeerShell(conn, "JOIN", cwd, in)
 }
 
