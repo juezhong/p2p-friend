@@ -1,26 +1,29 @@
 # p2p-friend
 
-一个面向两个人直接传文件的交互式 P2P 命令行工具，操作方式接近 SFTP。
+`p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，使用方式接近 SFTP。
+
+文件数据在两个端点之间直接传输，不经过 TURN / relay 中继服务器。建立会话后，双方都可以浏览远端文件系统、上传文件或目录、下载文件或目录，并在同一连接中连续执行多次操作。
+
+## 功能
 
 - Linux / Windows x86-64
 - 单文件可执行程序
-- TLS 1.3 加密
-- 不使用 TURN / relay，文件数据点对点直传
+- TLS 1.3 加密连接
+- 文件数据点对点直传
 - 文件和目录递归传输
-- 同一会话内可连续 `put` / `get`
-- 双方都可以浏览远端目录并互相传输
+- 双向 `put` / `get`
+- 远端目录浏览与切换
 - 支持远端绝对路径
 - SHA-256 文件完整性校验
-- `Ctrl-C` 只取消当前传输，不退出会话
-- 取消接收时清理 `.part` 和本次新建文件
-- 中文路径支持
-- Tab 自动补全本地/远端路径
-- 路径含空格时自动加引号
+- `Ctrl-C` 仅取消当前传输，不退出会话
+- 取消接收时自动清理临时文件和本次新建内容
+- 中文、空格路径支持
+- 本地 / 远端路径 Tab 补全
 - Linux / Windows 路径风格自动识别
 
-> v0.5 继续使用 `P2P4-...` 协议，与 v0.4 的网络协议兼容；双方都升级到 v0.5 才能获得 Tab 补全和新版交互体验。P2P3 及更早协议仍不兼容。
+当前版本使用 `P2P4-...` 连接码。使用不同协议版本的客户端不能互相连接。
 
-## 启动
+## 快速开始
 
 Linux：
 
@@ -35,7 +38,7 @@ Windows：
 .\p2p-friend-windows-amd64.exe
 ```
 
-启动菜单：
+启动后选择：
 
 ```text
 1) 创建会话（本机监听）
@@ -43,11 +46,24 @@ Windows：
 3) 退出
 ```
 
-如果 **A -> B 连接超时**，就让 **B 创建会话、A 加入会话**。也就是：让“超时方向的目标端”负责监听。连接建立后 TCP/TLS 本身是双向的，双方仍然都能 `put` / `get`。
+创建会话的一方会生成连接码，将可用的 `P2P4-...` 连接码发送给另一方即可。
 
-例如 **Windows -> Linux 超时**，就让 **Linux 创建会话、Windows 加入**。反过来，如果 **Linux -> Windows 超时**，就让 **Windows 创建会话、Linux 加入**。
+### 连接方向
 
-## SFTP 风格命令
+建立 TCP 连接只要求至少有一个方向可达，文件传输方向与 TCP 建连方向无关。
+
+规则很简单：
+
+```text
+如果 A -> B 连接超时：
+让 B 创建会话，A 加入会话。
+```
+
+也就是让“连接失败方向的目标端”负责监听。
+
+连接建立后，双方都可以执行 `put`、`get`、`ls`、`cd` 等命令。
+
+## 命令
 
 ### 远端文件系统
 
@@ -59,21 +75,25 @@ cd <remote-path>
 cd -
 ```
 
-这些命令操作**对方机器**。
+这些命令操作对方机器：
 
-绝对路径也允许，例如从 Linux 浏览 Windows：
+- `pwd`：显示远端当前目录
+- `ls`：列出远端目录
+- `cd`：切换远端当前目录
+- `cd -`：回到远端上一个目录
+
+远端路径可以使用绝对路径：
 
 ```text
-ls "D:\BaiduNetdiskDownload"
-cd "D:\BaiduNetdiskDownload\【正点原子】RK3568开发板资料（A盘）-基础资料"
-pwd
+ls /path/to/directory
+cd /path/to/directory
 ```
 
-从 Windows 浏览 Linux：
+Windows 风格：
 
 ```text
-ls /home/liyunfeng/Downloads
-cd /home/liyunfeng/Downloads
+ls "C:\path\to\directory"
+cd "C:\path\to\directory"
 ```
 
 ### 本地文件系统
@@ -88,58 +108,116 @@ lcd <local-path>
 lcd -
 ```
 
-因此：
+对应关系：
 
-- `ls` = 看对方
-- `lls` = 看自己
-- `cd` = 改对方的会话目录
-- `lcd` = 改自己的本地目录
+```text
+pwd   -> 远端当前目录
+lpwd  -> 本地当前目录
 
-## put
+ls    -> 浏览远端
+lls   -> 浏览本地
+
+cd    -> 切换远端目录
+lcd   -> 切换本地目录
+```
+
+## 上传
+
+语法：
 
 ```text
 put <local-path> [remote-path]
 ```
 
-不指定远端目标时，发送到远端当前目录：
+上传单个文件：
 
 ```text
-put ./test.txt
-put ./build-output
+put ./file.bin
+```
+
+上传目录：
+
+```text
+put ./directory
 ```
 
 指定远端目标：
 
 ```text
-put ./test.txt "D:\incoming\test.txt"
-put ./build-output "D:\incoming\build-output"
+put ./file.bin /remote/path/file.bin
+put ./directory /remote/path/directory
 ```
 
-Linux 远端示例：
+Windows 远端路径同样支持：
 
 ```text
-put "D:\data\result.zip" /home/liyunfeng/Downloads/result.zip
+put ./file.bin "C:\remote\path\file.bin"
 ```
 
-如果指定的目标已存在且是目录，会把源文件/目录放到该目录下面。
+如果省略 `remote-path`，内容会发送到远端当前目录。
 
-## get
+## 下载
+
+语法：
 
 ```text
 get <remote-path> [local-path]
 ```
 
-远端路径可以是绝对路径：
+下载当前远端目录中的文件：
 
 ```text
-get "D:\BaiduNetdiskDownload\【正点原子】RK3568开发板资料（A盘）-基础资料\正点原子产品选型手册_20240826.pdf"
+get file.bin
+```
+
+下载远端绝对路径：
+
+```text
+get /remote/path/file.bin
 ```
 
 指定本地保存位置：
 
 ```text
-get "D:\data\1GGGGG.bin" ./1GGGGG.bin
-get /home/liyunfeng/Downloads/kernel.tar.xz "D:\Downdata\kernel.tar.xz"
+get /remote/path/file.bin ./local-file.bin
+```
+
+Windows 风格远端路径：
+
+```text
+get "C:\remote\path\file.bin"
+```
+
+目录同样支持递归下载。
+
+## Tab 补全
+
+程序内置跨平台命令行编辑器，不依赖外部 readline 动态库。
+
+补全规则：
+
+```text
+cd / ls / get          -> 远端路径
+lcd / lls              -> 本地路径
+put 第 1 个路径参数    -> 本地路径
+put 第 2 个路径参数    -> 远端路径
+get 第 2 个路径参数    -> 本地路径
+overwrite              -> on / off
+```
+
+按一次 `Tab` 会尝试补全。存在多个候选时会列出候选项，再继续输入即可。
+
+包含空格的路径会自动加引号。中文路径不需要额外转义。
+
+命令行编辑支持：
+
+```text
+Left / Right           移动光标
+Up / Down              浏览命令历史
+Ctrl-A / Ctrl-E        跳到行首 / 行尾
+Ctrl-L                 清屏并重绘
+Ctrl-C                 取消当前传输；没有传输时清空当前输入
+Tab                    路径 / 参数补全
 ```
 
 ## 取消传输
@@ -150,26 +228,27 @@ get /home/liyunfeng/Downloads/kernel.tar.xz "D:\Downdata\kernel.tar.xz"
 Ctrl-C
 ```
 
-或者输入：
+或者执行：
 
 ```text
 cancel
 ```
 
-只会取消当前传输，**不会关闭 P2P 会话**。
+只会取消当前传输，不会关闭 P2P 会话。
 
-P2P4 使用带 transfer ID 的分块帧协议，因此取消后双方仍能继续解析后续命令和传输。
+P2P4 使用带 transfer ID 的分块帧协议，因此取消一个传输后，同一条 TLS 连接仍可继续执行后续命令和传输。
 
-接收端取消时：
+接收被取消时，程序会尝试清理：
 
-- 当前 `.part` 临时文件会删除
-- 本次传输中新建且已经完成的文件会回滚删除
-- 本次新建的空目录会尽量删除
-- 如果自动删除失败，会打印路径和错误，让用户手动清理
+- 当前 `.part` 临时文件
+- 本次传输中新建且已完成的文件
+- 本次传输中新建的空目录
 
-如果开启了 `overwrite on` 并且已有文件已经完成覆盖，则无法自动恢复旧内容，程序会明确列出这些路径。
+如果自动清理失败，会打印具体路径和错误，供用户手动处理。
 
-## overwrite
+如果开启 `overwrite on` 且原有文件已经被完整覆盖，旧内容无法自动恢复。
+
+## 覆盖策略
 
 默认禁止覆盖本机已有接收文件：
 
@@ -183,134 +262,82 @@ overwrite off
 overwrite on
 ```
 
-这是**本机接收策略**。如果你向朋友已有文件的位置 `put`，而朋友没有开启 overwrite，传输会被拒绝，但连接不会断开。
+这是本机接收策略。远端向本机写入已有路径时，如果本机没有开启覆盖，传输会被拒绝，但会话保持连接。
 
-## status
+## 状态
 
 ```text
 status
 ```
 
-显示：
+可查看当前会话角色、目录状态、覆盖策略、TCP 连接信息和活动传输。
 
-- HOST / JOIN 角色
-- 本地当前目录
-- 对方看到的本机会话目录
-- 当前远端目录
-- overwrite 状态
-- TCP 连接地址
-- 活动 transfer ID
+## 网络要求
 
-## 网络限制
+当前版本不使用 STUN、TURN 或 relay。
 
-当前版本仍然不使用 STUN / TURN / relay。
+至少需要一个方向能够建立直接 TCP 连接，例如：
 
-至少需要有一个方向可以建立直接 TCP：
+- 公网 IPv6 且入站防火墙允许 TCP 5000
+- 同一局域网 / VPN
+- 公网 IPv4
+- 手工端口映射
 
-- 公网 IPv6 + 入站防火墙允许 TCP 5000
-- 同一局域网 / VPN 的私有 IPv4
-- 公网 IPv4 / 手工端口映射
+拥有公网 IPv6 地址并不代表入站连接一定可达。主机防火墙、路由器防火墙或运营商网络策略都可能阻止某个方向的连接。
 
-公网 IPv6 地址存在并不代表入站一定可达。Windows Defender Firewall、Linux nftables/ufw、路由器 IPv6 防火墙或运营商策略都可能让某一个方向超时。
-
-如果只有 Linux -> Windows 可连接，就固定使用：
-
-```text
-Windows: 创建会话
-Linux:   加入会话
-```
-
-这不会影响 Windows -> Linux 的文件发送，因为文件方向与 TCP 建连方向无关。
+如果某个方向连接超时，按前面的规则交换“创建会话 / 加入会话”角色即可。
 
 ## 安全模型
+
+连接和文件传输包含以下保护：
 
 - TLS 1.3
 - 临时 ECDSA 证书
 - 连接码包含随机 256-bit token
-- 连接码固定校验证书 SHA-256 fingerprint
-- 每个文件校验 SHA-256
-- 接收文件先写 `.part`，校验成功后再 rename
+- 使用连接码中的 SHA-256 fingerprint 固定校验证书
+- 每个文件单独校验 SHA-256
+- 接收文件先写入临时 `.part` 文件，校验成功后再重命名
 - 默认拒绝通过符号链接写入目标路径
 
-### v0.4 的重要变化
+为了支持 SFTP 风格的远端浏览，成功连接的一方可以在对方当前系统用户权限范围内浏览、读取和写入文件系统。
 
-为了支持类似 SFTP 的远端浏览，远端绝对路径不再限制在程序启动目录。
+**连接码相当于临时访问凭据，只应发送给可信任的人。**
 
-**持有连接码并成功连接的人，可以在当前系统用户权限范围内浏览、读取文件，并通过 `put` 写入指定路径。只把连接码交给可信任的人。**
+## 从源码构建
 
-## Tab 补全与命令行编辑
+要求 Go 1.23 或兼容版本。
 
-v0.5 增加了内置的跨平台命令行编辑器，不依赖外部 readline 动态库。Linux 和 Windows 都可以直接使用 `Tab`。
+Linux：
 
-补全规则：
-
-```text
-cd / ls / get          -> 查询并补全远端路径
-lcd / lls              -> 补全本地路径
-put 第 1 个路径参数    -> 补全本地路径
-put 第 2 个路径参数    -> 查询并补全远端路径
-get 第 2 个路径参数    -> 补全本地路径
-overwrite              -> 补全 on / off
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o p2p-friend-linux-amd64 .
 ```
 
-例如 Linux 主动连接 Windows 后：
+Windows：
 
-```text
-cd D:\Bai<Tab>
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o p2p-friend-windows-amd64.exe .
 ```
 
-程序会向 Windows 查询对应目录。如果唯一候选是：
+运行测试：
 
-```text
-D:\BaiduNetdiskDownload\
-```
-
-就会直接补全。多个候选会列出来，再继续输入即可。
-
-路径里有空格时会自动加引号。例如输入：
-
-```text
-cd 正<Tab>
-```
-
-如果候选为：
-
-```text
-正点原子 RK3568资料/
-```
-
-命令行会自动变成类似：
-
-```text
-cd "正点原子 RK3568资料/"
-```
-
-中文路径不需要额外转义。Windows 的 `D:\...` 和 Linux 的 `/home/...` 会按远端系统的路径风格分别处理。
-
-命令行编辑还支持：
-
-```text
-Left / Right           移动光标
-Up / Down              浏览本次会话命令历史
-Ctrl-A / Ctrl-E        跳到行首 / 行尾
-Ctrl-L                 清屏并重绘
-Ctrl-C                 取消当前传输；没有传输时清空当前输入，不退出
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 ## Release
 
-仓库根目录的 `VERSION` 保存当前发布版本，例如：
+仓库根目录的 `VERSION` 保存当前发布版本。
 
-```text
-0.5.0
-```
+包含新版本号的 PR 合并到 `main` 后，GitHub Actions 会自动：
 
-合并一个包含新 `VERSION` 的 PR 到 `main` 后，Release workflow 会自动：
-
-1. 运行 `go test ./...` 和 `go vet ./...`
-2. 构建 Linux amd64 / Windows amd64
-3. 创建对应的 `v0.5.0` Git tag（如果还不存在）
+1. 运行测试和静态检查
+2. 构建 Linux amd64 和 Windows amd64
+3. 创建对应版本的 Git tag
 4. 生成 `SHA256SUMS.txt`
-5. 创建 GitHub Release 并上传二进制
+5. 创建 GitHub Release
+6. 上传二进制和校验文件
 
-仍然支持手工推送 `v*` tag；手工 tag 也会直接走同一套发布流程。
+手工推送 `v*` tag 也会进入同一套发布流程。
