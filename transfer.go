@@ -405,19 +405,23 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.cancelled {
+		t.mu.Unlock()
 		return nil
 	}
 	if t.currentFile != nil {
 		t.markCancelledLocked("new entry arrived before previous file finished")
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 	dst, err := transferEntryDestination(t.targetRoot, t.meta.Name, e.Path)
 	if err != nil {
 		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 
@@ -425,22 +429,29 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 		created, err := ensureReceiveDir(dst, os.FileMode(e.Mode))
 		if err != nil {
 			t.markCancelledLocked(err.Error())
-			go s.sendCancel(id, t.cancelWhy)
+			reason := t.cancelWhy
+			t.mu.Unlock()
+			go s.sendCancel(id, reason)
 			return nil
 		}
 		t.createdDirs = append(t.createdDirs, created...)
+		t.mu.Unlock()
 		return nil
 	}
 
 	if e.Size < 0 {
 		t.markCancelledLocked("negative file size")
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 	createdParents, err := ensureReceiveDir(filepath.Dir(dst), 0o755)
 	if err != nil {
 		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 	t.createdDirs = append(t.createdDirs, createdParents...)
@@ -450,36 +461,55 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 		existed = true
 		if st.Mode()&os.ModeSymlink != 0 {
 			t.markCancelledLocked("refusing to overwrite symlink: " + dst)
-			go s.sendCancel(id, t.cancelWhy)
+			reason := t.cancelWhy
+			t.mu.Unlock()
+			go s.sendCancel(id, reason)
 			return nil
 		}
 		if st.IsDir() {
 			t.markCancelledLocked("destination is a directory: " + dst)
-			go s.sendCancel(id, t.cancelWhy)
+			reason := t.cancelWhy
+			t.mu.Unlock()
+			go s.sendCancel(id, reason)
 			return nil
 		}
 		if !s.getOverwrite() {
 			t.markCancelledLocked("目标已存在: " + dst + "（接收方可执行 overwrite on 后重试）")
-			go s.sendCancel(id, t.cancelWhy)
+			reason := t.cancelWhy
+			t.mu.Unlock()
+			go s.sendCancel(id, reason)
 			return nil
 		}
 	} else if !os.IsNotExist(err) {
 		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".p2p-friend-*.part")
 	if err != nil {
 		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
+		return nil
+	}
+	if err := tmp.Truncate(e.Size); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		t.markCancelledLocked(err.Error())
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
 		return nil
 	}
 	t.currentPath = dst
 	t.currentFile = tmp
 	t.currentTemp = tmp.Name()
-	t.currentHash = sha256.New()
 	t.currentRemaining = e.Size
+	resetInboundData(t, e.Size)
 	t.currentMode = os.FileMode(e.Mode)
 	t.progress.Current = e.Path
 	t.progress.CurrentDone = 0
@@ -487,10 +517,20 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	if existed {
 		t.overwritten = append(t.overwritten, dst)
 	}
-	return nil
+	t.mu.Unlock()
+
+	return s.writeFrame(frameEntryReady, id, []byte(e.Path))
 }
 
 func (s *peerSession) handleTransferData(id uint64, payload []byte) error {
+	if len(payload) < 8 {
+		return errors.New("data frame missing offset")
+	}
+	offset := int64(binary.BigEndian.Uint64(payload[:8]))
+	return s.handleTransferDataAt(id, offset, payload[8:])
+}
+
+func (s *peerSession) handleTransferDataAt(id uint64, offset int64, payload []byte) error {
 	t := s.getInbound(id)
 	if t == nil {
 		return fmt.Errorf("data for unknown transfer %d", id)
@@ -505,25 +545,40 @@ func (s *peerSession) handleTransferData(id uint64, payload []byte) error {
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	if int64(len(payload)) > t.currentRemaining {
-		t.markCancelledLocked("received more bytes than declared")
+	if offset < 0 || offset+int64(len(payload)) > t.currentRemaining {
+		t.markCancelledLocked("received data outside declared file range")
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	if _, err := t.currentFile.Write(payload); err != nil {
+	st := getInboundData(t)
+	if st == nil {
+		t.markCancelledLocked("data state missing")
+		go s.sendCancel(id, t.cancelWhy)
+		return nil
+	}
+	if old, exists := st.chunks[offset]; exists {
+		if old != len(payload) {
+			t.markCancelledLocked("duplicate chunk has different size")
+			go s.sendCancel(id, t.cancelWhy)
+		}
+		return nil
+	}
+	if _, err := t.currentFile.WriteAt(payload, offset); err != nil {
 		t.markCancelledLocked("write failed: " + err.Error())
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	if _, err := t.currentHash.Write(payload); err != nil {
-		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	t.currentRemaining -= int64(len(payload))
+	st.chunks[offset] = len(payload)
+	st.received += int64(len(payload))
 	t.progress.Done += int64(len(payload))
 	t.progress.CurrentDone += int64(len(payload))
 	t.progress.print(false)
+	if st.received == t.currentRemaining {
+		st.once.Do(func() { close(st.done) })
+	} else if st.received > t.currentRemaining {
+		t.markCancelledLocked("received more bytes than declared")
+		go s.sendCancel(id, t.cancelWhy)
+	}
 	return nil
 }
 
@@ -532,25 +587,51 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 	if t == nil {
 		return fmt.Errorf("entry end for unknown transfer %d", id)
 	}
+
+	t.mu.Lock()
+	if t.cancelled {
+		t.cleanupCurrentLocked()
+		t.mu.Unlock()
+		return nil
+	}
+	st := getInboundData(t)
+	if t.currentFile == nil || st == nil {
+		t.markCancelledLocked("file end without active file")
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
+		return nil
+	}
+	done := st.done
+	t.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(90 * time.Second):
+		s.cancelInbound(id, "timeout waiting for parallel data streams", true)
+		return nil
+	case <-s.closed:
+		return errors.New("connection closed while receiving file")
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.cancelled {
 		t.cleanupCurrentLocked()
 		return nil
 	}
-	if t.currentFile == nil {
-		t.markCancelledLocked("file end without active file")
+	st = getInboundData(t)
+	if st == nil || st.received != t.currentRemaining {
+		received := int64(0)
+		if st != nil {
+			received = st.received
+		}
+		t.markCancelledLocked(fmt.Sprintf("file ended with %d/%d bytes", received, t.currentRemaining))
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	if t.currentRemaining != 0 {
-		t.markCancelledLocked(fmt.Sprintf("file ended with %d bytes missing", t.currentRemaining))
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	actual := t.currentHash.Sum(nil)
-	if len(payload) != sha256.Size || !equalBytes(actual, payload) {
-		t.markCancelledLocked("SHA-256 mismatch for " + t.currentPath)
+	if len(payload) != sha256.Size {
+		t.markCancelledLocked("invalid SHA-256 length")
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
@@ -564,6 +645,26 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.markCancelledLocked(err.Error())
+		go s.sendCancel(id, t.cancelWhy)
+		return nil
+	}
+	h := sha256.New()
+	if _, err := io.CopyBuffer(h, f, make([]byte, 1024*1024)); err != nil {
+		t.markCancelledLocked("verify read failed: " + err.Error())
+		go s.sendCancel(id, t.cancelWhy)
+		return nil
+	}
+	actual := h.Sum(nil)
+	if !equalBytes(actual, payload) {
+		consolePrintf("[VERIFY] %s  SHA-256 %x  FAIL（发送端 %x）\n", path, actual, payload)
+		t.markCancelledLocked("SHA-256 mismatch for " + path)
+		go s.sendCancel(id, t.cancelWhy)
+		return nil
+	}
+	consolePrintf("[VERIFY] %s  SHA-256 %x  OK\n", path, actual)
+
 	if err := f.Chmod(mode.Perm()); err != nil && runtime.GOOS != "windows" {
 		t.markCancelledLocked(err.Error())
 		go s.sendCancel(id, t.cancelWhy)
@@ -602,8 +703,8 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 	}
 	t.currentTemp = ""
 	t.currentPath = ""
-	t.currentHash = nil
 	t.currentRemaining = 0
+	clearInboundData(t)
 	if !existed {
 		t.createdFiles = append(t.createdFiles, path)
 	}
@@ -798,6 +899,7 @@ func (t *inboundTransfer) markCancelledLocked(reason string) {
 }
 
 func (t *inboundTransfer) cleanupCurrentLocked() {
+	clearInboundData(t)
 	if t.currentFile != nil {
 		_ = t.currentFile.Close()
 		t.currentFile = nil
