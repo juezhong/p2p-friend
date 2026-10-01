@@ -99,36 +99,32 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 			return "", err
 		}
 		switch r {
-		case '', '
-':
+		case '\r', '\n':
 			e.mu.Lock()
 			line := string(e.line)
 			e.clearInteractiveLocked()
 			e.status = ""
-			fmt.Fprint(e.out, e.prompt, line, "
-")
+			fmt.Fprint(e.out, e.prompt, line, "\r\n")
 			e.active = false
 			e.mu.Unlock()
 			if strings.TrimSpace(line) != "" {
 				e.addHistory(line)
 			}
 			return line, nil
-		case 3:
+		case 3: // Ctrl-C
 			e.mu.Lock()
 			e.clearInteractiveLocked()
 			e.status = ""
-			fmt.Fprint(e.out, "^C
-")
+			fmt.Fprint(e.out, "^C\r\n")
 			e.active = false
 			e.mu.Unlock()
 			return "", errLineInterrupt
-		case 4:
+		case 4: // Ctrl-D
 			e.mu.Lock()
 			if len(e.line) == 0 {
 				e.clearInteractiveLocked()
 				e.status = ""
-				fmt.Fprint(e.out, "
-")
+				fmt.Fprint(e.out, "\r\n")
 				e.active = false
 				e.mu.Unlock()
 				return "", io.EOF
@@ -138,22 +134,22 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 				e.redrawLocked()
 			}
 			e.mu.Unlock()
-		case 1:
+		case 1: // Ctrl-A
 			e.mu.Lock()
 			e.cursor = 0
 			e.redrawLocked()
 			e.mu.Unlock()
-		case 5:
+		case 5: // Ctrl-E
 			e.mu.Lock()
 			e.cursor = len(e.line)
 			e.redrawLocked()
 			e.mu.Unlock()
-		case 12:
+		case 12: // Ctrl-L
 			e.mu.Lock()
-			fmt.Fprint(e.out, "[2J[H")
+			fmt.Fprint(e.out, "\x1b[2J\x1b[H")
 			e.redrawLocked()
 			e.mu.Unlock()
-		case '	':
+		case '\t':
 			e.complete()
 		case 8, 127:
 			e.mu.Lock()
@@ -187,9 +183,10 @@ func (e *lineEditor) Write(p []byte) (int, error) {
 		return e.out.Write(p)
 	}
 
-	if len(p) > 0 && p[0] == '' && !bytes.ContainsAny(p, "
-") {
-		e.status = strings.TrimPrefix(string(p), "")
+	// 进度更新使用单独的状态行，不把每个刷新都插进命令历史区。
+	// progress.print() 的非最终刷新格式固定为 "\r..." 且不带换行。
+	if len(p) > 0 && p[0] == '\r' && !bytes.ContainsAny(p, "\n") {
+		e.status = strings.TrimPrefix(string(p), "\r")
 		e.redrawLocked()
 		return len(p), nil
 	}
@@ -197,17 +194,13 @@ func (e *lineEditor) Write(p []byte) (int, error) {
 	e.clearInteractiveLocked()
 	e.status = ""
 	text := string(p)
-	text = strings.TrimPrefix(text, "")
-	text = strings.TrimLeft(text, "
-")
+	text = strings.TrimPrefix(text, "\r")
+	text = strings.TrimLeft(text, "\n")
 	_, err := io.WriteString(e.out, text)
-	if text != "" && !strings.HasSuffix(text, "
-") && !strings.HasSuffix(text, "") {
-		fmt.Fprint(e.out, "
-")
-	} else if strings.HasSuffix(text, "") {
-		fmt.Fprint(e.out, "
-")
+	if text != "" && !strings.HasSuffix(text, "\n") && !strings.HasSuffix(text, "\r") {
+		fmt.Fprint(e.out, "\r\n")
+	} else if strings.HasSuffix(text, "\r") {
+		fmt.Fprint(e.out, "\n")
 	}
 	e.redrawLocked()
 	if err != nil {
@@ -217,22 +210,25 @@ func (e *lineEditor) Write(p []byte) (int, error) {
 }
 
 func (e *lineEditor) clearInteractiveLocked() {
-	fmt.Fprint(e.out, "[2K[E[2K[F")
+	// 清掉输入行和它下面的进度状态行，再从输入行起点输出异步消息。
+	fmt.Fprint(e.out, "\r\x1b[2K\x1b[E\x1b[2K\x1b[F")
 }
 
 func (e *lineEditor) redrawLocked() {
-	fmt.Fprint(e.out, "[2K", e.prompt, string(e.line))
+	fmt.Fprint(e.out, "\r\x1b[2K", e.prompt, string(e.line))
 	if e.cursor < len(e.line) {
 		w := displayWidthRunes(e.line[e.cursor:])
 		if w > 0 {
-			fmt.Fprintf(e.out, "[%dD", w)
+			fmt.Fprintf(e.out, "\x1b[%dD", w)
 		}
 	}
-	fmt.Fprint(e.out, "[s[E[2K")
+
+	// 状态行放在提示符下一行，然后恢复光标到原输入位置。
+	fmt.Fprint(e.out, "\x1b[s\x1b[E\x1b[2K")
 	if e.status != "" {
 		fmt.Fprint(e.out, e.status)
 	}
-	fmt.Fprint(e.out, "[u")
+	fmt.Fprint(e.out, "\x1b[u")
 }
 
 func (e *lineEditor) handleEscapeSequence() {
@@ -329,8 +325,7 @@ func (e *lineEditor) complete() {
 	if len(res.candidates) > 1 {
 		e.clearInteractiveLocked()
 		e.status = ""
-		fmt.Fprint(e.out, "
-")
+		fmt.Fprint(e.out, "\r\n")
 		for _, c := range res.candidates {
 			name := c.value
 			if c.dir {
@@ -347,6 +342,8 @@ func buildCompletion(s *peerSession, line []rune, cursor int) completionResult {
 		return completionResult{}
 	}
 	tokens, current := scanCompletionPrefix(line[:cursor])
+	// 目录补全会把光标放在闭合引号前；继续补全时一并替换旧的闭合引号，
+	// 避免唯一候选完成后产生两个引号。
 	if current.quote != 0 && current.rawEnd == cursor && cursor < len(line) && line[cursor] == current.quote {
 		current.rawEnd++
 	}
@@ -457,8 +454,8 @@ func renderCompletionPrefix(value string) (string, int) {
 		return value, len([]rune(value))
 	}
 	quote := '"'
-	if strings.ContainsRune(value, '"') && !strings.ContainsRune(value, ''') {
-		quote = '''
+	if strings.ContainsRune(value, '"') && !strings.ContainsRune(value, '\'') {
+		quote = '\''
 	}
 	if strings.ContainsRune(value, quote) {
 		raw := escapeUnquotedToken(value)
@@ -473,8 +470,8 @@ func renderCompletionToken(c completionCandidate) (string, int) {
 		return c.value, len([]rune(c.value))
 	}
 	quote := '"'
-	if strings.ContainsRune(c.value, '"') && !strings.ContainsRune(c.value, ''') {
-		quote = '''
+	if strings.ContainsRune(c.value, '"') && !strings.ContainsRune(c.value, '\'') {
+		quote = '\''
 	}
 	if strings.ContainsRune(c.value, quote) {
 		raw := escapeUnquotedToken(c.value)
@@ -483,20 +480,20 @@ func renderCompletionToken(c completionCandidate) (string, int) {
 	raw := string(quote) + c.value + string(quote)
 	pos := len([]rune(raw))
 	if c.dir {
-		pos--
+		pos-- // 目录补全后把光标留在闭合引号前，便于继续输入下一级。
 	}
 	return raw, pos
 }
 
 func needsQuoting(s string) bool {
-	return strings.IndexFunc(s, unicode.IsSpace) >= 0 || strings.ContainsAny(s, ""'")
+	return strings.IndexFunc(s, unicode.IsSpace) >= 0 || strings.ContainsAny(s, "\"'")
 }
 
 func escapeUnquotedToken(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsSpace(r) || r == ''' || r == '"' {
-			b.WriteRune('\')
+		if unicode.IsSpace(r) || r == '\'' || r == '"' {
+			b.WriteRune('\\')
 		}
 		b.WriteRune(r)
 	}
@@ -538,16 +535,16 @@ func scanCompletionPrefix(line []rune) ([]completionToken, completionToken) {
 		if start < 0 {
 			start = i
 		}
-		if r == ''' || r == '"' {
+		if r == '\'' || r == '"' {
 			if b.Len() == 0 && tokenQuote == 0 {
 				tokenQuote = r
 			}
 			quote = r
 			continue
 		}
-		if r == '\' && i+1 < len(line) {
+		if r == '\\' && i+1 < len(line) {
 			n := line[i+1]
-			if unicode.IsSpace(n) || n == ''' || n == '"' {
+			if unicode.IsSpace(n) || n == '\'' || n == '"' {
 				b.WriteRune(n)
 				i++
 				continue
@@ -585,7 +582,7 @@ func localPathCandidates(s *peerSession, prefix string, dirsOnly bool) []complet
 		return nil
 	}
 	sep := string(os.PathSeparator)
-	if runtime.GOOS == "windows" && strings.Contains(dirPrefix, "/") && !strings.Contains(dirPrefix, "\") {
+	if runtime.GOOS == "windows" && strings.Contains(dirPrefix, "/") && !strings.Contains(dirPrefix, "\\") {
 		sep = "/"
 	}
 	var out []completionCandidate
@@ -608,7 +605,7 @@ func localPathCandidates(s *peerSession, prefix string, dirsOnly bool) []complet
 func splitLocalCompletionPath(p string) (dirPrefix, namePrefix string) {
 	seps := string(os.PathSeparator)
 	if runtime.GOOS == "windows" {
-		seps = "\/"
+		seps = "\\/"
 	}
 	idx := strings.LastIndexAny(p, seps)
 	if idx < 0 {
@@ -628,7 +625,7 @@ func remotePathCandidates(s *peerSession, prefix string, dirsOnly bool) []comple
 	if err != nil {
 		return nil
 	}
-	windowsStyle := sep == "\"
+	windowsStyle := sep == "\\"
 	var out []completionCandidate
 	for _, entry := range resp.Entries {
 		if dirsOnly && !entry.Dir {
@@ -656,13 +653,13 @@ func pathPrefixMatch(name, prefix string, fold bool) bool {
 func splitRemoteCompletionPath(p, cwd string) (dirPrefix, namePrefix, sep string) {
 	sep = remotePathSeparator(p, cwd)
 	idx := strings.LastIndex(p, sep)
-	if sep == "\" {
+	if sep == "\\" {
 		if slash := strings.LastIndex(p, "/"); slash > idx {
 			idx = slash
 		}
-	} else if backslash := strings.LastIndex(p, "\"); backslash > idx && looksWindowsPath(p) {
+	} else if backslash := strings.LastIndex(p, "\\"); backslash > idx && looksWindowsPath(p) {
 		idx = backslash
-		sep = "\"
+		sep = "\\"
 	}
 	if idx < 0 {
 		return "", p, sep
@@ -672,13 +669,13 @@ func splitRemoteCompletionPath(p, cwd string) (dirPrefix, namePrefix, sep string
 
 func remotePathSeparator(p, cwd string) string {
 	if looksWindowsPath(p) || looksWindowsPath(cwd) {
-		return "\"
+		return "\\"
 	}
 	return "/"
 }
 
 func looksWindowsPath(p string) bool {
-	if strings.Contains(p, "\") {
+	if strings.Contains(p, "\\") {
 		return true
 	}
 	r := []rune(p)
