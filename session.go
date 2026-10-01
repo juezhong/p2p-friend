@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
@@ -36,7 +37,7 @@ func (s *peerSession) readLoop() {
 		f, err := readFrame(s.br)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedErr(err) {
-				consolePrintf("\n[连接] 读取失败: %v\n", err)
+				consolePrintf("[连接] 读取失败: %v\n", err)
 			}
 			return
 		}
@@ -45,49 +46,49 @@ func (s *peerSession) readLoop() {
 			go s.handleRPCRequest(f.ID, f.Payload)
 		case frameRPCResponse:
 			if err := s.handleRPCResponse(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] RPC 响应无效: %v\n", err)
+				consolePrintf("[协议] RPC 响应无效: %v\n", err)
 				return
 			}
 		case frameTransferStart:
 			if err := s.handleTransferStart(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 传输开始无效: %v\n", err)
+				consolePrintf("[协议] 传输开始无效: %v\n", err)
 				return
 			}
 		case frameEntryStart:
 			if err := s.handleEntryStart(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 文件项无效: %v\n", err)
+				consolePrintf("[协议] 文件项无效: %v\n", err)
 				return
 			}
 		case frameData:
 			if err := s.handleTransferData(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 数据帧无效: %v\n", err)
+				consolePrintf("[协议] 数据帧无效: %v\n", err)
 				return
 			}
 		case frameEntryEnd:
 			if err := s.handleEntryEnd(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 文件结束帧无效: %v\n", err)
+				consolePrintf("[协议] 文件结束帧无效: %v\n", err)
 				return
 			}
 		case frameTransferEnd:
 			if err := s.handleTransferEnd(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 传输结束帧无效: %v\n", err)
+				consolePrintf("[协议] 传输结束帧无效: %v\n", err)
 				return
 			}
 		case frameCancel:
 			if err := s.handleCancel(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 取消帧无效: %v\n", err)
+				consolePrintf("[协议] 取消帧无效: %v\n", err)
 				return
 			}
 		case frameTransferResult:
 			if err := s.handleTransferResult(f.ID, f.Payload); err != nil {
-				consolePrintf("\n[协议] 传输结果无效: %v\n", err)
+				consolePrintf("[协议] 传输结果无效: %v\n", err)
 				return
 			}
 		case frameBye:
-			consolePrintln("\n[连接] 对方已退出会话。")
+			consolePrintln("[连接] 对方已退出会话。")
 			return
 		default:
-			consolePrintf("\n[协议] 未知帧类型: %d\n", f.Type)
+			consolePrintf("[协议] 未知帧类型: %d\n", f.Type)
 			return
 		}
 	}
@@ -142,7 +143,7 @@ func (s *peerSession) handleRPCRequest(id uint64, payload []byte) {
 		}
 		go func() {
 			if err := s.sendTransfer(source, "", id, false, tid); err != nil && !errors.Is(err, context.Canceled) {
-				consolePrintf("\n[GET->SEND] 失败: %v\n", err)
+				consolePrintf("[REMOTE GET] 发送失败: %v\n", err)
 			}
 		}()
 		return
@@ -415,46 +416,64 @@ func onOff(v bool) string {
 }
 
 func parseCommandLine(line string) ([]string, error) {
-	line = strings.TrimSpace(line)
-	if line == "" {
+	rs := []rune(strings.TrimSpace(line))
+	if len(rs) == 0 {
 		return nil, nil
 	}
 	var args []string
 	var b strings.Builder
-	var quote rune
+	quote := rune(0)
 	have := false
-	for _, r := range line {
+
+	flush := func() {
+		if have || b.Len() > 0 {
+			args = append(args, b.String())
+			b.Reset()
+			have = false
+		}
+	}
+
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
 		if quote != 0 {
 			if r == quote {
 				quote = 0
 				have = true
 				continue
 			}
+			// 引号内保留反斜杠本身，避免破坏 Windows 路径 D:\dir\file。
 			b.WriteRune(r)
 			have = true
 			continue
 		}
+		if unicode.IsSpace(r) {
+			flush()
+			continue
+		}
+		have = true
 		switch r {
 		case '\'', '"':
 			quote = r
-			have = true
-		case ' ', '\t':
-			if have || b.Len() > 0 {
-				args = append(args, b.String())
-				b.Reset()
-				have = false
+		case '\\':
+			// 未加引号时只把“反斜杠 + 空白/引号”当作转义。
+			// 其它反斜杠按字面保留，这样 Windows 路径无需双写。
+			if i+1 < len(rs) {
+				n := rs[i+1]
+				if unicode.IsSpace(n) || n == '\'' || n == '"' {
+					b.WriteRune(n)
+					i++
+					continue
+				}
 			}
+			b.WriteRune(r)
 		default:
 			b.WriteRune(r)
-			have = true
 		}
 	}
 	if quote != 0 {
 		return nil, errors.New("引号没有闭合")
 	}
-	if have || b.Len() > 0 {
-		args = append(args, b.String())
-	}
+	flush()
 	return args, nil
 }
 

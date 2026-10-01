@@ -46,14 +46,16 @@ func printHelp() {
   lpwd / lls / lcd    操作本地目录
   put <local> [remote] 发送到远端，可指定远端绝对路径
   get <remote> [local] 获取远端文件/目录，可使用远端绝对路径
+  Tab                 自动补全命令、本地路径和远端路径
   cancel              取消当前传输
   Ctrl-C              取消当前传输，不退出会话
   quit / exit          断开并退出
 
 注意：
+  * v0.5 仍使用 P2P4 协议，可与 v0.4 建立连接；Tab 补全是本地 CLI 功能。
   * P2P4 连接码允许会话双方浏览和访问对方当前用户有权限访问的绝对路径。
   * 不使用 TURN/relay；文件数据始终点对点直传。
-  * 如果一个方向 IPv6 TCP 超时，让能够被直连的一方创建会话，另一方加入。
+  * 如果 A→B 连接超时，就让 B 创建会话、A 加入；也就是让“超时方向的目标端”监听。
 `, appVersion)
 }
 
@@ -74,7 +76,7 @@ func runInteractive() error {
 	consolePrintln("2) 加入会话（本机主动连接）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
-	consolePrintln("连接提示：如果 A→B 能连接而 B→A 超时，就让 B 创建会话、A 加入。")
+	consolePrintln("连接提示：如果 A→B 连接超时，就让 B 创建会话、A 加入（让超时方向的目标端监听）。")
 	consolePrintln("")
 
 	for {
@@ -162,10 +164,16 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 
 	consolePrintln("")
 	consolePrintln("会话已就绪。pwd/ls/cd 操作远端；lpwd/lls/lcd 操作本地。")
-	consolePrintln("put/get 都支持绝对路径；Ctrl-C 只取消当前传输，不退出会话。")
+	consolePrintln("支持 Tab 补全：远端命令自动查询对方目录，本地命令补全本机路径。")
+	consolePrintln("空格会自动转义，中文路径可直接输入/补全；put/get 都支持绝对路径。")
+	consolePrintln("Ctrl-C 只取消当前传输，不退出会话。")
 	consolePrintln("警告：连接码持有者可访问本进程用户权限范围内的绝对路径。")
 	consolePrintln("输入 help 查看命令。")
 	consolePrintln("")
+
+	editor := newLineEditor(s, in)
+	restoreConsole := setConsoleWriter(editor)
+	defer restoreConsole()
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt)
@@ -185,40 +193,37 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 		}
 	}()
 
-	lines := make(chan string)
-	readErr := make(chan error, 1)
-	go func() {
-		for {
-			line, err := in.ReadString('\n')
-			if len(line) > 0 {
-				lines <- line
-			}
-			if err != nil {
-				readErr <- err
-				return
-			}
-		}
-	}()
-
 	for {
-		remote := s.getRemoteCwd()
-		if remote == "" {
-			remote = "?"
-		}
-		consolePrintf("p2p[%s remote:%s]> ", s.roleName, remote)
-		var line string
 		select {
 		case <-s.closed:
 			consolePrintln("\n连接已关闭。")
 			return nil
-		case err := <-readErr:
-			if errors.Is(err, io.EOF) {
+		default:
+		}
+
+		line, err := editor.ReadLine(shellPrompt(s))
+		if err != nil {
+			switch {
+			case errors.Is(err, errLineInterrupt):
+				if s.cancelActive("用户按 Ctrl-C 取消传输") {
+					consolePrintln("[CANCEL] 已请求取消当前传输，会话保持连接。")
+				} else {
+					consolePrintln("[CANCEL] 当前没有活动传输；要退出请使用 quit/exit。")
+				}
+				continue
+			case errors.Is(err, io.EOF):
 				_ = s.writeFrame(frameBye, 0, nil)
 				return nil
+			default:
+				select {
+				case <-s.closed:
+					return nil
+				default:
+				}
+				return err
 			}
-			return err
-		case line = <-lines:
 		}
+
 		args, err := parseCommandLine(line)
 		if err != nil {
 			consolePrintf("命令解析失败: %v\n", err)
@@ -293,12 +298,12 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 			}
 			if err := s.put(args[1], remoteDest); err != nil {
 				if errors.Is(err, context.Canceled) {
-					consolePrintf("[SEND] 已取消: %v\n", err)
+					consolePrintf("[PUT] 已取消: %v\n", err)
 				} else {
-					consolePrintf("[SEND] 失败: %v\n", err)
+					consolePrintf("[PUT] 失败: %v\n", err)
 				}
 			} else {
-				consolePrintln("[SEND] 完成。")
+				consolePrintln("[PUT] 完成。")
 			}
 		case "get":
 			if len(args) < 2 || len(args) > 3 {
@@ -363,6 +368,19 @@ func printShellHelp() {
   cancel                      取消当前传输
   Ctrl-C                      等同 cancel，不退出会话
 
+补全与编辑：
+  Tab                         自动补全命令和路径
+  cd/ls/get                   补全远端路径
+  lcd/lls                     补全本地路径
+  put 第1参数                 补全本地路径
+  put 第2参数                 补全远端路径
+  get 第2参数                 补全本地路径
+  ↑/↓                         浏览本次会话命令历史
+  ←/→                         移动光标
+
+路径含空格时，补全会自动加引号；中文路径可直接补全。
+Windows 的 D:\... 路径和 Linux 的 /home/... 路径都会按远端系统风格处理。
+
 其他：
   overwrite on|off            是否允许覆盖本机已有接收文件（默认 off）
   status                      显示连接和目录状态
@@ -370,10 +388,9 @@ func printShellHelp() {
   quit / exit                 断开并退出
 
 示例：
-  ls "D:\\BaiduNetdiskDownload"
-  cd "D:\\BaiduNetdiskDownload\\【正点原子】"
-  get "D:\\BaiduNetdiskDownload\\manual.pdf" ./manual.pdf
-  put ./build.tar "D:\\incoming\\build.tar"
+  cd D:\Bai<Tab>
+  get "D:\BaiduNetdiskDownload\正点原子 产品手册.pdf"
+  put ./build.tar "D:\incoming\build.tar"
 
-安全提示：远端绝对路径访问不再限制在初始目录；请只把连接码交给可信任的人。`)
+安全提示：远端绝对路径访问不限制在初始目录；请只把连接码交给可信任的人。`)
 }

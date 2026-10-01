@@ -70,8 +70,14 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 		return fmt.Errorf("send transfer start: %w", err)
 	}
 
-	p := &progress{Start: time.Now(), LastPrint: time.Now(), Total: total, Prefix: "[SEND]"}
-	consolePrintf("[SEND] %s -> %s (%s)\n", source, remoteDisplay(remoteDest), humanBytes(total))
+	prefix := "[PUT]"
+	if requestID != 0 {
+		prefix = "[REMOTE GET]"
+		consolePrintf("[REMOTE GET] 对方请求下载: %s (%s)\n", source, humanBytes(total))
+	} else {
+		consolePrintf("[PUT] %s -> %s (%s)\n", source, remoteDisplay(remoteDest), humanBytes(total))
+	}
+	p := &progress{Start: time.Now(), LastPrint: time.Now(), Total: total, Prefix: prefix}
 	buf := make([]byte, chunkSize)
 
 	for _, e := range entries {
@@ -208,11 +214,15 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 	}
 
 	root, err := resolveReceiveRoot(base, dest, meta.Name)
+	recvPrefix := "[REMOTE PUT]"
+	if meta.RequestID != 0 {
+		recvPrefix = "[GET]"
+	}
 	t := &inboundTransfer{
 		id:         id,
 		meta:       meta,
 		targetRoot: root,
-		progress:   &progress{Start: time.Now(), LastPrint: time.Now(), Total: meta.Total, Prefix: "[RECV]"},
+		progress:   &progress{Start: time.Now(), LastPrint: time.Now(), Total: meta.Total, Prefix: recvPrefix},
 		getReqID:   meta.RequestID,
 	}
 	if err != nil {
@@ -238,7 +248,11 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 		_ = s.writeJSONFrame(frameCancel, id, transferEnd{Cancelled: true, Error: cancelWhy})
 		return nil
 	}
-	consolePrintf("\n[RECV] %s -> %s (%s)\n", meta.Name, root, humanBytes(meta.Total))
+	if meta.RequestID != 0 {
+		consolePrintf("[GET] %s -> %s (%s)\n", meta.Name, root, humanBytes(meta.Total))
+	} else {
+		consolePrintf("[REMOTE PUT] 对方发送: %s -> %s (%s)\n", meta.Name, root, humanBytes(meta.Total))
+	}
 	return nil
 }
 
@@ -514,15 +528,15 @@ func (s *peerSession) handleTransferEnd(id uint64, payload []byte) error {
 	s.clearForeground("recv", id)
 
 	if cancelled {
-		consolePrintf("\n[RECV] 已取消: %s\n", reason)
+		consolePrintf("%s 已取消: %s\n", t.progress.Prefix, reason)
 		if len(overwrote) > 0 {
-			consolePrintln("[RECV] 注意：overwrite on 时已完成覆盖的文件无法自动恢复：")
+			consolePrintf("%s 注意：overwrite on 时已完成覆盖的文件无法自动恢复：\n", t.progress.Prefix)
 			for _, p := range overwrote {
 				consolePrintf("  %s\n", p)
 			}
 		}
 	} else {
-		consolePrintln("[RECV] 完成。")
+		consolePrintf("%s 完成。\n", t.progress.Prefix)
 	}
 	return nil
 }
@@ -653,7 +667,7 @@ func (t *inboundTransfer) cleanupCurrentLocked() {
 	}
 	if t.currentTemp != "" {
 		if err := os.Remove(t.currentTemp); err != nil && !os.IsNotExist(err) {
-			consolePrintf("\n[RECV] 无法删除临时文件 %s，请手动删除：%v\n", t.currentTemp, err)
+			consolePrintf("%s 无法删除临时文件 %s，请手动删除：%v\n", t.progress.Prefix, t.currentTemp, err)
 		}
 		t.currentTemp = ""
 	}
@@ -667,14 +681,14 @@ func (t *inboundTransfer) rollbackCreatedLocked() {
 	for i := len(t.createdFiles) - 1; i >= 0; i-- {
 		p := t.createdFiles[i]
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			consolePrintf("\n[RECV] 无法删除已接收文件 %s，请手动删除：%v\n", p, err)
+			consolePrintf("%s 无法删除已接收文件 %s，请手动删除：%v\n", t.progress.Prefix, p, err)
 		}
 	}
 	for i := len(t.createdDirs) - 1; i >= 0; i-- {
 		p := t.createdDirs[i]
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			// 非空目录可能包含传输前已有内容，不能强制递归删除。
-			consolePrintf("\n[RECV] 目录未自动删除 %s：%v\n", p, err)
+			consolePrintf("%s 目录未自动删除 %s：%v\n", t.progress.Prefix, p, err)
 		}
 	}
 	t.createdFiles = nil

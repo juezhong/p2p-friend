@@ -275,3 +275,138 @@ func newSessionPair(t *testing.T, aCwd, bCwd string, bWriteDelay time.Duration) 
 	go b.readLoop()
 	return a, b
 }
+
+func TestParseCommandLineAutoEscapedSpaces(t *testing.T) {
+	args, err := parseCommandLine(`get D:\Program\ Files\中文.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `D:\Program Files\中文.txt`
+	if len(args) != 2 || args[1] != want {
+		t.Fatalf("args=%#v want path=%q", args, want)
+	}
+}
+
+func TestLocalCompletionQuotesUnicodeSpaceDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "中文 目录"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &peerSession{localCwd: root}
+	line := []rune("lcd 中")
+	res := buildCompletion(s, line, len(line))
+	if len(res.candidates) != 1 {
+		t.Fatalf("candidates=%#v", res.candidates)
+	}
+	got := string(res.replace)
+	want := `"中文 目录/"`
+	if runtime.GOOS == "windows" {
+		want = `"中文 目录\"`
+	}
+	if got != want {
+		t.Fatalf("replace=%q want=%q", got, want)
+	}
+	if res.cursor != len([]rune(got))-1 {
+		t.Fatalf("directory cursor=%d replacement runes=%d", res.cursor, len([]rune(got)))
+	}
+	cmd := string(line[:res.start]) + got
+	args, err := parseCommandLine(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 2 || !strings.Contains(args[1], "中文 目录") {
+		t.Fatalf("completed command parsed as %#v", args)
+	}
+}
+
+func TestRemoteCompletionUsesPeerDirectory(t *testing.T) {
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+	if err := os.Mkdir(filepath.Join(bLocal, "远程 空格"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bLocal, "远程文件.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, b := newSessionPair(t, aLocal, bLocal, 0)
+	defer a.close(false)
+	defer b.close(false)
+	if _, err := a.remotePwd(); err != nil {
+		t.Fatal(err)
+	}
+
+	line := []rune("cd 远")
+	res := buildCompletion(a, line, len(line))
+	if len(res.candidates) != 1 || !res.candidates[0].dir {
+		t.Fatalf("cd candidates=%#v", res.candidates)
+	}
+	if got := string(res.replace); got != `"远程 空格/"` {
+		t.Fatalf("cd completion=%q", got)
+	}
+
+	line = []rune("get 远程文")
+	res = buildCompletion(a, line, len(line))
+	if len(res.candidates) != 1 || res.candidates[0].dir {
+		t.Fatalf("get candidates=%#v", res.candidates)
+	}
+	if got := string(res.replace); got != "远程文件.txt" {
+		t.Fatalf("get completion=%q", got)
+	}
+
+	// 光标位于自动生成的闭合引号前时继续补全，不应产生两个闭合引号。
+	if err := os.WriteFile(filepath.Join(bLocal, "远程 文件.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	line = []rune(`get "远程 文"`)
+	res = buildCompletion(a, line, len(line)-1)
+	if got := string(res.replace); got != `"远程 文件.txt"` {
+		t.Fatalf("quoted continuation completion=%q", got)
+	}
+	if res.end != len(line) {
+		t.Fatalf("completion should replace old closing quote: end=%d len=%d", res.end, len(line))
+	}
+}
+
+func TestWindowsRemoteCompletionSplit(t *testing.T) {
+	dir, base, sep := splitRemoteCompletionPath(`D:\BaiduNetdiskDownload\正点`, `D:\Downdata`)
+	if dir != `D:\BaiduNetdiskDownload\` || base != "正点" || sep != `\` {
+		t.Fatalf("dir=%q base=%q sep=%q", dir, base, sep)
+	}
+	dir, base, sep = splitRemoteCompletionPath(`D:\`, `D:\Downdata`)
+	if dir != `D:\` || base != "" || sep != `\` {
+		t.Fatalf("root dir=%q base=%q sep=%q", dir, base, sep)
+	}
+}
+
+func TestDisplayWidthChinese(t *testing.T) {
+	if got := displayWidthRunes([]rune("A中B")); got != 4 {
+		t.Fatalf("display width=%d want=4", got)
+	}
+}
+
+func TestLineEditorAsyncOutputKeepsPromptAndInput(t *testing.T) {
+	var out bytes.Buffer
+	e := &lineEditor{out: &out, active: true, prompt: "p2p> ", line: []rune("get 中文"), cursor: len([]rune("get 中文"))}
+
+	if _, err := e.Write([]byte("\r[GET] file.bin 50.00%  512 MiB / 1 GiB  8 MiB/s")); err != nil {
+		t.Fatal(err)
+	}
+	if e.status == "" {
+		t.Fatal("progress status was not stored")
+	}
+	if got := out.String(); !strings.Contains(got, "p2p> get 中文") || !strings.Contains(got, "[GET] file.bin 50.00%") {
+		t.Fatalf("progress redraw missing prompt or status: %q", got)
+	}
+
+	out.Reset()
+	if _, err := e.Write([]byte("[REMOTE GET] 对方请求下载: D:\\资料\\手册.pdf\n")); err != nil {
+		t.Fatal(err)
+	}
+	if e.status != "" {
+		t.Fatalf("ordinary async message should clear status, got %q", e.status)
+	}
+	got := out.String()
+	if !strings.Contains(got, "[REMOTE GET] 对方请求下载") || !strings.Contains(got, "p2p> get 中文") {
+		t.Fatalf("async message did not preserve prompt/input: %q", got)
+	}
+}

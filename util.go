@@ -2,9 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 )
+
+var consoleOut io.Writer = os.Stdout
 
 func (p *progress) print(force bool) {
 	now := time.Now()
@@ -17,17 +21,19 @@ func (p *progress) print(force bool) {
 		elapsed = 0.001
 	}
 	speed := float64(p.Done) / elapsed
-	consoleMu.Lock()
-	defer consoleMu.Unlock()
+	var line string
 	if p.Total > 0 {
 		percent := float64(p.Done) * 100 / float64(p.Total)
-		fmt.Printf("\r%s %-30s %6.2f%%  %s / %s  %s/s", p.Prefix, truncate(p.Current, 30), percent, humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
+		line = fmt.Sprintf("\r%s %-30s %6.2f%%  %s / %s  %s/s", p.Prefix, truncate(p.Current, 30), percent, humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
 	} else {
-		fmt.Printf("\r%s %-30s %s  %s/s", p.Prefix, truncate(p.Current, 30), humanBytes(p.Done), humanBytes(int64(speed)))
+		line = fmt.Sprintf("\r%s %-30s %s  %s/s", p.Prefix, truncate(p.Current, 30), humanBytes(p.Done), humanBytes(int64(speed)))
 	}
 	if force {
-		fmt.Println()
+		line += "\n"
 	}
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	_, _ = io.WriteString(consoleOut, line)
 }
 
 func truncate(s string, n int) string {
@@ -66,14 +72,29 @@ func isClosedErr(err error) bool {
 		strings.Contains(s, "connection reset")
 }
 
+func setConsoleWriter(w io.Writer) func() {
+	if w == nil {
+		w = os.Stdout
+	}
+	consoleMu.Lock()
+	prev := consoleOut
+	consoleOut = w
+	consoleMu.Unlock()
+	return func() {
+		consoleMu.Lock()
+		consoleOut = prev
+		consoleMu.Unlock()
+	}
+}
+
 func consolePrintf(format string, args ...any) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	fmt.Printf(format, args...)
+	fmt.Fprintf(consoleOut, format, args...)
 }
 
 func consolePrintln(args ...any) {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	fmt.Println(args...)
+	fmt.Fprintln(consoleOut, args...)
 }

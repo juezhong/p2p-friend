@@ -156,7 +156,7 @@ func connectionHint(addr string) string {
 		return "\n提示：这是私有 IPv4，只能用于同一局域网/VPN。公网请优先使用 global IPv6 连接码。"
 	}
 	if ip.To4() == nil {
-		return "\n提示：IPv6 TCP 在文件传输前就失败，通常是创建会话一方的主机/路由器 IPv6 入站防火墙阻断。让能够被直连的一方创建会话，另一方选择加入。"
+		return "\n提示：IPv6 TCP 在文件传输前就失败。若 A→B 连接超时，请让 B 创建会话、A 加入；也就是让超时方向的目标端监听。"
 	}
 	return ""
 }
