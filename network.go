@@ -72,11 +72,8 @@ func printConnectionCodes(ln net.Listener, token []byte, fingerprintHex string) 
 		if err != nil {
 			return err
 		}
-		consolePrintf("  %s %s
-", addr, addressScope(addr))
-		consolePrintf("  %s
-
-", code)
+		consolePrintf("  %s %s\n", addr, addressScope(addr))
+		consolePrintf("  %s\n\n", code)
 	}
 	return nil
 }
@@ -123,8 +120,7 @@ func dialPeer(rawCode string) (net.Conn, []byte, error) {
 		return nil, nil, errors.New("连接码中的证书指纹无效")
 	}
 
-	consolePrintf("正在连接 %s ...
-", code.Address)
+	consolePrintf("正在连接 %s ...\n", code.Address)
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, // 使用连接码中的 SHA-256 证书指纹校验临时证书。
 		MinVersion:         tls.VersionTLS13,
@@ -158,12 +154,10 @@ func connectionHint(addr string) string {
 		return ""
 	}
 	if ip.To4() != nil && ip.IsPrivate() {
-		return "
-提示：这是私有 IPv4，只能用于同一局域网/VPN。公网请优先使用 global IPv6 连接码。"
+		return "\n提示：这是私有 IPv4，只能用于同一局域网/VPN。公网请优先使用 global IPv6 连接码。"
 	}
 	if ip.To4() == nil {
-		return "
-提示：IPv6 TCP 在文件传输前就失败了，通常是创建会话一方的主机/路由器 IPv6 入站防火墙阻断。让另一方创建会话再试。"
+		return "\n提示：IPv6 TCP 在文件传输前就失败了，通常是创建会话一方的主机/路由器 IPv6 入站防火墙阻断。让另一方创建会话再试。"
 	}
 	return ""
 }
