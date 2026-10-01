@@ -22,12 +22,8 @@ jobs:
           go-version: "1.23.x"
           cache: false
 
-      - name: Tidy modules
-        run: |
-          go mod tidy
-          echo '--- GO_SUM_BEGIN ---'
-          cat go.sum
-          echo '--- GO_SUM_END ---'
+      - name: Download dependencies
+        run: go mod download
 
       - name: Test
         run: go test ./...
