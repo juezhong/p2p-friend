@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -408,5 +409,83 @@ func TestLineEditorAsyncOutputKeepsPromptAndInput(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "[REMOTE GET] 对方请求下载") || !strings.Contains(got, "p2p> get 中文") {
 		t.Fatalf("async message did not preserve prompt/input: %q", got)
+	}
+}
+
+type multiLaneTestConn struct {
+	net.Conn
+	lanes []io.ReadWriteCloser
+}
+
+func (c *multiLaneTestConn) DataLanes() []io.ReadWriteCloser { return c.lanes }
+
+func newMultiLaneSessionPair(t *testing.T, aCwd, bCwd string) (*peerSession, *peerSession) {
+	t.Helper()
+	ca, cb := net.Pipe()
+	aLanes := make([]io.ReadWriteCloser, 0, parallelLanes)
+	bLanes := make([]io.ReadWriteCloser, 0, parallelLanes)
+	for i := 0; i < parallelLanes; i++ {
+		la, lb := net.Pipe()
+		aLanes = append(aLanes, la)
+		bLanes = append(bLanes, lb)
+	}
+	a := initPeerSession(&multiLaneTestConn{Conn: ca, lanes: aLanes}, "A", aCwd)
+	b := initPeerSession(&multiLaneTestConn{Conn: cb, lanes: bLanes}, "B", bCwd)
+	go a.readLoop()
+	go b.readLoop()
+	return a, b
+}
+
+func TestParallelDataLanesTransferAndHash(t *testing.T) {
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 180000)
+	if err := os.WriteFile(filepath.Join(aLocal, "large.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, b := newMultiLaneSessionPair(t, aLocal, bLocal)
+	defer a.close(false)
+	defer b.close(false)
+	if st := dataState(a); st == nil || len(st.lanes) != parallelLanes {
+		t.Fatalf("sender data lanes = %#v", st)
+	}
+	if st := dataState(b); st == nil || len(st.lanes) != parallelLanes {
+		t.Fatalf("receiver data lanes = %#v", st)
+	}
+	if err := a.put("large.bin", "received.bin"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(bLocal, "received.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("parallel lane payload mismatch")
+	}
+	wantHash, err := fileSHA256(filepath.Join(aLocal, "large.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotHash, err := fileSHA256(filepath.Join(bLocal, "received.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotHash, wantHash) {
+		t.Fatalf("hash mismatch sender=%x receiver=%x", wantHash, gotHash)
+	}
+}
+
+func TestSessionAuthenticationTokenAndRoles(t *testing.T) {
+	token := bytes.Repeat([]byte{0x5a}, 32)
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- authenticateListener(left, token, roleHost) }()
+	if err := authenticateDialer(right, token, roleJoin); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }
