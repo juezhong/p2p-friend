@@ -1,0 +1,10 @@
+# Build outputs
+p2p-friend
+p2p-friend.exe
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

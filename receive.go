@@ -1,0 +1,234 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+func receiveSessionReader(br *bufio.Reader, outDir string, overwrite bool, total int64, prefix string) error {
+	buf := make([]byte, copyBufferSize)
+	p := &progress{Start: time.Now(), LastPrint: time.Now(), Total: total, Prefix: prefix}
+	for {
+		typ, err := br.ReadByte()
+		if err != nil {
+			return fmt.Errorf("read record type: %w", err)
+		}
+		if typ == recordEnd {
+			p.print(true)
+			return nil
+		}
+		if typ != recordDir && typ != recordFile {
+			return fmt.Errorf("unknown record type: %d", typ)
+		}
+
+		var pathLen uint32
+		if err := binary.Read(br, binary.BigEndian, &pathLen); err != nil {
+			return err
+		}
+		if pathLen == 0 || pathLen > maxPathBytes {
+			return fmt.Errorf("invalid path length: %d", pathLen)
+		}
+		pathBytes := make([]byte, pathLen)
+		if _, err := io.ReadFull(br, pathBytes); err != nil {
+			return err
+		}
+		rel := string(pathBytes)
+		dst, err := safeDestination(outDir, rel)
+		if err != nil {
+			return err
+		}
+
+		var mode uint32
+		if err := binary.Read(br, binary.BigEndian, &mode); err != nil {
+			return err
+		}
+
+		if typ == recordDir {
+			if err := makeReceiveDir(dst, os.FileMode(mode)); err != nil {
+				return err
+			}
+			continue
+		}
+
+		var size uint64
+		if err := binary.Read(br, binary.BigEndian, &size); err != nil {
+			return err
+		}
+		if size > uint64(^uint64(0)>>1) {
+			return errors.New("file size exceeds protocol implementation limit")
+		}
+		if err := receiveFile(br, dst, os.FileMode(mode), int64(size), overwrite, buf, p); err != nil {
+			return err
+		}
+	}
+}
+
+func makeReceiveDir(dst string, mode os.FileMode) error {
+	if err := ensureNoSymlinkParents(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	if st, err := os.Lstat(dst); err == nil {
+		if !st.IsDir() {
+			return fmt.Errorf("destination exists and is not a directory: %s", dst)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(dst, mode.Perm()); err != nil {
+		return fmt.Errorf("create directory %s: %w", dst, err)
+	}
+	return nil
+}
+
+func receiveFile(r *bufio.Reader, dst string, mode os.FileMode, size int64, overwrite bool, buf []byte, p *progress) error {
+	if err := ensureNoSymlinkParents(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if !overwrite {
+		if _, err := os.Lstat(dst); err == nil {
+			return fmt.Errorf("目标已存在: %s（需要时先执行 overwrite on）", dst)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".p2p-file-*.part")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	keep := false
+	defer func() {
+		tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	h := sha256.New()
+	p.Current = filepath.Base(dst)
+	p.CurrentDone = 0
+	p.CurrentSize = size
+	if err := copyExactWithProgress(tmp, r, h, size, buf, p); err != nil {
+		return fmt.Errorf("receive %s: %w", dst, err)
+	}
+
+	expected := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(r, expected); err != nil {
+		return fmt.Errorf("read checksum for %s: %w", dst, err)
+	}
+	actual := h.Sum(nil)
+	if !bytes.Equal(actual, expected) {
+		return fmt.Errorf("SHA-256 mismatch for %s", dst)
+	}
+
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(mode.Perm()); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if overwrite {
+		if st, err := os.Lstat(dst); err == nil {
+			if st.IsDir() {
+				return fmt.Errorf("cannot overwrite directory with file: %s", dst)
+			}
+			if err := os.Remove(dst); err != nil {
+				return fmt.Errorf("remove existing file %s: %w", dst, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("finalize %s: %w", dst, err)
+	}
+	keep = true
+	return nil
+}
+
+func safeDestination(base, relSlash string) (string, error) {
+	if strings.ContainsRune(relSlash, '\x00') {
+		return "", errors.New("path contains NUL")
+	}
+	rel := filepath.FromSlash(relSlash)
+	clean := filepath.Clean(rel)
+	if clean == "." || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("unsafe path: %q", relSlash)
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes output directory: %q", relSlash)
+	}
+	if runtime.GOOS == "windows" {
+		vol := filepath.VolumeName(clean)
+		if vol != "" {
+			return "", fmt.Errorf("unsafe Windows volume path: %q", relSlash)
+		}
+	}
+
+	dst := filepath.Join(base, clean)
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	absDst, err := filepath.Abs(dst)
+	if err != nil {
+		return "", err
+	}
+	relCheck, err := filepath.Rel(absBase, absDst)
+	if err != nil {
+		return "", err
+	}
+	if relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes output directory: %q", relSlash)
+	}
+	return absDst, nil
+}
+
+func ensureNoSymlinkParents(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	vol := filepath.VolumeName(abs)
+	rest := strings.TrimPrefix(abs, vol)
+	parts := strings.FieldsFunc(rest, func(r rune) bool {
+		return r == '/' || r == '\\'
+	})
+	current := vol + string(os.PathSeparator)
+	if vol == "" && !filepath.IsAbs(abs) {
+		current = ""
+	}
+	for _, part := range parts {
+		current = filepath.Join(current, part)
+		st, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write through symlinked directory: %s", current)
+		}
+	}
+	return nil
+}
