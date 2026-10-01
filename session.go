@@ -28,6 +28,7 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		serveCwd:   cwd,
 		roleName:   roleName,
 	}
+	attachDataLanes(s, conn)
 	return s
 }
 
@@ -59,6 +60,8 @@ func (s *peerSession) readLoop() {
 				consolePrintf("[协议] 文件项无效: %v\n", err)
 				return
 			}
+		case frameEntryReady:
+			s.handleEntryReady(f.ID, f.Payload)
 		case frameData:
 			if err := s.handleTransferData(f.ID, f.Payload); err != nil {
 				consolePrintf("[协议] 数据帧无效: %v\n", err)
@@ -385,6 +388,7 @@ func printEntries(entries []remoteEntry) {
 }
 
 func (s *peerSession) close(sendBye bool) {
+	clearDataState(s)
 	s.closeOnce.Do(func() {
 		if sendBye {
 			_ = s.writeFrame(frameBye, 0, nil)

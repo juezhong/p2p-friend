@@ -23,24 +23,20 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
-          cache: true
+          cache: false
 
       - name: Resolve release version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG="$GITHUB_REF_NAME"
             VERSION="${TAG#v}"
             PUBLISH=true
           else
             VERSION="$(tr -d '[:space:]' < VERSION)"
-            if [[ -z "$VERSION" ]]; then
-              echo "VERSION is empty" >&2
-              exit 1
-            fi
+            [[ -n "$VERSION" ]] || { echo "VERSION is empty" >&2; exit 1; }
             TAG="v${VERSION}"
             if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
               echo "${TAG} already exists; nothing to publish from main."
@@ -49,10 +45,12 @@ jobs:
               PUBLISH=true
             fi
           fi
-
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+
+      - name: Download dependencies
+        run: go mod download
 
       - name: Test
         if: steps.version.outputs.publish == 'true'
@@ -68,15 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
-            -o dist/p2p-friend-linux-amd64 .
-
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
-            -o dist/p2p-friend-windows-amd64.exe .
-
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}"             -o dist/p2p-friend-linux-amd64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}"             -o dist/p2p-friend-windows-amd64.exe .
           (cd dist && sha256sum p2p-friend-* > SHA256SUMS.txt)
 
       - name: Create version tag
@@ -98,18 +89,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
+          NOTES="docs/releases/${TAG}.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              dist/p2p-friend-linux-amd64 \
-              dist/p2p-friend-windows-amd64.exe \
-              dist/SHA256SUMS.txt \
-              --clobber
+            gh release upload "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt --clobber
+          elif [[ -f "$NOTES" ]]; then
+            gh release create "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt               --verify-tag --title "$TAG" --notes-file "$NOTES"
           else
-            gh release create "$TAG" \
-              dist/p2p-friend-linux-amd64 \
-              dist/p2p-friend-windows-amd64.exe \
-              dist/SHA256SUMS.txt \
-              --verify-tag \
-              --title "$TAG" \
-              --generate-notes
+            gh release create "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt               --verify-tag --title "$TAG" --generate-notes
           fi

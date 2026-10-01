@@ -1,200 +1,156 @@
 # p2p-friend
 
-`p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，使用方式接近 SFTP。
+`p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，操作方式接近 SFTP。
 
-文件数据在两个端点之间直接传输，不经过 TURN / relay 中继服务器。建立会话后，双方都可以浏览远端文件系统、上传文件或目录、下载文件或目录，并在同一连接中连续执行多次操作。
+v0.6 将网络层升级为 **UDP + ICE + DTLS + SCTP DataChannel**。程序同时收集 IPv6、IPv4 与 STUN server-reflexive 候选，通过 ICE 选择能够直接通信的 UDP 路径；IPv4 位于常见 NAT 后时会尝试 UDP hole punching。项目不配置 TURN / relay，文件数据不会经过应用层中继服务器。
 
 ## 功能
 
 - Linux / Windows x86-64
-- 单文件可执行程序
-- TLS 1.3 加密连接
-- 文件数据点对点直传
+- IPv6 ↔ IPv6 UDP 直连
+- IPv4 ↔ IPv4 STUN / ICE NAT 打洞
+- DTLS 加密与 SCTP 可靠传输
+- 1 条控制 DataChannel + 4 条并行数据 DataChannel
 - 文件和目录递归传输
 - 双向 `put` / `get`
 - 远端目录浏览与切换
-- 支持远端绝对路径
-- SHA-256 文件完整性校验
-- `Ctrl-C` 仅取消当前传输，不退出会话
-- 取消接收时自动清理临时文件和本次新建内容
-- 中文、空格路径支持
 - 本地 / 远端路径 Tab 补全
-- Linux / Windows 路径风格自动识别
+- 绝对路径、中文和空格路径支持
+- 发送前 SHA-256 计算
+- 接收落盘后重新 SHA-256 校验
+- `Ctrl-C` 仅取消当前传输，不退出会话
 
-当前版本使用 `P2P4-...` 连接码。使用不同协议版本的客户端不能互相连接。
+> v0.6 使用 `P2P6-OFFER-...` / `P2P6-ANSWER-...` 信令码，与旧版网络协议不兼容。双方需要使用 v0.6.x。
 
-## 快速开始
+## 连接流程
 
-Linux：
+v0.6 不需要自建信令服务器。双方通过已有聊天工具手工交换一次 OFFER / ANSWER。
 
-```bash
-chmod +x ./p2p-friend-linux-amd64
-./p2p-friend-linux-amd64
-```
-
-Windows：
-
-```powershell
-.\p2p-friend-windows-amd64.exe
-```
+### 创建会话
 
 启动后选择：
 
 ```text
-1) 创建会话（本机监听）
-2) 加入会话（本机主动连接）
-3) 退出
+1) 创建会话（生成 OFFER）
 ```
 
-创建会话的一方会生成连接码，将可用的 `P2P4-...` 连接码发送给另一方即可。
-
-### 连接方向
-
-建立 TCP 连接只要求至少有一个方向可达，文件传输方向与 TCP 建连方向无关。
-
-规则很简单：
+程序收集本机 IPv4 / IPv6 与 STUN 候选，然后输出：
 
 ```text
-如果 A -> B 连接超时：
-让 B 创建会话，A 加入会话。
+P2P6-OFFER-...
 ```
 
-也就是让“连接失败方向的目标端”负责监听。
+将 OFFER 发给另一方。另一方会返回：
 
-连接建立后，双方都可以执行 `put`、`get`、`ls`、`cd` 等命令。
+```text
+P2P6-ANSWER-...
+```
+
+将 ANSWER 粘贴回创建方。只有 ICE、DTLS、会话认证和全部 DataChannel 建立成功后才进入命令行。
+
+### 加入会话
+
+选择：
+
+```text
+2) 加入会话（输入 OFFER / 生成 ANSWER）
+```
+
+粘贴 OFFER，程序生成 ANSWER。将 ANSWER 发回创建方，然后等待 ICE 连接建立。
+
+## 网络模型
+
+ICE 会自动尝试可用的 UDP candidate pair：
+
+```text
+IPv6 host candidate
+IPv4 host candidate
+IPv4 server-reflexive candidate (STUN)
+```
+
+IPv4 位于 NAT 后时，STUN 只用于发现公网映射地址，ICE 会同时执行 UDP connectivity checks，从而尝试 hole punching。公共 STUN 不承载文件内容。
+
+项目没有配置 TURN。若双方 NAT / 防火墙组合无法建立直接 UDP 路径，程序会明确连接失败，不会退回中继。
+
+## 传输模型
+
+底层链路：
+
+```text
+UDP
+  -> ICE
+  -> DTLS
+  -> SCTP DataChannel
+  -> p2p-friend protocol
+```
+
+UDP 本身允许丢包，但 DataChannel 使用可靠 SCTP 传输，因此丢失的数据会自动重传。程序不会把缺失数据当作成功文件。
+
+v0.6 建立：
+
+```text
+control
+data-0
+data-1
+data-2
+data-3
+```
+
+`control` 用于命令与传输元数据。单个大文件按 offset 分块后在 4 条数据 stream 上并行发送，接收端按 offset 写入同一个临时文件。
+
+这些逻辑 stream 共享同一 ICE/UDP P2P 路径，不强制创建多个公网 UDP 端口，从而减少 NAT 映射数量并优先保证打洞稳定性。多 stream 用于减少单一有序数据流的队头阻塞和提高并行处理能力，但不会突破物理带宽上限。
+
+## 文件完整性
+
+每个文件都执行独立端到端校验：
+
+1. 发送端传输前完整读取文件并计算 SHA-256。
+2. 文件块通过多条 data stream 发送。
+3. 接收端按 offset 写入 `.part` 临时文件。
+4. 所有数据落盘后，接收端重新完整读取临时文件计算 SHA-256。
+5. 两端 SHA-256 完全一致后才重命名为最终文件并报告完成。
+6. 校验失败、取消或传输异常时不会报告成功，并会尽量清理临时内容。
+
+典型输出：
+
+```text
+[HASH] file.bin  SHA-256 <sender-hash>
+[VERIFY] /path/to/file.bin  SHA-256 <receiver-hash>  OK
+```
 
 ## 命令
 
-### 远端文件系统
+远端文件系统：
 
 ```text
 pwd
-ls
-ls <remote-path>
-cd <remote-path>
-cd -
+ls [remote-path]
+cd <remote-path|->
 ```
 
-这些命令操作对方机器：
-
-- `pwd`：显示远端当前目录
-- `ls`：列出远端目录
-- `cd`：切换远端当前目录
-- `cd -`：回到远端上一个目录
-
-远端路径可以使用绝对路径：
-
-```text
-ls /path/to/directory
-cd /path/to/directory
-```
-
-Windows 风格：
-
-```text
-ls "C:\path\to\directory"
-cd "C:\path\to\directory"
-```
-
-### 本地文件系统
-
-本地命令使用 `l` 前缀：
+本地文件系统：
 
 ```text
 lpwd
-lls
-lls <local-path>
-lcd <local-path>
-lcd -
+lls [local-path]
+lcd <local-path|->
 ```
 
-对应关系：
-
-```text
-pwd   -> 远端当前目录
-lpwd  -> 本地当前目录
-
-ls    -> 浏览远端
-lls   -> 浏览本地
-
-cd    -> 切换远端目录
-lcd   -> 切换本地目录
-```
-
-## 上传
-
-语法：
+上传：
 
 ```text
 put <local-path> [remote-path]
 ```
 
-上传单个文件：
-
-```text
-put ./file.bin
-```
-
-上传目录：
-
-```text
-put ./directory
-```
-
-指定远端目标：
-
-```text
-put ./file.bin /remote/path/file.bin
-put ./directory /remote/path/directory
-```
-
-Windows 远端路径同样支持：
-
-```text
-put ./file.bin "C:\remote\path\file.bin"
-```
-
-如果省略 `remote-path`，内容会发送到远端当前目录。
-
-## 下载
-
-语法：
+下载：
 
 ```text
 get <remote-path> [local-path]
 ```
 
-下载当前远端目录中的文件：
-
-```text
-get file.bin
-```
-
-下载远端绝对路径：
-
-```text
-get /remote/path/file.bin
-```
-
-指定本地保存位置：
-
-```text
-get /remote/path/file.bin ./local-file.bin
-```
-
-Windows 风格远端路径：
-
-```text
-get "C:\remote\path\file.bin"
-```
-
-目录同样支持递归下载。
+目录会递归传输，远端路径可以使用绝对路径。
 
 ## Tab 补全
-
-程序内置跨平台命令行编辑器，不依赖外部 readline 动态库。
-
-补全规则：
 
 ```text
 cd / ls / get          -> 远端路径
@@ -205,11 +161,9 @@ get 第 2 个路径参数    -> 本地路径
 overwrite              -> on / off
 ```
 
-按一次 `Tab` 会尝试补全。存在多个候选时会列出候选项，再继续输入即可。
+包含空格的路径会自动加引号，中文路径无需额外转义。
 
-包含空格的路径会自动加引号。中文路径不需要额外转义。
-
-命令行编辑支持：
+命令行编辑还支持：
 
 ```text
 Left / Right           移动光标
@@ -222,31 +176,15 @@ Tab                    路径 / 参数补全
 
 ## 取消传输
 
-传输过程中按：
-
-```text
-Ctrl-C
-```
-
-或者执行：
+传输过程中按 `Ctrl-C`，或者执行：
 
 ```text
 cancel
 ```
 
-只会取消当前传输，不会关闭 P2P 会话。
+只取消当前传输，不关闭 P2P 会话。
 
-P2P4 使用带 transfer ID 的分块帧协议，因此取消一个传输后，同一条 TLS 连接仍可继续执行后续命令和传输。
-
-接收被取消时，程序会尝试清理：
-
-- 当前 `.part` 临时文件
-- 本次传输中新建且已完成的文件
-- 本次传输中新建的空目录
-
-如果自动清理失败，会打印具体路径和错误，供用户手动处理。
-
-如果开启 `overwrite on` 且原有文件已经被完整覆盖，旧内容无法自动恢复。
+接收取消时，程序会尝试删除当前 `.part`、本次新建的文件和本次新建的空目录。自动清理失败时会输出具体路径。
 
 ## 覆盖策略
 
@@ -262,50 +200,29 @@ overwrite off
 overwrite on
 ```
 
-这是本机接收策略。远端向本机写入已有路径时，如果本机没有开启覆盖，传输会被拒绝，但会话保持连接。
-
-## 状态
-
-```text
-status
-```
-
-可查看当前会话角色、目录状态、覆盖策略、TCP 连接信息和活动传输。
-
-## 网络要求
-
-当前版本不使用 STUN、TURN 或 relay。
-
-至少需要一个方向能够建立直接 TCP 连接，例如：
-
-- 公网 IPv6 且入站防火墙允许 TCP 5000
-- 同一局域网 / VPN
-- 公网 IPv4
-- 手工端口映射
-
-拥有公网 IPv6 地址并不代表入站连接一定可达。主机防火墙、路由器防火墙或运营商网络策略都可能阻止某个方向的连接。
-
-如果某个方向连接超时，按前面的规则交换“创建会话 / 加入会话”角色即可。
-
 ## 安全模型
 
-连接和文件传输包含以下保护：
-
-- TLS 1.3
-- 临时 ECDSA 证书
-- 连接码包含随机 256-bit token
-- 使用连接码中的 SHA-256 fingerprint 固定校验证书
-- 每个文件单独校验 SHA-256
-- 接收文件先写入临时 `.part` 文件，校验成功后再重命名
+- ICE 只负责建立点对点 UDP 路径
+- DTLS 保护链路
+- 会话信令码包含随机 256-bit token
+- control DataChannel 使用可靠有序模式
+- 4 条 data DataChannel 使用可靠乱序模式
+- 每个文件额外执行 SHA-256 端到端校验
+- 接收文件先写 `.part`，校验成功后再重命名
 - 默认拒绝通过符号链接写入目标路径
 
-为了支持 SFTP 风格的远端浏览，成功连接的一方可以在对方当前系统用户权限范围内浏览、读取和写入文件系统。
-
-**连接码相当于临时访问凭据，只应发送给可信任的人。**
+成功连接的一方可以在对方当前系统用户权限范围内浏览、读取和写入文件系统。连接码属于临时访问凭据，只应发送给可信任的人。
 
 ## 从源码构建
 
 要求 Go 1.23 或兼容版本。
+
+```bash
+go mod download
+go test ./...
+go test -race ./...
+go vet ./...
+```
 
 Linux：
 
@@ -319,25 +236,6 @@ Windows：
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o p2p-friend-windows-amd64.exe .
 ```
 
-运行测试：
-
-```bash
-go test ./...
-go test -race ./...
-go vet ./...
-```
-
 ## Release
 
-仓库根目录的 `VERSION` 保存当前发布版本。
-
-包含新版本号的 PR 合并到 `main` 后，GitHub Actions 会自动：
-
-1. 运行测试和静态检查
-2. 构建 Linux amd64 和 Windows amd64
-3. 创建对应版本的 Git tag
-4. 生成 `SHA256SUMS.txt`
-5. 创建 GitHub Release
-6. 上传二进制和校验文件
-
-手工推送 `v*` tag 也会进入同一套发布流程。
+仓库根目录的 `VERSION` 保存当前发布版本。包含新版本号的 PR 合并到 `main` 后，GitHub Actions 会自动运行测试、构建 Linux / Windows 二进制、创建版本 Tag、生成 `SHA256SUMS.txt` 并发布 GitHub Release。
