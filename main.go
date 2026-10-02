@@ -41,9 +41,8 @@ func printHelp() {
   1. 创建会话：生成 OFFER，收到朋友的 ANSWER 后建立连接
   2. 加入会话：输入 OFFER，生成 ANSWER 发回创建方
 
-连接阶段会自动收集 IPv6 / IPv4 UDP 候选并执行 UDP 连通性检查；
-IPv4 位于 NAT 后时会通过 STUN 辅助 UDP hole punching，不使用 TURN/relay。
-只有 ICE、DTLS 和数据通道全部建立成功后才进入文件命令行。
+连接阶段会收集 IPv6 / IPv4 / STUN UDP 候选，并在同一 UDP socket 上执行直连或 hole punching；
+QUIC 握手、会话认证和 4 条数据 stream 全部建立成功后才进入文件命令行。
 
 连接后采用类似 SFTP 的命令：
   pwd / ls / cd         操作远端目录
@@ -111,7 +110,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 		return fmt.Errorf("创建 UDP/QUIC 会话失败: %w", err)
 	}
 	consolePrintf("\n[创建会话] 初始目录: %s\n", cwd)
-	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选。")
+	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选；传输将复用同一 UDP socket。")
 	consolePrintln("")
 	consolePrintln("把下面的 OFFER 发给朋友：")
 	consolePrintln(offer)
