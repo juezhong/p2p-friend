@@ -30,6 +30,8 @@ func (s *peerSession) put(localPath, remoteDest string) error {
 	return s.sendTransfer(source, remoteDest, 0, true, 0)
 }
 
+// sendTransfer 同时服务 PUT 和远端 GET：GET 请求到达文件所在端后，仍复用同一套
+// “发送端 -> 接收端”传输状态机。requestID!=0 表示这是响应远端 GET 的被动发送。
 func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, foreground bool, fixedID uint64) error {
 	s.sendGate.Lock()
 	defer s.sendGate.Unlock()
@@ -112,6 +114,8 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 		if e.IsDir {
 			continue
 		}
+		// 接收端先创建/校验目标路径并回复 EntryReady，再开始发送该文件数据，
+		// 避免发送端已经大量写入 QUIC 后才发现目标不可写。
 		if err := s.waitEntryReady(ot, e.RelPath); err != nil {
 			if cause := context.Cause(ctx); cause != nil {
 				return s.finishCancelledOutbound(ot, cause)
