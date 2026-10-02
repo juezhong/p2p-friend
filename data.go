@@ -24,19 +24,117 @@ type transferTuningProfile struct {
 	pace      time.Duration
 }
 
-func transferTuning(goos string) transferTuningProfile {
-	if goos == "windows" {
-		// Winsock can return WSAENOBUFS when several QUIC streams enqueue
-		// large writes faster than the UDP send queue can drain. Keep the
-		// protocol at four lanes, but use two active writers and smaller
-		// application chunks on Windows. This still allows QUIC to packetize
-		// and pace efficiently while avoiding large bursts into Winsock.
-		return transferTuningProfile{chunkSize: 64 * 1024, lanes: 2, pace: 200 * time.Microsecond}
-	}
-	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: parallelLanes}
+type adaptiveTransferTuner struct {
+	goos       string
+	maxLanes   int
+	profile    transferTuningProfile
+	stableRuns int
 }
 
-func currentTransferTuning() transferTuningProfile { return transferTuning(runtime.GOOS) }
+func initialTransferTuning(goos string, maxLanes int) transferTuningProfile {
+	if maxLanes < 1 {
+		maxLanes = 1
+	}
+	if goos == "windows" {
+		return transferTuningProfile{chunkSize: 64 * 1024, lanes: 1}
+	}
+	lanes := parallelLanes
+	if lanes > maxLanes {
+		lanes = maxLanes
+	}
+	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: lanes}
+}
+
+func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner {
+	if maxLanes < 1 {
+		maxLanes = 1
+	}
+	return &adaptiveTransferTuner{
+		goos:     goos,
+		maxLanes: maxLanes,
+		profile:  initialTransferTuning(goos, maxLanes),
+	}
+}
+
+func (t *adaptiveTransferTuner) current() transferTuningProfile {
+	p := t.profile
+	if p.lanes < 1 {
+		p.lanes = 1
+	}
+	if p.lanes > t.maxLanes {
+		p.lanes = t.maxLanes
+	}
+	if p.chunkSize < 32*1024 {
+		p.chunkSize = 32 * 1024
+	}
+	if p.chunkSize > maxDataChunkSize {
+		p.chunkSize = maxDataChunkSize
+	}
+	return p
+}
+
+func (t *adaptiveTransferTuner) observe(batch time.Duration, err error) (transferTuningProfile, bool) {
+	old := t.current()
+
+	switch {
+	case err != nil || batch >= 200*time.Millisecond:
+		t.stableRuns = 0
+		if t.profile.lanes > 1 {
+			t.profile.lanes--
+		} else if t.profile.chunkSize > 32*1024 {
+			t.profile.chunkSize /= 2
+		}
+		if t.profile.pace == 0 {
+			t.profile.pace = 250 * time.Microsecond
+		} else if t.profile.pace < 2*time.Millisecond {
+			t.profile.pace *= 2
+			if t.profile.pace > 2*time.Millisecond {
+				t.profile.pace = 2 * time.Millisecond
+			}
+		}
+
+	case batch >= 80*time.Millisecond:
+		t.stableRuns = 0
+		if t.profile.pace < time.Millisecond {
+			t.profile.pace += 100 * time.Microsecond
+		}
+
+	case batch <= 20*time.Millisecond:
+		t.stableRuns++
+		needed := 8
+		if t.profile.lanes >= 3 {
+			needed = 16
+		}
+		if t.stableRuns >= needed {
+			t.stableRuns = 0
+			if t.profile.pace > 0 {
+				t.profile.pace /= 2
+				if t.profile.pace < 50*time.Microsecond {
+					t.profile.pace = 0
+				}
+			} else if t.profile.lanes < t.maxLanes {
+				t.profile.lanes++
+			} else if t.profile.chunkSize < maxDataChunkSize {
+				t.profile.chunkSize *= 2
+				if t.profile.chunkSize > maxDataChunkSize {
+					t.profile.chunkSize = maxDataChunkSize
+				}
+			}
+		}
+
+	default:
+		if t.stableRuns > 0 {
+			t.stableRuns--
+		}
+	}
+
+	now := t.current()
+	return now, old != now
+}
+
+func currentTransferTuner(maxLanes int) *adaptiveTransferTuner {
+	return newAdaptiveTransferTuner(runtime.GOOS, maxLanes)
+}
 
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
@@ -55,9 +153,9 @@ type inboundDataState struct {
 	once     sync.Once
 }
 
-var sessionData sync.Map   // map[*peerSession]*sessionDataState
-var inboundData sync.Map   // map[*inboundTransfer]*inboundDataState
-var outboundReady sync.Map // map[*outboundTransfer]chan string
+var sessionData sync.Map
+var inboundData sync.Map
+var outboundReady sync.Map
 
 func attachDataLanes(s *peerSession, conn io.ReadWriteCloser) {
 	provider, ok := conn.(dataLaneProvider)
