@@ -20,15 +20,18 @@ import (
 )
 
 const (
-	signalVersion      = 11
+	signalVersion      = 12
 	signalInvitePrefix = "P2PF-INVITE-"
 	signalReplyPrefix  = "P2PF-REPLY-"
-	quicALPN           = "p2p-friend/11"
-	punchMagic         = "P2PF11PUNCH"
+	quicALPN           = "p2p-friend/12"
+	punchMagic         = "P2PF12PUNCH"
+
+	maxDynamicCandidates = 16
+	maxRemoteCandidates  = 32
 )
 
-// signalCandidate / signalCode 只是在进程内表示识别码内容；v0.11 起线上格式
-// 由 encodeSignal/decodeSignal 的紧凑二进制编码定义，不再使用 JSON。
+// signalCandidate / signalCode 只是在进程内表示识别码内容；线上格式由
+// encodeSignal/decodeSignal 的紧凑二进制编码定义。
 type signalCandidate struct {
 	Addr string
 	Type string
@@ -49,20 +52,36 @@ type udpEndpoint struct {
 	family    int
 }
 
-// rtcPeer 是早期实现遗留的类型名；当前实现不是 WebRTC peer。
-// 它实际管理 IPv4/IPv6 UDP socket、quic.Transport、候选地址和 QUIC TLS 身份。
-// server=true 表示“创建方 / QUIC 监听端”，与某次文件传输由谁发起无关。
+// rtcPeer 是历史类型名，当前实现不是 WebRTC peer。
+// server 只表示“创建方 / 传输仲裁方”，v12 起双方都会同时尝试 QUIC Listen + Dial。
 type rtcPeer struct {
-	token       []byte
+	token []byte
+
+	cert             tls.Certificate
+	localFingerprint []byte
+	remoteFingerprint []byte
+
+	// fingerprint 保留给旧的包内测试辅助路径：创建方保存本机指纹，
+	// 加入方在解析邀请码后保存远端创建方指纹。正式 v12 建链使用上面的
+	// localFingerprint / remoteFingerprint。
 	fingerprint []byte
-	cert        tls.Certificate
-	endpoints   []*udpEndpoint
+
+	punchNonce [12]byte
+	endpoints  []*udpEndpoint
 
 	localMu sync.RWMutex
 	local   []signalCandidate
 
 	remoteMu sync.RWMutex
 	remote   []signalCandidate
+
+	networkInfoMu    sync.RWMutex
+	mappingBehavior  string
+	stunObservations []string
+	portMappings     []string
+
+	cleanupMu sync.Mutex
+	cleanups  []func()
 
 	server    bool
 	closeOnce sync.Once
@@ -73,11 +92,12 @@ type quicStreamConn struct{ *quic.Stream }
 func (s *quicStreamConn) Close() error { return s.Stream.Close() }
 
 type rtcConn struct {
-	control *quic.Stream
-	lanes   []io.ReadWriteCloser
-	qc      *quic.Conn
-	peer    *rtcPeer
-	once    sync.Once
+	control  *quic.Stream
+	lanes    []io.ReadWriteCloser
+	qc       *quic.Conn
+	peer     *rtcPeer
+	outbound bool
+	once     sync.Once
 }
 
 type quicAddr struct{ net.Addr }
@@ -97,7 +117,9 @@ func (c *rtcConn) SetReadDeadline(t time.Time) error  { return c.control.SetRead
 func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.control.SetWriteDeadline(t) }
 func (c *rtcConn) SetDeadline(t time.Time) error      { return c.control.SetDeadline(t) }
 func (c *rtcConn) DataLanes() []io.ReadWriteCloser    { return c.lanes }
-func (c *rtcConn) TransferCoordinator() bool            { return c.peer.server }
+func (c *rtcConn) TransferCoordinator() bool          { return c.peer.server }
+func (c *rtcConn) QUICOutbound() bool                 { return c.outbound }
+
 func (c *rtcConn) LinkMode() string {
 	return classifyQUICLink(c.qc, c.peer.remoteCandidates())
 }
@@ -105,8 +127,6 @@ func (c *rtcConn) LinkMode() string {
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
-		// application error code 0 约定为本程序的正常会话关闭。
-		// 关闭 QUIC connection 会同时结束 control stream 和所有 data stream。
 		err = c.qc.CloseWithError(0, "normal shutdown")
 		_ = c.peer.Close()
 	})
@@ -131,10 +151,73 @@ func (p *rtcPeer) setRemoteCandidates(cands []signalCandidate) {
 	p.remoteMu.Unlock()
 }
 
+// addRemoteCandidate 只给运行时发现的真实 peer endpoint 使用。
+// 数量有硬上限，即使会话 token 泄漏后有人持续发送合法格式 probe，也不能无限增长。
+func (p *rtcPeer) addRemoteCandidate(c signalCandidate) bool {
+	addr, _, err := parseCandidate(c)
+	if err != nil || addr == nil || addr.Port <= 0 {
+		return false
+	}
+	if c.Type != "prflx" {
+		return false
+	}
+
+	p.remoteMu.Lock()
+	defer p.remoteMu.Unlock()
+
+	for i := range p.remote {
+		if !sameUDPAddress(p.remote[i].Addr, c.Addr) {
+			continue
+		}
+		// 已有显式/信令 candidate 比运行时 prflx 信息更强，不覆盖它。
+		if p.remote[i].Type == "prflx" {
+			p.remote[i] = c
+		}
+		return false
+	}
+
+	dynamic := 0
+	for _, old := range p.remote {
+		if old.Type == "prflx" {
+			dynamic++
+		}
+	}
+	if dynamic >= maxDynamicCandidates || len(p.remote) >= maxRemoteCandidates {
+		return false
+	}
+	p.remote = append(p.remote, c)
+	return true
+}
+
 func (p *rtcPeer) remoteCandidates() []signalCandidate {
 	p.remoteMu.RLock()
 	defer p.remoteMu.RUnlock()
 	return append([]signalCandidate(nil), p.remote...)
+}
+
+func (p *rtcPeer) setNetworkInfo(behavior string, stun, mappings []string) {
+	p.networkInfoMu.Lock()
+	p.mappingBehavior = behavior
+	p.stunObservations = append([]string(nil), stun...)
+	p.portMappings = append([]string(nil), mappings...)
+	p.networkInfoMu.Unlock()
+}
+
+func (p *rtcPeer) networkInfo() (string, []string, []string) {
+	p.networkInfoMu.RLock()
+	defer p.networkInfoMu.RUnlock()
+	return p.mappingBehavior,
+		append([]string(nil), p.stunObservations...),
+		append([]string(nil), p.portMappings...)
+}
+
+func (p *rtcPeer) addCleanup(fn func()) {
+	if fn == nil {
+		return
+	}
+	p.cleanupMu.Lock()
+	p.cleanups = append(p.cleanups, fn)
+	p.cleanupMu.Unlock()
 }
 
 func classifyQUICLink(qc *quic.Conn, candidates []signalCandidate) string {
@@ -152,24 +235,38 @@ func classifyQUICLink(qc *quic.Conn, candidates []signalCandidate) string {
 	if ip.IsPrivate() {
 		return "IPv4-LAN"
 	}
+
 	remote := addr.String()
-	hostMatch := false
-	srflxMatch := false
+	bestType := ""
 	for _, c := range candidates {
 		if !sameUDPAddress(c.Addr, remote) {
 			continue
 		}
 		switch strings.ToLower(c.Type) {
 		case "host":
-			hostMatch = true
+			bestType = "host"
+		case "portmap":
+			if bestType != "host" {
+				bestType = "portmap"
+			}
+		case "prflx":
+			if bestType == "" || bestType == "srflx" {
+				bestType = "prflx"
+			}
 		case "srflx":
-			srflxMatch = true
+			if bestType == "" {
+				bestType = "srflx"
+			}
 		}
 	}
-	if srflxMatch && !hostMatch {
+	switch bestType {
+	case "portmap":
+		return "IPv4-PORTMAP"
+	case "prflx", "srflx":
 		return "IPv4-NAT-PUNCH"
+	default:
+		return "IPv4-DIRECT"
 	}
-	return "IPv4-DIRECT"
 }
 
 func sameUDPAddress(a, b string) bool {
@@ -235,15 +332,20 @@ func (p *rtcPeer) serverTLSConfig() *tls.Config {
 }
 
 func (p *rtcPeer) clientTLSConfig() *tls.Config {
-	expected := append([]byte(nil), p.fingerprint...)
+	expected := append([]byte(nil), p.remoteFingerprint...)
+	if len(expected) == 0 {
+		expected = append([]byte(nil), p.fingerprint...)
+	}
 	return &tls.Config{
-		// 不使用公网 CA/主机名作为信任根，而是固定校验邀请码中携带的临时证书
-		// SHA-256 指纹。InsecureSkipVerify 这里只是关闭默认 PKI 校验，下面的
-		// VerifyPeerCertificate 仍会对远端证书做严格 pinning。
+		// 双方证书都是本次会话临时生成，不走公网 CA；信任根是识别码交换的
+		// SHA-256 指纹。InsecureSkipVerify 只关闭默认 PKI，下面仍严格做 pinning。
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{quicALPN},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(expected) != sha256.Size {
+				return errors.New("missing remote QUIC certificate fingerprint")
+			}
 			if len(rawCerts) != 1 {
 				return errors.New("unexpected QUIC certificate chain")
 			}
