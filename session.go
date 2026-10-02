@@ -42,9 +42,7 @@ func (s *peerSession) readLoop() {
 	for {
 		f, err := readFrame(s.br)
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.reportTransportError("连接", err)
-			}
+			s.handleReadError(err)
 			return
 		}
 		switch f.Type {
@@ -101,6 +99,21 @@ func (s *peerSession) readLoop() {
 			consolePrintf("[协议] 未知帧类型: %d\n", f.Type)
 			return
 		}
+	}
+}
+
+func (s *peerSession) handleReadError(err error) {
+	if err == nil {
+		return
+	}
+	if !s.closing.Load() && !s.remoteBye.Load() && isRemoteGracefulClose(err) {
+		s.remoteBye.Store(true)
+		s.closing.Store(true)
+		consolePrintln("[连接] 对方已正常结束会话。")
+		return
+	}
+	if !errors.Is(err, io.EOF) {
+		s.reportTransportError("连接", err)
 	}
 }
 
