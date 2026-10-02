@@ -240,3 +240,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o p2p-friend-windows-amd64.exe
 ## Release
 
 仓库根目录的 `VERSION` 保存当前发布版本。包含新版本号的 PR 合并到 `main` 后，GitHub Actions 会自动运行测试、构建 Linux / Windows 二进制、创建版本 Tag、生成 `SHA256SUMS.txt` 并发布 GitHub Release。
+
+## Windows 大文件传输稳定性
+
+v0.7.1 对 Windows QUIC 发送端采用更平滑的默认参数：协议仍保留 4 条 data stream，但 Windows 默认启用 2 条并行 writer、64 KiB 应用层 chunk 和小幅 pacing；Linux 等平台继续使用 4 条 writer 与 256 KiB chunk。这样可以降低 Winsock UDP send queue 被瞬时写满的概率，同时仍由 QUIC 负责拥塞控制、丢包重传和网络层 packet pacing。

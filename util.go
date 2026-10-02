@@ -72,6 +72,20 @@ func isClosedErr(err error) bool {
 		strings.Contains(s, "connection reset")
 }
 
+func (s *peerSession) reportTransportError(scope string, err error) {
+	if err == nil || isClosedErr(err) {
+		return
+	}
+	s.transportErrOnce.Do(func() {
+		msg := err.Error()
+		if strings.Contains(strings.ToLower(msg), "buffer space") || strings.Contains(strings.ToLower(msg), "queue was full") {
+			consolePrintf("[%s] Windows UDP 发送队列已满，连接异常: %v\n", scope, err)
+			return
+		}
+		consolePrintf("[%s] 传输连接异常: %v\n", scope, err)
+	})
+}
+
 func setConsoleWriter(w io.Writer) func() {
 	if w == nil {
 		w = os.Stdout

@@ -153,9 +153,10 @@ type peerSession struct {
 	br   *bufio.Reader
 	bw   *bufio.Writer
 
-	writeMu   sync.Mutex
-	closed    chan struct{}
-	closeOnce sync.Once
+	writeMu          sync.Mutex
+	closed           chan struct{}
+	closeOnce        sync.Once
+	transportErrOnce sync.Once
 
 	requestSeq  atomic.Uint64
 	transferSeq atomic.Uint64
