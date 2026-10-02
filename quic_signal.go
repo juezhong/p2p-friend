@@ -21,7 +21,7 @@ import (
 
 // newPeer 为 IPv4/IPv6 各打开一个 UDP socket。后续 candidate 收集、STUN、
 // 防火墙/NAT 探测、QUIC 握手和文件传输都复用这些 socket，避免端口变化导致
- // NAT 映射或防火墙状态失效。
+// NAT 映射或防火墙状态失效。
 func newPeer(server bool) (*rtcPeer, error) {
 	token, err := newToken()
 	if err != nil {
