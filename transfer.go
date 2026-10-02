@@ -246,16 +246,16 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 			}
 		}
 		elapsed := time.Since(start)
-		newProfile, _ := tuner.observe(elapsed, batchErr)
+		var batchBytes int64
+		for _, job := range jobs {
+			batchBytes += int64(len(job.data))
+		}
+		newProfile, _ := tuner.observe(batchBytes, elapsed, batchErr)
 		s.setCurrentTuning(newProfile)
 		if batchErr != nil {
 			return batchErr
 		}
 
-		var batchBytes int64
-		for _, job := range jobs {
-			batchBytes += int64(len(job.data))
-		}
 		p.Done += batchBytes
 		p.CurrentDone += batchBytes
 		p.print(false)
