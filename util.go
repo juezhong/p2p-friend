@@ -90,6 +90,17 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+func isRemoteGracefulClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var appErr *quic.ApplicationError
+	return errors.As(err, &appErr) && appErr.ErrorCode == 0 && appErr.Remote
+}
+
 func isClosedErr(err error) bool {
 	if err == nil {
 		return false
