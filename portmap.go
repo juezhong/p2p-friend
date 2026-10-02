@@ -44,8 +44,8 @@ func discoverPortMapping(ep *udpEndpoint) (signalCandidate, func(), string, erro
 	return signalCandidate{}, nil, "", errors.New("no explicit UDP port mapping available")
 }
 
-func tryNATPMP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
-	client := natpmp.NewClientWithLocalAndTimeout(gw, localIP, 1100*time.Millisecond)
+func tryNATPMP(gw, _ net.IP, localPort int) (*net.UDPAddr, func(), error) {
+	client := natpmp.NewClientWithTimeout(gw, 1100*time.Millisecond)
 	ext, err := client.GetExternalAddress()
 	if err != nil {
 		return nil, nil, err
