@@ -202,6 +202,9 @@ func currentTransferTuner(maxLanes int) *adaptiveTransferTuner {
 	return newAdaptiveTransferTuner(runtime.GOOS, maxLanes)
 }
 
+// dataLaneProvider 把 QUIC connection 上预先建立的多条 data stream 暴露给会话。
+// control stream 仍由 peerSession.conn 使用；这里只处理带 transferID/offset 的
+// 文件块，从而允许单文件按 offset 并行发送。
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
 }
@@ -286,6 +289,8 @@ func clearInboundData(t *inboundTransfer) {
 	inboundData.Delete(t)
 }
 
+// writeDataChunk 优先把文件块分配到独立 data stream；只有底层连接没有提供
+// data lanes 时才回退到 control stream 的 frameData，主要用于测试/兼容路径。
 func (s *peerSession) writeDataChunk(id uint64, offset int64, payload []byte) error {
 	if offset < 0 {
 		return errors.New("negative data offset")

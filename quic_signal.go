@@ -19,6 +19,9 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
+// newPeer 为 IPv4/IPv6 各打开一个 UDP socket。后续 candidate 收集、STUN、
+// 防火墙/NAT 探测、QUIC 握手和文件传输都复用这些 socket，避免端口变化导致
+// NAT 映射或防火墙状态失效。
 func newPeer(server bool) (*rtcPeer, error) {
 	token, err := newToken()
 	if err != nil {
@@ -67,9 +70,8 @@ func (p *rtcPeer) Close() error {
 					first = err
 				}
 			}
-			// Transport and listener lifetime are independent from the UDPConn.
-			// Explicitly close the socket we opened so the OS port is released
-			// immediately on normal process/session exit.
+			// quic.Transport / Listener 与底层 UDPConn 生命周期并不完全等价；
+			// 这里显式关闭自己创建的 socket，确保正常退出后端口立即释放。
 			if ep.conn != nil {
 				if err := ep.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && first == nil {
 					first = err
@@ -159,6 +161,9 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 
 func (p *rtcPeer) waitConn() (net.Conn, error) { return p.dialQUIC() }
 
+// gatherCandidates 收集可直接使用的 host candidate；IPv4 额外通过 STUN 获取
+// srflx（NAT 映射）candidate。IPv6 不做 NAT 映射发现，公网 IPv6 直接作为 host
+// candidate，遇到有状态防火墙时由双方主动 UDP 探测尽量打开返回流量状态。
 func gatherCandidates(endpoints []*udpEndpoint) []signalCandidate {
 	set := map[string]signalCandidate{}
 	ifaces, _ := net.Interfaces()
@@ -351,6 +356,8 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 	return out, nil
 }
 
+// encodeSignal 使用紧凑二进制格式编码识别码，而不是 JSON。
+// signalCode 只是内部统一的数据结构，线上格式由本函数和 decodeSignal 定义。
 func encodeSignal(c signalCode) (string, error) {
 	prefix, err := signalPrefixForKind(c.Kind)
 	if err != nil {

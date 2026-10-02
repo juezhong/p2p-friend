@@ -13,6 +13,8 @@ import (
 	"unicode"
 )
 
+// peerSession 是应用层会话：control stream 承载 RPC/传输元数据，data.go 会把
+// rtcConn 中的多条 QUIC data stream 附加到同一会话用于文件块传输。
 func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 	coordinator := roleName == "创建方" || roleName == "发起方" || roleName == "HOST" || roleName == "A"
 	if p, ok := conn.(interface{ TransferCoordinator() bool }); ok {
@@ -37,6 +39,8 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 	return s
 }
 
+// readLoop 只消费 control stream。文件数据通常由 dataLaneReadLoop 并行处理，
+// 因而目录/RPC/取消等控制消息不会和大文件 payload 共用同一条 QUIC stream。
 func (s *peerSession) readLoop() {
 	defer s.close(false)
 	for {

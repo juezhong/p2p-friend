@@ -14,6 +14,8 @@ import (
 
 const connectionWaitTimeout = 5 * time.Minute
 
+// acceptQUIC 由创建方执行。创建方在每个可用 UDP family 上监听 QUIC，同时仍会
+// 主动发送 UDP 探测包，因此“QUIC 监听端”并不等于网络层完全被动。
 func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
@@ -68,9 +70,9 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 			}
 			lastErr = err
 			_ = qc.CloseWithError(0, "candidate rejected")
-			// Candidate racing can make us accept a connection that the dialer
-			// immediately closes because another path won. Keep accepting until
-			// a connection actually completes stream establishment.
+			// 多个 candidate 会并行竞争。监听端可能先 Accept 到一条随后被拨号端
+			// 放弃的连接（另一条路径已经获胜），因此必须继续 Accept，直到应用
+			// control/data stream 也完整建立。
 			continue
 		case <-done:
 			if lastErr != nil {
@@ -86,6 +88,8 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 	}
 }
 
+// dialQUIC 由加入方执行。它会对双方交换得到的所有匹配 candidate 发起并行尝试，
+// 但给公网 IPv6 一个短暂优先窗口；IPv6 不通时 IPv4 会自动继续竞争。
 func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
@@ -133,10 +137,9 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				// Both sides have already exchanged their full candidate sets.
-				// Give globally routable IPv6 a small head start so dual-stack
-				// peers normally select IPv6-DIRECT, while IPv4 remains an
-				// automatic fallback if IPv6 is filtered or unreachable.
+				// 此时双方已经完整交换 candidate。公网 IPv6 获得 250ms 优先窗口，
+				// 让双栈环境尽量选择 IPv6；IPv6 被过滤或不可达时，IPv4 仍会自动
+				// 进入竞争，不需要再次交换识别码。
 				if preferGlobalIPv6 && t.rank != 0 {
 					select {
 					case <-roundCtx.Done():
@@ -190,6 +193,9 @@ func connectionTimeoutError() error {
 	return errors.New("P2P UDP/QUIC 连接超时；如果持续失败，可以交换“创建连接 / 加入连接”角色后重试")
 }
 
+// punchLoop 只负责 UDP 可达性探测，不承载文件数据，也不替代 QUIC 握手。
+// IPv4 侧用于建立/刷新 NAT 映射与过滤状态；IPv6 侧没有 NAT 映射，主要用于
+// 尽量打开 stateful firewall 的返回流量状态。
 func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
 	payload := append([]byte{0x00}, []byte(punchMagic)...)
 	ticker := time.NewTicker(250 * time.Millisecond)

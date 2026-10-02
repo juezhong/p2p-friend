@@ -14,12 +14,15 @@ import (
 var appVersion = "dev"
 
 const (
-	protocolMagic   = "P2PF11"
-	protocolVersion = 11
+	// protocolMagic 是 QUIC 建连后的应用层会话认证标识；识别码版本由
+	// quic_types.go 的 signalVersion 单独管理。
+	protocolMagic = "P2PF11"
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
 
+	// frame 1~10 走 control stream；frameEntryReady 定义在 data.go，
+	// 文件块本身优先走独立 QUIC data streams。
 	frameRPCRequest     = byte(1)
 	frameRPCResponse    = byte(2)
 	frameTransferStart  = byte(3)

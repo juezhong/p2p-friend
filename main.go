@@ -137,11 +137,13 @@ func runHost(in *bufio.Reader, cwd string) error {
 
 	consolePrintln("识别码交换完成，正在建立 P2P 连接...")
 	token := append([]byte(nil), peer.token...)
+	// 创建方负责 QUIC Listen；双方仍会主动发 UDP 探测，因此 NAT/IPv6 防火墙
+	// 穿透能力不取决于谁是 QUIC client/server。
 	conn, err := peer.acceptQUIC()
 	if err != nil {
 		return err
 	}
-	peer = nil // rtcConn owns peer resources from here.
+	peer = nil // 从这里开始由 rtcConn 接管 peer 及底层 UDP/QUIC 资源。
 	if err := authenticateListener(conn, token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
@@ -176,6 +178,8 @@ func runJoin(in *bufio.Reader, cwd string) error {
 	consolePrintln(replyCode)
 	consolePrintln("发送后程序会静默等待创建方粘贴回传码并开始建连。")
 
+	// 加入方作为 QUIC Dialer。这个角色只影响连接握手方向，不限制后续 put/get
+	// 的数据方向；QUIC 建立后双方都可以发送和接收文件。
 	conn, err := peer.waitConn()
 	if err != nil {
 		return err
