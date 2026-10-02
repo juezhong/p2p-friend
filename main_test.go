@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	quic "github.com/quic-go/quic-go"
 )
 
 func TestSignalCodeRoundTrip(t *testing.T) {
@@ -819,5 +821,85 @@ func TestSilentProgressProducesNoOutput(t *testing.T) {
 	p.closeLine()
 	if got := out.String(); got != "" {
 		t.Fatalf("silent progress wrote output: %q", got)
+	}
+}
+
+func TestGracefulByeIsNotTransportError(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+
+	s := initPeerSession(left, "A", t.TempDir())
+	var out bytes.Buffer
+	restore := setConsoleWriter(&out)
+	defer restore()
+
+	go s.readLoop()
+
+	peer := &peerSession{
+		conn:       right,
+		br:         bufio.NewReader(right),
+		bw:         bufio.NewWriter(right),
+		closed:     make(chan struct{}),
+		pendingRPC: make(map[uint64]chan rpcResponse),
+		pendingGet: make(map[uint64]*pendingGet),
+		outbound:   make(map[uint64]*outboundTransfer),
+		inbound:    make(map[uint64]*inboundTransfer),
+	}
+	if err := peer.writeFrame(frameBye, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-s.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not close after graceful bye")
+	}
+	got := out.String()
+	if !strings.Contains(got, "对方已正常结束会话") {
+		t.Fatalf("missing graceful close message: %q", got)
+	}
+	if strings.Contains(got, "异常") {
+		t.Fatalf("graceful close reported as error: %q", got)
+	}
+}
+
+func TestQUICApplicationCodeZeroIsExpectedClose(t *testing.T) {
+	err := &quic.ApplicationError{
+		ErrorCode:    0,
+		ErrorMessage: "normal shutdown",
+		Remote:       true,
+	}
+	if !isClosedErr(err) {
+		t.Fatalf("QUIC application close code 0 should be treated as graceful: %v", err)
+	}
+}
+
+func TestShutdownRemovesPartialReceive(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	s := initPeerSession(left, "A", t.TempDir())
+
+	tmp, err := os.CreateTemp(t.TempDir(), ".p2p-friend-*.part")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := &inboundTransfer{
+		id:          42,
+		currentFile: tmp,
+		currentTemp: tmpPath,
+		progress:    &progress{Silent: true},
+	}
+	s.transferMu.Lock()
+	s.inbound[42] = tr
+	s.transferMu.Unlock()
+
+	s.cleanupTransfersForShutdown()
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("partial file still exists after shutdown: %v", err)
 	}
 }
