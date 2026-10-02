@@ -2,7 +2,7 @@
 
 `p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，使用方式接近 SFTP。
 
-文件数据通过 **UDP + QUIC** 在两个端点之间直接传输。程序会收集 IPv6、IPv4 与 STUN 映射候选，在同一 UDP socket 上尝试 IPv6 直连/有状态防火墙探测、IPv4 直连或 IPv4 NAT 打洞；不配置 TURN / relay。
+文件数据通过 **UDP + QUIC** 在两个端点之间直接传输。程序会收集 IPv6、IPv4、多 STUN 映射和可用的 PCP/NAT-PMP/UPnP 端口映射候选；双方同时 QUIC Listen + Dial，并通过带 HMAC 的 UDP punch 学习真实 peer-reflexive 地址。不配置 TURN / relay。
 
 当前网络实现**不是 WebRTC/ICE/DataChannel**：`pion/stun` 只用于 IPv4 STUN 映射发现，实际会话与文件数据由 `quic-go` 的 QUIC/TLS 1.3 承载；项目不使用 TURN 中继。
 
@@ -12,8 +12,10 @@
 - Windows amd64
 - macOS amd64 / arm64
 - IPv6 UDP 直连，并由双方主动发送 UDP 探测以尽量打开有状态 IPv6 防火墙
-- IPv4 UDP 直连 / LAN / STUN 辅助 NAT 打洞
-- IPv6 不做 NAT punching；双方只做 UDP 防火墙探测，STUN 映射仍只作为 IPv4 fallback 候选预先探测
+- IPv4 UDP 直连 / LAN / Multi-STUN 辅助 NAT 打洞
+- 安全 UDP punch：session HMAC、时间戳、nonce 重放过滤和 peer-reflexive candidate
+- PCP / NAT-PMP / UPnP IGD 显式 UDP 端口映射（可选增强，失败自动降级）
+- IPv6 不做地址转换映射；双方通过安全 UDP punch 尽量打开 stateful firewall
 - QUIC TLS 1.3、可靠重传、拥塞控制和多 stream
 - 1 条 control stream + 4 条 data stream
 - 自适应 data lane / chunk / pacing
@@ -47,9 +49,11 @@
                   ↓
          双方 candidate 已完整交换
                   ↓
-      优先 IPv6 direct / firewall traversal，失败再回退 IPv4
+      双方同时 QUIC Listen + Dial
                   ↓
-        必要时执行 IPv4 NAT punching
+ IPv6 / portmap / STUN / host candidates 竞争
+                  ↓
+ 安全 punch 可动态学习 prflx 真实端点
                   ↓
                  QUIC
 ```
@@ -62,11 +66,11 @@
 - 加入方生成并显示 `P2PF-REPLY` 后进入静默等待；创建方粘贴回传码后开始连接。
 - 双方都有 globally routable IPv6 时，连接器给 IPv6 一个很短的优先窗口，通常选择 `IPv6-DIRECT`。
 - 双方都会主动向对端 IPv6 candidate 发送 UDP 探测；若有状态防火墙允许匹配的返回流量，IPv6 可以继续建立 QUIC。仍不可达时 IPv4 candidate 自动接管，不需要重新交换识别码。
-- IPv4 NAT 场景使用已经交换好的 STUN / host candidate 直接进入 NAT punching。
+- IPv4 NAT 场景会使用多个 STUN 观察值、host/portmap candidate，并从通过认证的 punch 中动态学习 prflx endpoint。
 
 识别码前缀直接表示用途：收到 `P2PF-INVITE-...` 时选择“加入连接”；收到 `P2PF-REPLY-...` 时说明自己是创建方，应把它粘贴到创建端。
 
-连接过程中的 candidate retry 保持静默。只有最终超时才提示交换“创建连接 / 加入连接”角色重试。
+连接过程中的 candidate retry 保持静默。创建/加入角色不再固定 QUIC 握手方向；只有所有直接路径最终都失败时才报告当前 NAT/防火墙没有形成可用直连路径。
 
 ## 紧凑识别码
 
@@ -93,6 +97,7 @@ IPv6-LAN
 IPv4-DIRECT
 IPv4-LAN
 IPv4-NAT-PUNCH
+IPv4-PORTMAP
 ```
 
 例如：
@@ -176,7 +181,8 @@ status
 - QUIC 是监听端还是主动连接端
 - IPv4 / IPv6 UDP socket 与监听 / 打洞状态
 - 本机 STUN 映射（IPv6 链路时明确标为 IPv4 备用）
-- 对端 candidate 类型
+- NAT 映射稳定性与显式端口映射信息
+- 对端 candidate 类型（HOST / STUN / prflx / portmap）
 - control / data stream 数量
 - 当前是否存在文件传输任务
 - 当前发送自适应参数（存在发送任务时）
