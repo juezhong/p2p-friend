@@ -165,131 +165,109 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 	}
 	defer f.Close()
 
-	tuning := currentTransferTuning()
 	ds := dataState(s)
-	if ds == nil || len(ds.lanes) == 0 {
-		buf := make([]byte, tuning.chunkSize)
-		for off := int64(0); off < size; {
-			select {
-			case <-ctx.Done():
-				return context.Cause(ctx)
-			default:
+	maxLanes := 1
+	if ds != nil && len(ds.lanes) > 0 {
+		maxLanes = len(ds.lanes)
+	}
+	tuner := currentTransferTuner(maxLanes)
+	lastPrinted := transferTuningProfile{}
+
+	printTuning := func(profile transferTuningProfile) {
+		if profile == lastPrinted {
+			return
+		}
+		lastPrinted = profile
+		consolePrintf("[传输] 自适应发送: %d lane, chunk=%s, pacing=%s\n",
+			profile.lanes, humanBytes(int64(profile.chunkSize)), profile.pace)
+	}
+
+	nextOff := int64(0)
+	for nextOff < size {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+		}
+
+		profile := tuner.current()
+		if ds == nil || len(ds.lanes) == 0 {
+			profile.lanes = 1
+		}
+		printTuning(profile)
+
+		type chunkJob struct {
+			lane int
+			off  int64
+			data []byte
+		}
+		jobs := make([]chunkJob, 0, profile.lanes)
+		for lane := 0; lane < profile.lanes && nextOff < size; lane++ {
+			nwant := int64(profile.chunkSize)
+			if size-nextOff < nwant {
+				nwant = size - nextOff
 			}
-			nwant := int64(len(buf))
-			if size-off < nwant {
-				nwant = size - off
-			}
-			n, err := f.ReadAt(buf[:nwant], off)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return err
+			buf := make([]byte, int(nwant))
+			n, rerr := f.ReadAt(buf, nextOff)
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return rerr
 			}
 			if n == 0 {
 				return io.ErrUnexpectedEOF
 			}
-			if err := s.writeDataChunk(id, off, buf[:n]); err != nil {
-				return err
-			}
-			if tuning.pace > 0 {
-				time.Sleep(tuning.pace)
-			}
-			off += int64(n)
-			p.Done += int64(n)
-			p.CurrentDone += int64(n)
-			p.print(false)
+			buf = buf[:n]
+			jobs = append(jobs, chunkJob{lane: lane, off: nextOff, data: buf})
+			nextOff += int64(n)
 		}
-		return nil
-	}
 
-	activeLanes := tuning.lanes
-	if activeLanes > len(ds.lanes) {
-		activeLanes = len(ds.lanes)
-	}
-	if activeLanes < 1 {
-		activeLanes = 1
-	}
-
-	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// Keep at most one queued chunk per active writer. QUIC already has its own
-	// congestion / flow-control queues; a large application queue just creates
-	// bursts and is especially harmful to Winsock UDP send queues.
-	jobs := make(chan int64, activeLanes)
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-	var progressMu sync.Mutex
-	for lane := 0; lane < activeLanes; lane++ {
-		lane := lane
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			buf := make([]byte, tuning.chunkSize)
-			for {
-				select {
-				case <-workerCtx.Done():
+		start := time.Now()
+		errCh := make(chan error, len(jobs))
+		var wg sync.WaitGroup
+		for _, job := range jobs {
+			job := job
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if ds == nil || len(ds.lanes) == 0 {
+					errCh <- s.writeDataChunk(id, job.off, job.data)
 					return
-				case off, ok := <-jobs:
-					if !ok {
-						return
-					}
-					nwant := int64(len(buf))
-					if size-off < nwant {
-						nwant = size - off
-					}
-					n, rerr := f.ReadAt(buf[:nwant], off)
-					if rerr != nil && !errors.Is(rerr, io.EOF) {
-						select {
-						case errCh <- rerr:
-						default:
-						}
-						cancel()
-						return
-					}
-					if n == 0 {
-						select {
-						case errCh <- io.ErrUnexpectedEOF:
-						default:
-						}
-						cancel()
-						return
-					}
-					if werr := s.writeDataChunkOnLane(lane, id, off, buf[:n]); werr != nil {
-						select {
-						case errCh <- werr:
-						default:
-						}
-						cancel()
-						return
-					}
-					if tuning.pace > 0 {
-						time.Sleep(tuning.pace)
-					}
-					progressMu.Lock()
-					p.Done += int64(n)
-					p.CurrentDone += int64(n)
-					p.print(false)
-					progressMu.Unlock()
 				}
-			}
-		}()
-	}
-
-produce:
-	for off := int64(0); off < size; off += int64(tuning.chunkSize) {
-		select {
-		case <-workerCtx.Done():
-			break produce
-		case jobs <- off:
+				errCh <- s.writeDataChunkOnLane(job.lane, id, job.off, job.data)
+			}()
 		}
-	}
-	close(jobs)
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return err
-	default:
-	}
-	if cause := context.Cause(ctx); cause != nil {
-		return cause
+		wg.Wait()
+		close(errCh)
+
+		var batchErr error
+		for werr := range errCh {
+			if werr != nil && batchErr == nil {
+				batchErr = werr
+			}
+		}
+		elapsed := time.Since(start)
+		newProfile, changed := tuner.observe(elapsed, batchErr)
+		if changed {
+			printTuning(newProfile)
+		}
+		if batchErr != nil {
+			return batchErr
+		}
+
+		var batchBytes int64
+		for _, job := range jobs {
+			batchBytes += int64(len(job.data))
+		}
+		p.Done += batchBytes
+		p.CurrentDone += batchBytes
+		p.print(false)
+
+		if newProfile.pace > 0 {
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			case <-time.After(newProfile.pace):
+			}
+		}
 	}
 	return nil
 }
