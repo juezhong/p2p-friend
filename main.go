@@ -208,7 +208,7 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 	consolePrintln("空格会自动转义，中文路径可直接输入/补全；put/get 都支持绝对路径。")
 	consolePrintln("Ctrl-C 只取消当前传输，不退出会话。")
 	consolePrintln("警告：连接码持有者可访问本进程用户权限范围内的绝对路径。")
-	consolePrintln("输入 help 查看命令。")
+	consolePrintln("输入 help 查看命令，status 查看当前 QUIC/UDP 端口和链路。")
 	consolePrintln("")
 
 	editor := newLineEditor(s, in)
