@@ -2,10 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -279,15 +280,75 @@ func parseCandidate(raw signalCandidate) (*net.UDPAddr, int, error) {
 	return addr, family, nil
 }
 
+const (
+	maxSignalCandidates = 16
+	maxSignalPayload     = 1024
+)
+
 func signalPrefixForKind(kind string) (string, error) {
 	switch kind {
 	case "connect":
-		return signalCreatePrefix, nil
+		return signalInvitePrefix, nil
 	case "confirm":
-		return signalJoinPrefix, nil
+		return signalReplyPrefix, nil
 	default:
 		return "", fmt.Errorf("unknown signal kind: %s", kind)
 	}
+}
+
+func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) {
+	byAddr := make(map[string]signalCandidate)
+	for _, cand := range in {
+		addr, err := net.ResolveUDPAddr("udp", cand.Addr)
+		if err != nil || addr == nil || addr.IP == nil || addr.Port <= 0 || addr.Port > 65535 {
+			return nil, fmt.Errorf("invalid candidate %q", cand.Addr)
+		}
+		if addr.IP.IsUnspecified() || addr.IP.IsLoopback() || addr.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(cand.Type))
+		if typ != "host" && typ != "srflx" {
+			return nil, fmt.Errorf("unsupported candidate type %q", cand.Type)
+		}
+		ip := addr.IP
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		} else {
+			ip = ip.To16()
+		}
+		if ip == nil {
+			continue
+		}
+		key := net.JoinHostPort(ip.String(), fmt.Sprint(addr.Port))
+		normalized := signalCandidate{Addr: key, Type: typ}
+		if prev, ok := byAddr[key]; ok {
+			// 同一公网地址同时作为 host / srflx 出现时，host 更能准确表示
+			// “无需 NAT 映射即可直接到达”，同时也减少识别码长度。
+			if prev.Type == "host" || typ != "host" {
+				continue
+			}
+		}
+		byAddr[key] = normalized
+	}
+	out := make([]signalCandidate, 0, len(byAddr))
+	for _, cand := range byAddr {
+		out = append(out, cand)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ri := candidateRank(out[i])
+		rj := candidateRank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].Addr < out[j].Addr
+	})
+	if len(out) > maxSignalCandidates {
+		out = out[:maxSignalCandidates]
+	}
+	if len(out) == 0 {
+		return nil, errors.New("没有可编码的 UDP candidate")
+	}
+	return out, nil
 }
 
 func encodeSignal(c signalCode) (string, error) {
@@ -295,11 +356,56 @@ func encodeSignal(c signalCode) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := json.Marshal(c)
+	if c.Version != signalVersion {
+		return "", fmt.Errorf("unsupported signal version %d", c.Version)
+	}
+
+	token, err := base64.RawURLEncoding.DecodeString(c.Token)
+	if err != nil || len(token) != 32 {
+		return "", errors.New("识别码 token 必须是 256-bit")
+	}
+	var fingerprint []byte
+	if c.Kind == "connect" {
+		fingerprint, err = hex.DecodeString(c.Fingerprint)
+		if err != nil || len(fingerprint) != 32 {
+			return "", errors.New("INVITE 证书指纹必须是 SHA-256")
+		}
+	}
+
+	cands, err := normalizeSignalCandidates(c.Candidates)
 	if err != nil {
 		return "", err
 	}
-	return prefix + base64.RawURLEncoding.EncodeToString(b), nil
+
+	var buf bytes.Buffer
+	buf.Grow(2 + len(token) + len(fingerprint) + len(cands)*20)
+	buf.WriteByte(byte(signalVersion))
+	buf.WriteByte(byte(len(cands)))
+	buf.Write(token)
+	if c.Kind == "connect" {
+		buf.Write(fingerprint)
+	}
+	for _, cand := range cands {
+		addr, err := net.ResolveUDPAddr("udp", cand.Addr)
+		if err != nil {
+			return "", err
+		}
+		flags := byte(0)
+		ip := addr.IP.To4()
+		if ip == nil {
+			flags |= 0x01
+			ip = addr.IP.To16()
+		}
+		if strings.EqualFold(cand.Type, "srflx") {
+			flags |= 0x02
+		}
+		buf.WriteByte(flags)
+		var port [2]byte
+		binary.BigEndian.PutUint16(port[:], uint16(addr.Port))
+		buf.Write(port[:])
+		buf.Write(ip)
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 func decodeSignal(s, expectedKind string) (signalCode, error) {
@@ -311,23 +417,97 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	}
 	if !strings.HasPrefix(s, expectedPrefix) {
 		switch {
-		case strings.HasPrefix(s, signalCreatePrefix) && expectedKind == "confirm":
-			return c, errors.New("这是 P2PF-CREATE 创建码；当前需要加入方返回的 P2PF-JOIN 加入码")
-		case strings.HasPrefix(s, signalJoinPrefix) && expectedKind == "connect":
-			return c, errors.New("这是 P2PF-JOIN 加入码；它应粘贴给创建方。加入连接需要 P2PF-CREATE 创建码")
+		case strings.HasPrefix(s, signalInvitePrefix) && expectedKind == "confirm":
+			return c, errors.New("这是 P2PF-INVITE 邀请码；它应发给准备加入连接的一方。当前创建方需要 P2PF-REPLY 回传码")
+		case strings.HasPrefix(s, signalReplyPrefix) && expectedKind == "connect":
+			return c, errors.New("这是 P2PF-REPLY 回传码；它应交回创建方。加入连接需要 P2PF-INVITE 邀请码")
 		default:
 			return c, fmt.Errorf("识别码格式错误：当前需要 %s...", expectedPrefix)
 		}
 	}
-	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, expectedPrefix))
+
+	rawText := strings.TrimPrefix(s, expectedPrefix)
+	if len(rawText) > base64.RawURLEncoding.EncodedLen(maxSignalPayload) {
+		return c, errors.New("识别码过长")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(rawText)
 	if err != nil {
-		return c, err
+		return c, errors.New("识别码 Base64 数据无效")
 	}
-	if err := json.Unmarshal(b, &c); err != nil {
-		return c, err
+	if len(raw) < 2+32 {
+		return c, errors.New("识别码数据过短")
 	}
-	if c.Version != signalVersion || c.Kind != expectedKind || len(c.Candidates) == 0 {
-		return c, errors.New("识别码协议版本或类型不匹配")
+	if int(raw[0]) != signalVersion {
+		return c, fmt.Errorf("识别码协议版本不匹配：收到 v%d，需要 v%d", raw[0], signalVersion)
+	}
+	count := int(raw[1])
+	if count <= 0 || count > maxSignalCandidates {
+		return c, errors.New("识别码 candidate 数量无效")
+	}
+	pos := 2
+	if len(raw) < pos+32 {
+		return c, errors.New("识别码缺少会话 token")
+	}
+	token := append([]byte(nil), raw[pos:pos+32]...)
+	pos += 32
+
+	var fingerprint []byte
+	if expectedKind == "connect" {
+		if len(raw) < pos+32 {
+			return c, errors.New("INVITE 邀请码缺少证书指纹")
+		}
+		fingerprint = append([]byte(nil), raw[pos:pos+32]...)
+		pos += 32
+	}
+
+	cands := make([]signalCandidate, 0, count)
+	for i := 0; i < count; i++ {
+		if len(raw) < pos+3 {
+			return c, errors.New("识别码 candidate 数据不完整")
+		}
+		flags := raw[pos]
+		pos++
+		if flags&^byte(0x03) != 0 {
+			return c, errors.New("识别码 candidate flags 无效")
+		}
+		port := int(binary.BigEndian.Uint16(raw[pos : pos+2]))
+		pos += 2
+		if port == 0 {
+			return c, errors.New("识别码 candidate 端口无效")
+		}
+		ipLen := 4
+		if flags&0x01 != 0 {
+			ipLen = 16
+		}
+		if len(raw) < pos+ipLen {
+			return c, errors.New("识别码 candidate IP 数据不完整")
+		}
+		ip := net.IP(append([]byte(nil), raw[pos:pos+ipLen]...))
+		pos += ipLen
+		if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return c, errors.New("识别码包含不可用 candidate")
+		}
+		typ := "host"
+		if flags&0x02 != 0 {
+			typ = "srflx"
+		}
+		cands = append(cands, signalCandidate{
+			Addr: net.JoinHostPort(ip.String(), fmt.Sprint(port)),
+			Type: typ,
+		})
+	}
+	if pos != len(raw) {
+		return c, errors.New("识别码包含多余数据")
+	}
+
+	c = signalCode{
+		Version:    signalVersion,
+		Kind:       expectedKind,
+		Token:      base64.RawURLEncoding.EncodeToString(token),
+		Candidates: cands,
+	}
+	if expectedKind == "connect" {
+		c.Fingerprint = hex.EncodeToString(fingerprint)
 	}
 	return c, nil
 }
