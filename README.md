@@ -2,16 +2,16 @@
 
 `p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，使用方式接近 SFTP。
 
-文件数据通过 **UDP + QUIC** 在两个端点之间直接传输。程序会收集 IPv6、IPv4 与 STUN 映射候选，在同一 UDP socket 上尝试直连或 IPv4 NAT 打洞；不配置 TURN / relay。
+文件数据通过 **UDP + QUIC** 在两个端点之间直接传输。程序会收集 IPv6、IPv4 与 STUN 映射候选，在同一 UDP socket 上尝试 IPv6 直连/有状态防火墙探测、IPv4 直连或 IPv4 NAT 打洞；不配置 TURN / relay。
 
 ## 功能
 
 - Linux amd64
 - Windows amd64
 - macOS amd64 / arm64
-- IPv6 UDP 直连
+- IPv6 UDP 直连，并由双方主动发送 UDP 探测以尽量打开有状态 IPv6 防火墙
 - IPv4 UDP 直连 / LAN / STUN 辅助 NAT 打洞
-- IPv6 选中后不执行 NAT punching；STUN 映射只作为 IPv4 fallback 候选预先探测
+- IPv6 不做 NAT punching；双方只做 UDP 防火墙探测，STUN 映射仍只作为 IPv4 fallback 候选预先探测
 - QUIC TLS 1.3、可靠重传、拥塞控制和多 stream
 - 1 条 control stream + 4 条 data stream
 - 自适应 data lane / chunk / pacing
@@ -45,7 +45,7 @@
                   ↓
          双方 candidate 已完整交换
                   ↓
-      优先 IPv6 direct，失败再回退 IPv4
+      优先 IPv6 direct / firewall traversal，失败再回退 IPv4
                   ↓
         必要时执行 IPv4 NAT punching
                   ↓
@@ -59,7 +59,7 @@
 - 创建方拿到 `P2PF-REPLY` 前不会开始真实 QUIC 建连。
 - 加入方生成并显示 `P2PF-REPLY` 后进入静默等待；创建方粘贴回传码后开始连接。
 - 双方都有 globally routable IPv6 时，连接器给 IPv6 一个很短的优先窗口，通常选择 `IPv6-DIRECT`。
-- IPv6 被防火墙过滤或不可达时，IPv4 candidate 会自动接管，不需要再重新交换识别码。
+- 双方都会主动向对端 IPv6 candidate 发送 UDP 探测；若有状态防火墙允许匹配的返回流量，IPv6 可以继续建立 QUIC。仍不可达时 IPv4 candidate 自动接管，不需要重新交换识别码。
 - IPv4 NAT 场景使用已经交换好的 STUN / host candidate 直接进入 NAT punching。
 
 识别码前缀直接表示用途：收到 `P2PF-INVITE-...` 时选择“加入连接”；收到 `P2PF-REPLY-...` 时说明自己是创建方，应把它粘贴到创建端。
