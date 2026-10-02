@@ -14,8 +14,8 @@ import (
 var appVersion = "dev"
 
 const (
-	protocolMagic   = "P2PF9"
-	protocolVersion = 9
+	protocolMagic   = "P2PF10"
+	protocolVersion = 10
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
