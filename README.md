@@ -6,7 +6,7 @@
 
 ## 功能
 
-- Linux amd64
+- Linux amd64 / arm64（aarch64）
 - Windows amd64
 - macOS amd64 / arm64
 - IPv6 UDP 直连，并由双方主动发送 UDP 探测以尽量打开有状态 IPv6 防火墙
@@ -246,6 +246,12 @@ Linux amd64：
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o p2p-friend-linux-amd64 .
 ```
 
+Linux arm64 / aarch64：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o p2p-friend-linux-arm64 .
+```
+
 Windows amd64：
 
 ```bash
@@ -270,6 +276,7 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o p2p-friend-darwin-arm64 .
 
 ```text
 p2p-friend-linux-amd64
+p2p-friend-linux-arm64
 p2p-friend-windows-amd64.exe
 p2p-friend-darwin-amd64
 p2p-friend-darwin-arm64
