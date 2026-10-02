@@ -62,11 +62,15 @@ func (p *rtcPeer) Close() error {
 				_ = ep.listener.Close()
 			}
 			if ep.transport != nil {
-				if err := ep.transport.Close(); err != nil && first == nil {
+				if err := ep.transport.Close(); err != nil && !errors.Is(err, net.ErrClosed) && first == nil {
 					first = err
 				}
-			} else if ep.conn != nil {
-				if err := ep.conn.Close(); err != nil && first == nil {
+			}
+			// Transport and listener lifetime are independent from the UDPConn.
+			// Explicitly close the socket we opened so the OS port is released
+			// immediately on normal process/session exit.
+			if ep.conn != nil {
+				if err := ep.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && first == nil {
 					first = err
 				}
 			}
