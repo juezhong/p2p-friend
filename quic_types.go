@@ -27,17 +27,19 @@ const (
 	punchMagic         = "P2PF11PUNCH"
 )
 
+// signalCandidate / signalCode 只是在进程内表示识别码内容；v0.11 起线上格式
+// 由 encodeSignal/decodeSignal 的紧凑二进制编码定义，不再使用 JSON。
 type signalCandidate struct {
-	Addr string `json:"addr"`
-	Type string `json:"type"`
+	Addr string
+	Type string
 }
 
 type signalCode struct {
-	Version     int               `json:"v"`
-	Kind        string            `json:"kind"`
-	Token       string            `json:"token"`
-	Candidates  []signalCandidate `json:"candidates"`
-	Fingerprint string            `json:"fingerprint,omitempty"`
+	Version     int
+	Kind        string
+	Token       string
+	Candidates  []signalCandidate
+	Fingerprint string
 }
 
 type udpEndpoint struct {
