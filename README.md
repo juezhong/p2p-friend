@@ -4,6 +4,8 @@
 
 文件数据通过 **UDP + QUIC** 在两个端点之间直接传输。程序会收集 IPv6、IPv4 与 STUN 映射候选，在同一 UDP socket 上尝试 IPv6 直连/有状态防火墙探测、IPv4 直连或 IPv4 NAT 打洞；不配置 TURN / relay。
 
+当前网络实现**不是 WebRTC/ICE/DataChannel**：`pion/stun` 只用于 IPv4 STUN 映射发现，实际会话与文件数据由 `quic-go` 的 QUIC/TLS 1.3 承载；项目不使用 TURN 中继。
+
 ## 功能
 
 - Linux amd64 / arm64（aarch64）
