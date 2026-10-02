@@ -37,26 +37,32 @@
 3) 退出
 ```
 
-创建方生成 `P2PF-INVITE-...` 邀请码后立即监听真实 QUIC 握手。加入方粘贴邀请码后会先尝试直接连接。
-
-如果 IPv6、公开 IPv4，或当前 NAT 允许加入方向创建方直接建立 QUIC，则只需要交换一次邀请码：
+当前连接流程固定先交换两类识别码，再开始真实 QUIC 建连：
 
 ```text
 创建方 -> P2PF-INVITE -> 加入方
-                    -> QUIC connected
+创建方 <- P2PF-REPLY  <- 加入方
+                  ↓
+         双方 candidate 已完整交换
+                  ↓
+      优先 IPv6 direct，失败再回退 IPv4
+                  ↓
+        必要时执行 IPv4 NAT punching
+                  ↓
+                 QUIC
 ```
 
-如果数秒内仍无法直接建立连接，加入方才会显示 `P2PF-REPLY-...` 回传码。这个码包含加入方启动 UDP socket 后获得的 candidate，用于双方都在较严格 IPv4 NAT 后时完成双向 UDP hole punching：
+这样不再存在“先尝试 4 秒直连、失败后才显示回传码”的启发式状态机，也避免连接后台握手和用户粘贴回传码同时发生造成的 UI/时序问题。
 
-```text
-创建方 -> P2PF-INVITE -> 加入方
-创建方 <- P2PF-REPLY   <- 加入方
-              -> IPv4 NAT punching -> QUIC
-```
+邀请码和回传码本身都已经是紧凑二进制格式，第二次复制的成本较低。这个固定两步流程换来的是更简单、可预测的连接状态：
 
-因此当前流程是“一次邀请码优先、回传码仅 NAT 兜底”，而不是所有网络都强制交换两次。若要在所有双 NAT 场景中都只复制一次，就必须引入一个外部 rendezvous/signaling 服务来自动交换第二端 candidate；当前项目仍保持无信令服务器设计。
+- 创建方拿到 `P2PF-REPLY` 前不会开始真实 QUIC 建连。
+- 加入方生成并显示 `P2PF-REPLY` 后进入静默等待；创建方粘贴回传码后开始连接。
+- 双方都有 globally routable IPv6 时，连接器给 IPv6 一个很短的优先窗口，通常选择 `IPv6-DIRECT`。
+- IPv6 被防火墙过滤或不可达时，IPv4 candidate 会自动接管，不需要再重新交换识别码。
+- IPv4 NAT 场景使用已经交换好的 STUN / host candidate 直接进入 NAT punching。
 
-识别码前缀也直接表示来源角色：收到 `P2PF-INVITE-...` 时应选择“加入连接”；收到 `P2PF-REPLY-...` 时说明自己应是创建方并将其粘贴到创建端。
+识别码前缀直接表示用途：收到 `P2PF-INVITE-...` 时选择“加入连接”；收到 `P2PF-REPLY-...` 时说明自己是创建方，应把它粘贴到创建端。
 
 连接过程中的 candidate retry 保持静默。只有最终超时才提示交换“创建连接 / 加入连接”角色重试。
 
