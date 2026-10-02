@@ -67,6 +67,8 @@ type rtcPeer struct {
 	fingerprint []byte
 
 	punchNonce [12]byte
+	punchSeenMu sync.Mutex
+	punchSeen   map[[8]byte]time.Time
 	endpoints  []*udpEndpoint
 
 	localMu sync.RWMutex
