@@ -22,6 +22,8 @@ type quicConnectionInfo struct {
 	Streams             int
 	Sockets             []udpSocketInfo
 	STUNMappings        []string
+	MappingBehavior     string
+	PortMappings        []string
 }
 
 func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
@@ -31,10 +33,10 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		RemoteUDP: c.qc.RemoteAddr().String(),
 		Streams:   len(c.lanes),
 	}
-	if c.peer.server {
-		info.QUICRole = "监听端"
-	} else {
+	if c.outbound {
 		info.QUICRole = "主动连接端"
+	} else {
+		info.QUICRole = "监听端"
 	}
 
 	remote := c.qc.RemoteAddr().String()
@@ -45,6 +47,10 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		switch strings.ToLower(cand.Type) {
 		case "srflx":
 			info.RemoteCandidateType = "STUN 映射 / NAT-PUNCH"
+		case "prflx":
+			info.RemoteCandidateType = "PEER-REFLEXIVE / NAT-PUNCH"
+		case "portmap":
+			info.RemoteCandidateType = "显式端口映射"
 		case "host":
 			info.RemoteCandidateType = "HOST"
 		default:
@@ -87,6 +93,7 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 			info.STUNMappings = append(info.STUNMappings, cand.Addr)
 		}
 	}
+	info.MappingBehavior, _, info.PortMappings = c.peer.networkInfo()
 	return info
 }
 
