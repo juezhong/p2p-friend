@@ -1,11 +1,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
+
+	quic "github.com/quic-go/quic-go"
 )
 
 var consoleOut io.Writer = os.Stdout
@@ -90,14 +94,23 @@ func isClosedErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) && appErr.ErrorCode == 0 {
+		return true
+	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "use of closed network connection") ||
 		strings.Contains(s, "forcibly closed") ||
-		strings.Contains(s, "connection reset")
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "session closed") ||
+		strings.Contains(s, "normal shutdown")
 }
 
 func (s *peerSession) reportTransportError(scope string, err error) {
-	if err == nil || isClosedErr(err) {
+	if err == nil || s.closing.Load() || s.remoteBye.Load() || isClosedErr(err) {
 		return
 	}
 	s.transportErrOnce.Do(func() {
