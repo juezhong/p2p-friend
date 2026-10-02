@@ -41,9 +41,8 @@ func printHelp() {
   1. 创建会话：生成 OFFER，收到朋友的 ANSWER 后建立连接
   2. 加入会话：输入 OFFER，生成 ANSWER 发回创建方
 
-连接阶段会自动收集 IPv6 / IPv4 ICE 候选并执行 UDP 连通性检查；
-IPv4 位于 NAT 后时会通过 STUN 辅助 UDP hole punching，不使用 TURN/relay。
-只有 ICE、DTLS 和数据通道全部建立成功后才进入文件命令行。
+连接阶段会收集 IPv6 / IPv4 / STUN UDP 候选，并在同一 UDP socket 上执行直连或 hole punching；
+QUIC 握手、会话认证和 4 条数据 stream 全部建立成功后才进入文件命令行。
 
 连接后采用类似 SFTP 的命令：
   pwd / ls / cd         操作远端目录
@@ -55,8 +54,8 @@ IPv4 位于 NAT 后时会通过 STUN 辅助 UDP hole punching，不使用 TURN/r
   quit / exit           断开并退出
 
 传输：
-  * 底层是 UDP + ICE + DTLS + SCTP DataChannel。
-  * 4 条可靠数据 stream 并行传输，UDP 丢包由传输层自动重传。
+  * 底层是 UDP + QUIC（TLS 1.3、可靠重传、拥塞控制、多 stream）。
+  * 4 条 QUIC data stream 并行传输，UDP 丢包由 QUIC 自动重传。
   * 发送文件前计算 SHA-256；接收端落盘后重新计算，匹配才报告完成。
   * 不配置 TURN/relay；全部候选失败时会明确报连接失败。
 `, appVersion)
@@ -79,7 +78,7 @@ func runInteractive() error {
 	consolePrintln("2) 加入会话（输入 OFFER / 生成 ANSWER）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
-	consolePrintln("网络：UDP/ICE 自动尝试 IPv6 直连与 IPv4 NAT 打洞；不使用 TURN/relay。")
+	consolePrintln("网络：同一 UDP socket 自动尝试 IPv6 直连与 IPv4 STUN/NAT 打洞，传输使用 QUIC；不使用 TURN/relay。")
 	consolePrintln("")
 
 	for {
@@ -108,41 +107,41 @@ func runInteractive() error {
 func runHost(in *bufio.Reader, cwd string) error {
 	peer, offer, err := createHostOffer()
 	if err != nil {
-		return fmt.Errorf("创建 UDP/ICE 会话失败: %w", err)
+		return fmt.Errorf("创建 UDP/QUIC 会话失败: %w", err)
 	}
 	consolePrintf("\n[创建会话] 初始目录: %s\n", cwd)
-	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选。")
+	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选；传输将复用同一 UDP socket。")
 	consolePrintln("")
 	consolePrintln("把下面的 OFFER 发给朋友：")
 	consolePrintln(offer)
 	consolePrintln("")
-	consolePrintln("朋友会返回一个 P2P6-ANSWER-...，粘贴后开始 UDP/ICE 连通性检查。")
+	consolePrintln("朋友会返回一个 P2P7-ANSWER-...，粘贴后开始 UDP/QUIC 连通性检查。")
 	consolePrintf("ANSWER: ")
 	answer, err := readSignalLine(in)
 	if err != nil {
-		_ = peer.pc.Close()
+		_ = peer.Close()
 		return err
 	}
 	if answer == "" {
-		_ = peer.pc.Close()
+		_ = peer.Close()
 		return errors.New("ANSWER 为空")
 	}
 	consolePrintln("正在建立 P2P UDP 连接（IPv6 direct / IPv4 hole punching）...")
 	conn, token, err := peer.acceptAnswer(answer)
 	if err != nil {
-		_ = peer.pc.Close()
+		_ = peer.Close()
 		return err
 	}
 	if err := authenticateListener(conn, token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
 	}
-	consolePrintln("已建立 P2P UDP 加密连接：ICE + DTLS + SCTP，多数据 stream 已就绪。")
+	consolePrintln("已建立 P2P UDP 加密连接：QUIC + TLS 1.3，多数据 stream 已就绪。")
 	return runPeerShell(conn, "HOST", cwd, in)
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P6-OFFER-...。")
+	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P7-OFFER-...。")
 	consolePrintf("OFFER: ")
 	offer, err := readSignalLine(in)
 	if err != nil {
@@ -159,17 +158,17 @@ func runJoin(in *bufio.Reader, cwd string) error {
 	consolePrintln("把下面的 ANSWER 发回创建方：")
 	consolePrintln(answer)
 	consolePrintln("")
-	consolePrintln("等待创建方粘贴 ANSWER，并自动执行 UDP/ICE 连通性检查...")
+	consolePrintln("等待创建方粘贴 ANSWER，并自动执行 UDP/QUIC 连通性检查...")
 	conn, err := peer.waitConn()
 	if err != nil {
-		_ = peer.pc.Close()
+		_ = peer.Close()
 		return err
 	}
 	if err := authenticateDialer(conn, token, roleJoin); err != nil {
 		_ = conn.Close()
 		return err
 	}
-	consolePrintln("已建立 P2P UDP 加密连接：ICE + DTLS + SCTP，多数据 stream 已就绪。")
+	consolePrintln("已建立 P2P UDP 加密连接：QUIC + TLS 1.3，多数据 stream 已就绪。")
 	return runPeerShell(conn, "JOIN", cwd, in)
 }
 
@@ -406,11 +405,6 @@ Windows 的 D:\... 路径和 Linux 的 /home/... 路径都会按远端系统风�
   status                      显示连接和目录状态
   help                        显示帮助
   quit / exit                 断开并退出
-
-示例：
-  cd D:\Bai<Tab>
-  get "D:\BaiduNetdiskDownload\正点原子 产品手册.pdf"
-  put ./build.tar "D:\incoming\build.tar"
 
 安全提示：远端绝对路径访问不限制在初始目录；请只把连接码交给可信任的人。`)
 }

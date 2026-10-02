@@ -12,7 +12,7 @@ import (
 const (
 	frameEntryReady = byte(11)
 	dataHeaderSize  = 20
-	dataChunkSize   = 48 * 1024
+	dataChunkSize   = 256 * 1024
 	parallelLanes   = 4
 )
 
@@ -139,28 +139,28 @@ func (s *peerSession) writeDataChunkOnLane(idx int, id uint64, offset int64, pay
 }
 
 func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
-	buf := make([]byte, dataHeaderSize+dataChunkSize)
+	header := make([]byte, dataHeaderSize)
 	for {
-		n, err := lane.Read(buf)
-		if err != nil {
-			if !errors.Is(err, io.EOF) && !isClosedErr(err) {
-				consolePrintf("[数据流] 读取失败: %v\n", err)
+		if _, err := io.ReadFull(lane, header); err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isClosedErr(err) {
+				consolePrintf("[数据流] 读取帧头失败: %v\n", err)
 			}
 			return
 		}
-		if n < dataHeaderSize {
-			consolePrintf("[数据流] 无效数据帧长度: %d\n", n)
-			continue
-		}
-		id := binary.BigEndian.Uint64(buf[0:8])
-		offset := int64(binary.BigEndian.Uint64(buf[8:16]))
-		want := int(binary.BigEndian.Uint32(buf[16:20]))
-		if want != n-dataHeaderSize || want > dataChunkSize {
-			consolePrintf("[数据流] 无效数据长度: frame=%d payload=%d\n", n, want)
-			continue
+		id := binary.BigEndian.Uint64(header[0:8])
+		offset := int64(binary.BigEndian.Uint64(header[8:16]))
+		want := int(binary.BigEndian.Uint32(header[16:20]))
+		if want > dataChunkSize {
+			consolePrintf("[数据流] 无效数据长度: %d\n", want)
+			return
 		}
 		data := make([]byte, want)
-		copy(data, buf[dataHeaderSize:n])
+		if _, err := io.ReadFull(lane, data); err != nil {
+			if !isClosedErr(err) {
+				consolePrintf("[数据流] 读取 payload 失败: %v\n", err)
+			}
+			return
+		}
 		if err := s.handleTransferDataAt(id, offset, data); err != nil {
 			consolePrintf("[数据流] 数据处理失败: %v\n", err)
 		}

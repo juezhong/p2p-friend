@@ -2,15 +2,15 @@
 
 `p2p-friend` 是一个面向两端直接文件传输的交互式 P2P 命令行工具，操作方式接近 SFTP。
 
-v0.6 将网络层升级为 **UDP + ICE + DTLS + SCTP DataChannel**。程序同时收集 IPv6、IPv4 与 STUN server-reflexive 候选，通过 ICE 选择能够直接通信的 UDP 路径；IPv4 位于常见 NAT 后时会尝试 UDP hole punching。项目不配置 TURN / relay，文件数据不会经过应用层中继服务器。
+v0.7 将数据面升级为 **QUIC/UDP + TLS 1.3 + 多 stream**。程序同时收集 IPv6、IPv4 与 STUN 映射候选，在同一个真实 UDP socket 上进行 IPv6 直连或 IPv4 UDP hole punching；QUIC 直接接管该 socket，从而在支持的平台上保留批量收包、ECN、PMTU 与 Linux UDP GSO 等内核优化。项目不配置 TURN / relay。
 
 ## 功能
 
 - Linux / Windows x86-64
 - IPv6 ↔ IPv6 UDP 直连
-- IPv4 ↔ IPv4 STUN / ICE NAT 打洞
-- DTLS 加密与 SCTP 可靠传输
-- 1 条控制 DataChannel + 4 条并行数据 DataChannel
+- IPv4 ↔ IPv4 STUN 辅助 UDP NAT 打洞
+- QUIC TLS 1.3 加密、可靠重传与拥塞控制
+- 1 条 QUIC 控制 stream + 4 条并行 QUIC data stream
 - 文件和目录递归传输
 - 双向 `put` / `get`
 - 远端目录浏览与切换
@@ -20,11 +20,11 @@ v0.6 将网络层升级为 **UDP + ICE + DTLS + SCTP DataChannel**。程序同�
 - 接收落盘后重新 SHA-256 校验
 - `Ctrl-C` 仅取消当前传输，不退出会话
 
-> v0.6 使用 `P2P6-OFFER-...` / `P2P6-ANSWER-...` 信令码，与旧版网络协议不兼容。双方需要使用 v0.6.x。
+> v0.7 使用 `P2P7-OFFER-...` / `P2P7-ANSWER-...` 信令码，与旧版网络协议不兼容。双方需要使用 v0.7.x。
 
 ## 连接流程
 
-v0.6 不需要自建信令服务器。双方通过已有聊天工具手工交换一次 OFFER / ANSWER。
+v0.7 不需要自建信令服务器。双方通过已有聊天工具手工交换一次 OFFER / ANSWER。
 
 ### 创建会话
 
@@ -37,16 +37,16 @@ v0.6 不需要自建信令服务器。双方通过已有聊天工具手工交换
 程序收集本机 IPv4 / IPv6 与 STUN 候选，然后输出：
 
 ```text
-P2P6-OFFER-...
+P2P7-OFFER-...
 ```
 
 将 OFFER 发给另一方。另一方会返回：
 
 ```text
-P2P6-ANSWER-...
+P2P7-ANSWER-...
 ```
 
-将 ANSWER 粘贴回创建方。只有 ICE、DTLS、会话认证和全部 DataChannel 建立成功后才进入命令行。
+将 ANSWER 粘贴回创建方。只有 UDP 路径、QUIC TLS 1.3、会话认证和全部 QUIC stream 建立成功后才进入命令行。
 
 ### 加入会话
 
@@ -56,49 +56,50 @@ P2P6-ANSWER-...
 2) 加入会话（输入 OFFER / 生成 ANSWER）
 ```
 
-粘贴 OFFER，程序生成 ANSWER。将 ANSWER 发回创建方，然后等待 ICE 连接建立。
+粘贴 OFFER，程序生成 ANSWER。将 ANSWER 发回创建方，然后等待 UDP 打洞/直连和 QUIC 握手完成。
 
 ## 网络模型
 
-ICE 会自动尝试可用的 UDP candidate pair：
+v0.7 的数据链路：
 
 ```text
-IPv6 host candidate
-IPv4 host candidate
-IPv4 server-reflexive candidate (STUN)
+IPv6 / IPv4 candidates
+        ↓
+STUN 映射（IPv4 NAT 场景）
+        ↓
+同时 UDP hole punching
+        ↓
+同一个 *net.UDPConn
+        ↓
+quic-go Transport
+        ↓
+QUIC TLS 1.3 + loss recovery + congestion control
+        ↓
+control stream + 4 data streams
 ```
 
-IPv4 位于 NAT 后时，STUN 只用于发现公网映射地址，ICE 会同时执行 UDP connectivity checks，从而尝试 hole punching。公共 STUN 不承载文件内容。
+STUN 只用于发现公网 UDP 映射，不承载文件数据；打洞和 QUIC 使用同一个 UDP socket，因此不会出现“STUN 映射端口和实际传输端口不同”的问题。
 
-项目没有配置 TURN。若双方 NAT / 防火墙组合无法建立直接 UDP 路径，程序会明确连接失败，不会退回中继。
+IPv6 有可达的 global address 时会直接尝试 QUIC/UDP；IPv4 则同时尝试本地 candidate 与 STUN 映射 candidate。当前仍然不配置 TURN / relay，所有 candidate 都失败时会明确报错。后续 NAT 兼容性可以继续单独增强，不影响 QUIC 文件传输层。
 
-## 传输模型
+## QUIC 多 stream 与大文件
 
-底层链路：
+单个文件按 offset 切成块，由 4 个 worker 同时投递到 4 条独立 QUIC bidirectional stream：
 
 ```text
-UDP
-  -> ICE
-  -> DTLS
-  -> SCTP DataChannel
-  -> p2p-friend protocol
+file
+ ├─ offset 0       -> data stream 0
+ ├─ offset N       -> data stream 1
+ ├─ offset 2N      -> data stream 2
+ ├─ offset 3N      -> data stream 3
+ └─ ...
+
+receiver -> WriteAt(offset) -> .part
 ```
 
-UDP 本身允许丢包，但 DataChannel 使用可靠 SCTP 传输，因此丢失的数据会自动重传。程序不会把缺失数据当作成功文件。
+它和多线程下载的思路相近，但所有 stream 共享一个 QUIC connection 和一个 UDP socket，不需要额外创建多个公网端口。QUIC 负责 ACK、丢包重传、RTT、拥塞控制和流量控制；应用层只负责 chunk 调度、offset 写盘和最终 SHA-256。
 
-v0.6 建立：
-
-```text
-control
-data-0
-data-1
-data-2
-data-3
-```
-
-`control` 用于命令与传输元数据。单个大文件按 offset 分块后在 4 条数据 stream 上并行发送，接收端按 offset 写入同一个临时文件。
-
-这些逻辑 stream 共享同一 ICE/UDP P2P 路径，不强制创建多个公网 UDP 端口，从而减少 NAT 映射数量并优先保证打洞稳定性。多 stream 用于减少单一有序数据流的队头阻塞和提高并行处理能力，但不会突破物理带宽上限。
+应用层数据块提高到 256 KiB；QUIC 再根据 PMTU 分包。在 Linux 和内核支持时，quic-go 直接使用真实 `*net.UDPConn` 可利用 UDP GSO 等内核优化；不支持时自动退回普通 UDP 发送路径。
 
 ## 文件完整性
 
@@ -202,11 +203,11 @@ overwrite on
 
 ## 安全模型
 
-- ICE 只负责建立点对点 UDP 路径
-- DTLS 保护链路
+- STUN 只用于发现 IPv4 NAT 映射，不承载文件数据
+- QUIC 使用 TLS 1.3 保护连接，并负责可靠重传、拥塞控制和流量控制
 - 会话信令码包含随机 256-bit token
-- control DataChannel 使用可靠有序模式
-- 4 条 data DataChannel 使用可靠乱序模式
+- QUIC 服务端临时证书通过 OFFER 中的 SHA-256 fingerprint 固定校验
+- 1 条 control stream + 4 条 data stream 复用同一个 QUIC/UDP 连接
 - 每个文件额外执行 SHA-256 端到端校验
 - 接收文件先写 `.part`，校验成功后再重命名
 - 默认拒绝通过符号链接写入目标路径
