@@ -15,7 +15,13 @@ import (
 )
 
 func TestSignalCodeRoundTrip(t *testing.T) {
-	in := signalCode{Version: signalVersion, Kind: "offer", Token: "abc", SDP: "v=0\r\n"}
+	in := signalCode{
+		Version: signalVersion,
+		Kind: "offer",
+		Token: "abc",
+		Candidates: []string{"[2001:db8::1]:5000", "203.0.113.1:40000"},
+		Fingerprint: strings.Repeat("ab", 32),
+	}
 	s, err := encodeSignal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +33,7 @@ func TestSignalCodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip mismatch: %#v != %#v", out, in)
 	}
 }
@@ -487,5 +493,108 @@ func TestSessionAuthenticationTokenAndRoles(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
+	}
+}
+
+
+func ipv4EndpointAddr(t *testing.T, p *rtcPeer) string {
+	t.Helper()
+	for _, ep := range p.endpoints {
+		if ep.family == 4 {
+			port := ep.conn.LocalAddr().(*net.UDPAddr).Port
+			return net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
+		}
+	}
+	t.Fatal("no IPv4 endpoint")
+	return ""
+}
+
+func TestQUICLoopbackParallelTransfer(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	join.fingerprint = append([]byte(nil), host.fingerprint...)
+	host.remote = []string{ipv4EndpointAddr(t, join)}
+	join.remote = []string{ipv4EndpointAddr(t, host)}
+
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	hostCh := make(chan connResult, 1)
+	go func() {
+		conn, err := host.acceptQUIC()
+		hostCh <- connResult{conn: conn, err: err}
+	}()
+
+	joinConn, err := join.dialQUIC()
+	if err != nil {
+		t.Fatalf("join QUIC dial: %v", err)
+	}
+	hr := <-hostCh
+	if hr.err != nil {
+		_ = joinConn.Close()
+		t.Fatalf("host QUIC accept: %v", hr.err)
+	}
+	hostConn := hr.conn
+
+	authErr := make(chan error, 1)
+	go func() { authErr <- authenticateListener(hostConn, host.token, roleHost) }()
+	if err := authenticateDialer(joinConn, join.token, roleJoin); err != nil {
+		t.Fatalf("dialer auth: %v", err)
+	}
+	if err := <-authErr; err != nil {
+		t.Fatalf("listener auth: %v", err)
+	}
+
+	hostDir := t.TempDir()
+	joinDir := t.TempDir()
+	payload := bytes.Repeat([]byte("quic-parallel-payload-"), 180000)
+	if err := os.WriteFile(filepath.Join(joinDir, "source.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hs := initPeerSession(hostConn, "HOST", hostDir)
+	js := initPeerSession(joinConn, "JOIN", joinDir)
+	defer hs.close(false)
+	defer js.close(false)
+	go hs.readLoop()
+	go js.readLoop()
+
+	if st := dataState(js); st == nil || len(st.lanes) != parallelLanes {
+		t.Fatalf("join QUIC data lanes = %#v", st)
+	}
+	if st := dataState(hs); st == nil || len(st.lanes) != parallelLanes {
+		t.Fatalf("host QUIC data lanes = %#v", st)
+	}
+	if err := js.put("source.bin", "received.bin"); err != nil {
+		t.Fatalf("QUIC put: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(hostDir, "received.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("QUIC payload mismatch")
+	}
+	wantHash, err := fileSHA256(filepath.Join(joinDir, "source.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotHash, err := fileSHA256(filepath.Join(hostDir, "received.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wantHash, gotHash) {
+		t.Fatalf("QUIC hash mismatch sender=%x receiver=%x", wantHash, gotHash)
 	}
 }
