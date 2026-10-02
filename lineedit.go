@@ -723,5 +723,5 @@ func shellPrompt(s *peerSession) string {
 		r := []rune(remote)
 		remote = "…" + string(r[len(r)-(maxRunes-1):])
 	}
-	return "p2p[" + s.roleName + " remote:" + remote + "]> "
+	return "p2p[" + s.linkMode + " remote:" + remote + "]> "
 }
