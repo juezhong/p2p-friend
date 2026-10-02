@@ -14,8 +14,8 @@ import (
 var appVersion = "dev"
 
 const (
-	protocolMagic   = "P2PF8"
-	protocolVersion = 8
+	protocolMagic   = "P2PF9"
+	protocolVersion = 9
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
@@ -42,8 +42,10 @@ type wireFrame struct {
 }
 
 type rpcRequest struct {
-	Op   string `json:"op"`
-	Path string `json:"path,omitempty"`
+	Op           string `json:"op"`
+	Path         string `json:"path,omitempty"`
+	LeaseID      uint64 `json:"lease_id,omitempty"`
+	TransferKind string `json:"transfer_kind,omitempty"`
 }
 
 type rpcResponse struct {
@@ -97,6 +99,7 @@ type sendEntry struct {
 }
 
 type progress struct {
+	mu          sync.Mutex
 	Start       time.Time
 	LastPrint   time.Time
 	Done        int64
@@ -105,6 +108,8 @@ type progress struct {
 	CurrentDone int64
 	CurrentSize int64
 	Prefix      string
+	Silent      bool
+	lineOpen    bool
 }
 
 type pendingGet struct {
@@ -183,6 +188,13 @@ type peerSession struct {
 
 	stateMu   sync.RWMutex
 	overwrite bool
+
+	leaseMu             sync.Mutex
+	lease               transferLeaseState
+	transferCoordinator bool
+
+	tuningMu sync.RWMutex
+	tuning   transferTuningProfile
 
 	fgMu       sync.Mutex
 	foreground foregroundTransfer
