@@ -236,7 +236,9 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 	for {
 		select {
 		case <-s.closed:
-			consolePrintln("\n连接已关闭。")
+			if !s.remoteBye.Load() {
+				consolePrintln("\n[连接] 会话已关闭。")
+			}
 			return nil
 		default:
 		}
@@ -252,7 +254,8 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 				}
 				continue
 			case errors.Is(err, io.EOF):
-				_ = s.writeFrame(frameBye, 0, nil)
+				s.close(true)
+				consolePrintln("[连接] 会话已正常结束。")
 				return nil
 			default:
 				select {
@@ -382,8 +385,8 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 		case "help", "?":
 			printShellHelp()
 		case "quit", "exit", "bye":
-			_ = s.writeFrame(frameBye, 0, nil)
-			s.close(false)
+			s.close(true)
+			consolePrintln("[连接] 会话已正常结束。")
 			return nil
 		default:
 			consolePrintf("未知命令: %s（输入 help 查看命令）\n", args[0])
