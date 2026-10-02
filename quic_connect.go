@@ -18,7 +18,7 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
 
-	acceptCh := make(chan *quic.Conn, 1)
+	acceptCh := make(chan *quic.Conn, 8)
 	var wg sync.WaitGroup
 	started := 0
 	for _, ep := range p.endpoints {
@@ -31,14 +31,17 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 		wg.Add(1)
 		go func(ln *quic.Listener) {
 			defer wg.Done()
-			qc, err := ln.Accept(ctx)
-			if err != nil {
-				return
-			}
-			select {
-			case acceptCh <- qc:
-			case <-ctx.Done():
-				_ = qc.CloseWithError(0, "cancelled")
+			for {
+				qc, err := ln.Accept(ctx)
+				if err != nil {
+					return
+				}
+				select {
+				case acceptCh <- qc:
+				case <-ctx.Done():
+					_ = qc.CloseWithError(0, "cancelled")
+					return
+				}
 			}
 		}(ln)
 		if ep.family == 4 {
@@ -55,14 +58,32 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 		close(done)
 	}()
 
-	select {
-	case qc := <-acceptCh:
-		cancel()
-		return establishStreams(qc, p, true)
-	case <-done:
-		return nil, errors.New("QUIC listener 已停止，未建立连接")
-	case <-ctx.Done():
-		return nil, connectionTimeoutError()
+	var lastErr error
+	for {
+		select {
+		case qc := <-acceptCh:
+			conn, err := establishStreams(qc, p, true)
+			if err == nil {
+				cancel()
+				return conn, nil
+			}
+			lastErr = err
+			_ = qc.CloseWithError(0, "candidate rejected")
+			// Candidate racing can make us accept a connection that the dialer
+			// immediately closes because another path won. Keep accepting until
+			// a connection actually completes stream establishment.
+			continue
+		case <-done:
+			if lastErr != nil {
+				return nil, fmt.Errorf("QUIC listener 已停止，候选连接均未完成: %w", lastErr)
+			}
+			return nil, errors.New("QUIC listener 已停止，未建立连接")
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w；最后一次候选错误: %v", connectionTimeoutError(), lastErr)
+			}
+			return nil, connectionTimeoutError()
+		}
 	}
 }
 
