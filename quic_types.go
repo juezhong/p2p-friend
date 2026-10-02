@@ -27,11 +27,11 @@ const (
 )
 
 type signalCode struct {
-	Version     int      \`json:"v"\`
-	Kind        string   \`json:"kind"\`
-	Token       string   \`json:"token"\`
-	Candidates  []string \`json:"candidates"\`
-	Fingerprint string   \`json:"fingerprint,omitempty"\`
+	Version     int      `json:"v"`
+	Kind        string   `json:"kind"`
+	Token       string   `json:"token"`
+	Candidates  []string `json:"candidates"`
+	Fingerprint string   `json:"fingerprint,omitempty"`
 }
 
 type udpEndpoint struct {
