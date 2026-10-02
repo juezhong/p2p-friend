@@ -19,19 +19,22 @@ import (
 func TestSignalCodeRoundTrip(t *testing.T) {
 	in := signalCode{
 		Version:     signalVersion,
-		Kind:        "offer",
-		Token:       "abc",
-		Candidates:  []string{"[2001:db8::1]:5000", "203.0.113.1:40000"},
+		Kind:  "connect",
+		Token: "abc",
+		Candidates: []signalCandidate{
+			{Addr: "[2001:db8::1]:5000", Type: "host"},
+			{Addr: "203.0.113.1:40000", Type: "srflx"},
+		},
 		Fingerprint: strings.Repeat("ab", 32),
 	}
 	s, err := encodeSignal(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(s, signalPrefixOffer) {
+	if !strings.HasPrefix(s, signalPrefix) {
 		t.Fatalf("unexpected code prefix: %s", s)
 	}
-	out, err := decodeSignal(s, "offer")
+	out, err := decodeSignal(s, "connect")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +525,7 @@ func TestLineEditorRedrawAvoidsCursorSaveRestore(t *testing.T) {
 	e := &lineEditor{
 		out:    &out,
 		active: true,
-		prompt: "p2p[JOIN remote:/tmp]> ",
+		prompt: "p2p[IPv6-DIRECT remote:/tmp]> ",
 		line:   []rune("get 中文"),
 		cursor: len([]rune("get 中")),
 		status: "[GET] 50%",
@@ -565,8 +568,8 @@ func TestQUICDialWaitsForDelayedHost(t *testing.T) {
 
 	join.token = append([]byte(nil), host.token...)
 	join.fingerprint = append([]byte(nil), host.fingerprint...)
-	host.remote = []string{ipv4EndpointAddr(t, join)}
-	join.remote = []string{ipv4EndpointAddr(t, host)}
+	host.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, join), Type: "host"}})
+	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
 
 	type connResult struct {
 		conn net.Conn
@@ -630,8 +633,8 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 
 	join.token = append([]byte(nil), host.token...)
 	join.fingerprint = append([]byte(nil), host.fingerprint...)
-	host.remote = []string{ipv4EndpointAddr(t, join)}
-	join.remote = []string{ipv4EndpointAddr(t, host)}
+	host.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, join), Type: "host"}})
+	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
 
 	type connResult struct {
 		conn net.Conn
