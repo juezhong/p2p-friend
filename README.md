@@ -25,40 +25,55 @@
 - `Ctrl-C` 只取消当前传输，不退出会话
 - `status` 显示实际 QUIC / UDP 链路、端口、候选和传输状态
 
-当前协议使用可辨识的两类识别码：`P2PF-CREATE-...` 表示创建方生成的创建码；`P2PF-JOIN-...` 表示加入方在需要双向 NAT 打洞时返回的加入码。
+当前协议使用两类按“用途”命名的识别码：`P2PF-INVITE-...` 是创建方发给对方的**邀请码**，收到后选择“加入连接”；`P2PF-REPLY-...` 是加入方在需要双向 NAT 打洞时发回创建方的**回传码**。
 
 ## 建立连接
 
 启动后选择：
 
 ```text
-1) 创建连接（生成 P2PF-CREATE 创建码）
-2) 加入连接（输入 P2PF-CREATE 创建码）
+1) 创建连接（生成 P2PF-INVITE 邀请码）
+2) 加入连接（输入 P2PF-INVITE 邀请码）
 3) 退出
 ```
 
-创建方生成 `P2PF-CREATE-...` 创建码后立即监听真实 QUIC 握手。加入方粘贴创建码后会先尝试直接连接。
+创建方生成 `P2PF-INVITE-...` 邀请码后立即监听真实 QUIC 握手。加入方粘贴邀请码后会先尝试直接连接。
 
-如果 IPv6、公开 IPv4，或当前 NAT 允许加入方向创建方直接建立 QUIC，则只需要交换一次创建码：
+如果 IPv6、公开 IPv4，或当前 NAT 允许加入方向创建方直接建立 QUIC，则只需要交换一次邀请码：
 
 ```text
-创建方 -> P2PF-CREATE -> 加入方
+创建方 -> P2PF-INVITE -> 加入方
                     -> QUIC connected
 ```
 
-如果数秒内仍无法直接建立连接，加入方才会显示 `P2PF-JOIN-...` 加入码。这个码包含加入方启动 UDP socket 后获得的 candidate，用于双方都在较严格 IPv4 NAT 后时完成双向 UDP hole punching：
+如果数秒内仍无法直接建立连接，加入方才会显示 `P2PF-REPLY-...` 回传码。这个码包含加入方启动 UDP socket 后获得的 candidate，用于双方都在较严格 IPv4 NAT 后时完成双向 UDP hole punching：
 
 ```text
-创建方 -> P2PF-CREATE -> 加入方
-创建方 <- P2PF-JOIN   <- 加入方
+创建方 -> P2PF-INVITE -> 加入方
+创建方 <- P2PF-REPLY   <- 加入方
               -> IPv4 NAT punching -> QUIC
 ```
 
-因此 v0.10 是“一次优先、两次兜底”，而不是所有网络都强制交换两次。若要在所有双 NAT 场景中都只复制一次，就必须引入一个外部 rendezvous/signaling 服务来自动交换第二端 candidate；当前项目仍保持无信令服务器设计。
+因此当前流程是“一次邀请码优先、回传码仅 NAT 兜底”，而不是所有网络都强制交换两次。若要在所有双 NAT 场景中都只复制一次，就必须引入一个外部 rendezvous/signaling 服务来自动交换第二端 candidate；当前项目仍保持无信令服务器设计。
 
-识别码前缀也直接表示来源角色：收到 `P2PF-CREATE-...` 时应选择“加入连接”；收到 `P2PF-JOIN-...` 时说明自己应是创建方并将其粘贴到创建端。
+识别码前缀也直接表示来源角色：收到 `P2PF-INVITE-...` 时应选择“加入连接”；收到 `P2PF-REPLY-...` 时说明自己应是创建方并将其粘贴到创建端。
 
 连接过程中的 candidate retry 保持静默。只有最终超时才提示交换“创建连接 / 加入连接”角色重试。
+
+## 紧凑识别码
+
+v0.11 将识别码内部从 JSON 改为紧凑二进制格式，再使用 URL-safe Base64 编码。
+
+候选地址不再以字符串和字段名重复保存：
+
+- IPv4 使用 4-byte 地址 + 2-byte 端口。
+- IPv6 使用 16-byte 地址 + 2-byte 端口。
+- candidate 类型与地址族压缩到标志位。
+- 相同 IP:port 的重复 candidate 会合并；若同一 endpoint 同时表现为 host 和 STUN 映射，优先保留 host。
+- 继续完整保留 256-bit 会话 token 和 SHA-256 证书指纹，不通过削弱安全参数来缩短识别码。
+- loopback、link-local、unspecified 等明显不可用于公网连接的地址不会进入识别码。
+
+因此相比旧版 Base64(JSON)，同样数量的 IPv4 / IPv6 candidate 会明显更短，也更适合在聊天工具中复制。
 
 ## 链路类型
 

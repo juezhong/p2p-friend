@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -20,10 +21,11 @@ import (
 )
 
 func TestSignalCodeRoundTrip(t *testing.T) {
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
 	in := signalCode{
-		Version:     signalVersion,
-		Kind:  "connect",
-		Token: "abc",
+		Version: signalVersion,
+		Kind:    "connect",
+		Token:   token,
 		Candidates: []signalCandidate{
 			{Addr: "[2001:db8::1]:5000", Type: "host"},
 			{Addr: "203.0.113.1:40000", Type: "srflx"},
@@ -34,8 +36,11 @@ func TestSignalCodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(s, signalCreatePrefix) {
-		t.Fatalf("unexpected CREATE code prefix: %s", s)
+	if !strings.HasPrefix(s, signalInvitePrefix) {
+		t.Fatalf("unexpected INVITE code prefix: %s", s)
+	}
+	if len(s) >= 200 {
+		t.Fatalf("compact INVITE unexpectedly long: %d chars: %s", len(s), s)
 	}
 	out, err := decodeSignal(s, "connect")
 	if err != nil {
@@ -918,34 +923,68 @@ func TestShutdownRemovesPartialReceive(t *testing.T) {
 }
 
 func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
-	create := signalCode{
-		Version: signalVersion, Kind: "connect", Token: "x",
-		Candidates: []signalCandidate{{Addr: "127.0.0.1:1", Type: "host"}},
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x24}, 32))
+	invite := signalCode{
+		Version: signalVersion, Kind: "connect", Token: token,
+		Candidates:  []signalCandidate{{Addr: "192.0.2.1:41001", Type: "host"}},
+		Fingerprint: strings.Repeat("cd", 32),
 	}
-	createCode, err := encodeSignal(create)
+	inviteCode, err := encodeSignal(invite)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(createCode, signalCreatePrefix) {
-		t.Fatalf("create prefix=%q", createCode)
+	if !strings.HasPrefix(inviteCode, signalInvitePrefix) {
+		t.Fatalf("invite prefix=%q", inviteCode)
 	}
-	if _, err := decodeSignal(createCode, "confirm"); err == nil || !strings.Contains(err.Error(), "P2PF-CREATE") {
-		t.Fatalf("wrong-role CREATE code should be explained, got %v", err)
+	if _, err := decodeSignal(inviteCode, "confirm"); err == nil || !strings.Contains(err.Error(), "P2PF-INVITE") {
+		t.Fatalf("wrong-role INVITE code should be explained, got %v", err)
 	}
 
-	join := signalCode{
-		Version: signalVersion, Kind: "confirm", Token: "x",
-		Candidates: []signalCandidate{{Addr: "127.0.0.1:2", Type: "host"}},
+	reply := signalCode{
+		Version: signalVersion, Kind: "confirm", Token: token,
+		Candidates: []signalCandidate{{Addr: "198.51.100.2:42002", Type: "srflx"}},
 	}
-	joinCode, err := encodeSignal(join)
+	replyCode, err := encodeSignal(reply)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(joinCode, signalJoinPrefix) {
-		t.Fatalf("join prefix=%q", joinCode)
+	if !strings.HasPrefix(replyCode, signalReplyPrefix) {
+		t.Fatalf("reply prefix=%q", replyCode)
 	}
-	if _, err := decodeSignal(joinCode, "connect"); err == nil || !strings.Contains(err.Error(), "P2PF-JOIN") {
-		t.Fatalf("wrong-role JOIN code should be explained, got %v", err)
+	if len(replyCode) >= 100 {
+		t.Fatalf("compact REPLY unexpectedly long: %d chars: %s", len(replyCode), replyCode)
+	}
+	if _, err := decodeSignal(replyCode, "connect"); err == nil || !strings.Contains(err.Error(), "P2PF-REPLY") {
+		t.Fatalf("wrong-role REPLY code should be explained, got %v", err)
+	}
+}
+
+func TestSignalCandidateDeduplication(t *testing.T) {
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	in := signalCode{
+		Version: signalVersion, Kind: "connect", Token: token,
+		Fingerprint: strings.Repeat("ef", 32),
+		Candidates: []signalCandidate{
+			{Addr: "203.0.113.9:45678", Type: "srflx"},
+			{Addr: "203.0.113.9:45678", Type: "host"},
+			{Addr: "[2001:db8::9]:45679", Type: "host"},
+		},
+	}
+	code, err := encodeSignal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := decodeSignal(code, "connect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Candidates) != 2 {
+		t.Fatalf("dedup candidate count=%d, want 2: %#v", len(out.Candidates), out.Candidates)
+	}
+	for _, cand := range out.Candidates {
+		if cand.Addr == "203.0.113.9:45678" && cand.Type != "host" {
+			t.Fatalf("duplicate endpoint should prefer host candidate: %#v", cand)
+		}
 	}
 }
 
