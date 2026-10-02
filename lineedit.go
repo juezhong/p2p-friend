@@ -210,24 +210,29 @@ func (e *lineEditor) Write(p []byte) (int, error) {
 }
 
 func (e *lineEditor) clearInteractiveLocked() {
-	// 光标始终停在输入行。显式清除输入行和下一行状态，避免依赖
-	// Windows Console 对 ESC[s / ESC[u 保存恢复光标序列的兼容性。
-	fmt.Fprint(e.out, "\r\x1b[2K\x1b[1E\x1b[2K\x1b[1F")
+	// 没有状态行时只清当前输入行。旧实现无论是否有进度都强制
+	// 下移/上移一行，在 tmux、部分 Windows Terminal / conhost 中可能
+	// 触发滚屏或把 prompt 擦掉，最终只剩一个空白光标。
+	fmt.Fprint(e.out, "\r\x1b[2K")
+	if e.status != "" {
+		// 使用最通用的 CRLF + Cursor Up，而不是 CNL/CPL (CSI E/F)。
+		fmt.Fprint(e.out, "\r\n\x1b[2K\x1b[1A\r")
+	}
 }
 
 func (e *lineEditor) redrawLocked() {
-	// 先完整画输入行。
+	// prompt 永远先画在当前输入行；没有状态时绝不触碰下一行。
 	fmt.Fprint(e.out, "\r\x1b[2K", e.prompt, string(e.line))
 
-	// 再画下一行状态。不要用 ESC[s / ESC[u：部分 Windows Terminal /
-	// conhost 组合会把光标留在空白状态行，看起来像“没有提示符”。
-	fmt.Fprint(e.out, "\x1b[1E\x1b[2K")
 	if e.status != "" {
-		fmt.Fprint(e.out, e.status)
+		// 只有传输进度存在时才维护第二行。CRLF + Cursor Up 在
+		// Linux 终端、tmux、Windows Terminal 和 conhost 上兼容性更好。
+		fmt.Fprint(e.out, "\r\n\x1b[2K", e.status, "\x1b[1A\r")
+	} else {
+		fmt.Fprint(e.out, "\r")
 	}
 
-	// 回到输入行，并按显示宽度恢复到逻辑光标位置。
-	fmt.Fprint(e.out, "\x1b[1F")
+	// 按显示宽度恢复逻辑光标；中文/全角字符按双宽处理。
 	col := displayWidthRunes([]rune(e.prompt)) + displayWidthRunes(e.line[:e.cursor])
 	if col > 0 {
 		fmt.Fprintf(e.out, "\x1b[%dC", col)
