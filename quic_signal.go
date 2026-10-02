@@ -81,6 +81,7 @@ func createConnectionCode() (*rtcPeer, string, error) {
 		return nil, "", err
 	}
 	cands := gatherCandidates(p.endpoints)
+	p.setLocalCandidates(cands)
 	if len(cands) == 0 {
 		_ = p.Close()
 		return nil, "", errors.New("没有可用 UDP candidate")
@@ -120,6 +121,7 @@ func createJoinConfirmation(rawCode string) (*rtcPeer, string, []byte, error) {
 	p.fingerprint = fp
 	p.setRemoteCandidates(code.Candidates)
 	cands := gatherCandidates(p.endpoints)
+	p.setLocalCandidates(cands)
 	if len(cands) == 0 {
 		_ = p.Close()
 		return nil, "", nil, errors.New("没有可用 UDP candidate")
