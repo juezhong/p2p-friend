@@ -99,11 +99,9 @@ func (c *rtcConn) LinkMode() string {
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
-		_ = c.control.Close()
-		for _, lane := range c.lanes {
-			_ = lane.Close()
-		}
-		err = c.qc.CloseWithError(0, "session closed")
+		// QUIC application error code 0 is this program's graceful session close.
+		// Closing the QUIC connection tears down control/data streams together.
+		err = c.qc.CloseWithError(0, "normal shutdown")
 		_ = c.peer.Close()
 	})
 	return err

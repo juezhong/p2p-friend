@@ -93,7 +93,9 @@ func (s *peerSession) readLoop() {
 				return
 			}
 		case frameBye:
-			consolePrintln("[连接] 对方已退出会话。")
+			s.remoteBye.Store(true)
+			s.closing.Store(true)
+			consolePrintln("[连接] 对方已正常结束会话。")
 			return
 		default:
 			consolePrintf("[协议] 未知帧类型: %d\n", f.Type)
@@ -419,14 +421,56 @@ func printEntries(entries []remoteEntry) {
 }
 
 func (s *peerSession) close(sendBye bool) {
-	clearDataState(s)
+	s.closing.Store(true)
 	s.closeOnce.Do(func() {
 		if sendBye {
 			_ = s.writeFrame(frameBye, 0, nil)
 		}
+
+		// 先让所有传输任务进入取消态并清理未完成接收内容，再关闭 QUIC。
+		// 这样退出不会遗留 .part，也不会让等待中的 put/get 永久阻塞。
+		s.cleanupTransfersForShutdown()
+		clearDataState(s)
+		s.clearCurrentTuning()
+
 		_ = s.conn.Close()
 		close(s.closed)
 	})
+}
+
+func (s *peerSession) cleanupTransfersForShutdown() {
+	shutdownErr := errors.New("会话已关闭")
+
+	s.transferMu.Lock()
+	outbound := make([]*outboundTransfer, 0, len(s.outbound))
+	for _, t := range s.outbound {
+		outbound = append(outbound, t)
+	}
+	inbound := make([]*inboundTransfer, 0, len(s.inbound))
+	for _, t := range s.inbound {
+		inbound = append(inbound, t)
+	}
+	s.transferMu.Unlock()
+
+	for _, t := range outbound {
+		t.cancel(shutdownErr)
+	}
+	for _, t := range inbound {
+		t.mu.Lock()
+		if !t.cancelled {
+			t.markCancelledLocked(shutdownErr.Error())
+		}
+		t.rollbackCreatedLocked()
+		t.mu.Unlock()
+	}
+
+	s.fgMu.Lock()
+	s.foreground = foregroundTransfer{}
+	s.fgMu.Unlock()
+
+	s.leaseMu.Lock()
+	s.lease = transferLeaseState{}
+	s.leaseMu.Unlock()
 }
 
 func (s *peerSession) status() {
