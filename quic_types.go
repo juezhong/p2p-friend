@@ -47,6 +47,9 @@ type udpEndpoint struct {
 	family    int
 }
 
+// rtcPeer 是早期实现遗留的类型名；当前实现不是 WebRTC peer。
+// 它实际管理 IPv4/IPv6 UDP socket、quic.Transport、候选地址和 QUIC TLS 身份。
+// server=true 表示“创建方 / QUIC 监听端”，与某次文件传输由谁发起无关。
 type rtcPeer struct {
 	token       []byte
 	fingerprint []byte
@@ -100,8 +103,8 @@ func (c *rtcConn) LinkMode() string {
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
-		// QUIC application error code 0 is this program's graceful session close.
-		// Closing the QUIC connection tears down control/data streams together.
+		// application error code 0 约定为本程序的正常会话关闭。
+		// 关闭 QUIC connection 会同时结束 control stream 和所有 data stream。
 		err = c.qc.CloseWithError(0, "normal shutdown")
 		_ = c.peer.Close()
 	})
@@ -232,6 +235,9 @@ func (p *rtcPeer) serverTLSConfig() *tls.Config {
 func (p *rtcPeer) clientTLSConfig() *tls.Config {
 	expected := append([]byte(nil), p.fingerprint...)
 	return &tls.Config{
+		// 不使用公网 CA/主机名作为信任根，而是固定校验邀请码中携带的临时证书
+		// SHA-256 指纹。InsecureSkipVerify 这里只是关闭默认 PKI 校验，下面的
+		// VerifyPeerCertificate 仍会对远端证书做严格 pinning。
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{quicALPN},
