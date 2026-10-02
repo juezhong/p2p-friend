@@ -136,12 +136,13 @@ func runHost(in *bufio.Reader, cwd string) error {
 	}
 
 	consolePrintln("识别码交换完成，正在建立 P2P 连接...")
+	token := append([]byte(nil), peer.token...)
 	conn, err := peer.acceptQUIC()
 	if err != nil {
 		return err
 	}
 	peer = nil // rtcConn owns peer resources from here.
-	if err := authenticateListener(conn, conn.(*rtcConn).peer.token, roleHost); err != nil {
+	if err := authenticateListener(conn, token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
 	}
