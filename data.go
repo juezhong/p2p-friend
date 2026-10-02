@@ -67,6 +67,18 @@ func transferTuningLevels(maxLanes int) []transferTuningProfile {
 
 func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner {
 	levels := transferTuningLevels(maxLanes)
+	if goos == "windows" {
+		// 高档位仅保留极轻的 burst pacing，目标是避免 Winsock 短时队列峰值，
+		// 而不是限速。真正的链路拥塞仍完全交给 QUIC congestion control。
+		for i := range levels {
+			switch levels[i].lanes {
+			case 3:
+				levels[i].pace = 50 * time.Microsecond
+			case 4:
+				levels[i].pace = 100 * time.Microsecond
+			}
+		}
+	}
 	initial := len(levels) - 1
 	// Windows 从 2 lane / 128 KiB 起步，避免一次把 Winsock 队列压满；
 	// Linux/macOS 从 3 lane 左右起步。之后都按实际吞吐探测到最高档。
