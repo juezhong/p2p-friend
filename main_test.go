@@ -892,6 +892,49 @@ func TestQUICApplicationCodeZeroIsExpectedClose(t *testing.T) {
 	}
 }
 
+func TestRemoteQUICCloseShowsPeerExitNotice(t *testing.T) {
+	var out bytes.Buffer
+	restore := setConsoleWriter(&out)
+	defer restore()
+
+	s := &peerSession{}
+	s.handleReadError(&quic.ApplicationError{
+		ErrorCode:    0,
+		ErrorMessage: "normal shutdown",
+		Remote:       true,
+	})
+
+	if !s.remoteBye.Load() {
+		t.Fatal("remote graceful close did not mark remoteBye")
+	}
+	if !s.closing.Load() {
+		t.Fatal("remote graceful close did not mark session closing")
+	}
+	if got := out.String(); !strings.Contains(got, "对方已正常结束会话") {
+		t.Fatalf("missing peer graceful close notice: %q", got)
+	}
+}
+
+func TestLocalQUICCloseDoesNotClaimPeerExit(t *testing.T) {
+	var out bytes.Buffer
+	restore := setConsoleWriter(&out)
+	defer restore()
+
+	s := &peerSession{}
+	s.handleReadError(&quic.ApplicationError{
+		ErrorCode:    0,
+		ErrorMessage: "normal shutdown",
+		Remote:       false,
+	})
+
+	if s.remoteBye.Load() {
+		t.Fatal("local graceful close was misclassified as remote exit")
+	}
+	if strings.Contains(out.String(), "对方已正常结束会话") {
+		t.Fatalf("local close printed peer exit notice: %q", out.String())
+	}
+}
+
 func TestShutdownRemovesPartialReceive(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
