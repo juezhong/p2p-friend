@@ -276,15 +276,18 @@ func candidateRank(c signalCandidate) int {
 	if ip.To4() == nil && !ip.IsPrivate() {
 		return 0
 	}
-	switch strings.ToLower(c.Type) {
-	case "portmap":
+	if strings.EqualFold(c.Type, "portmap") {
 		return 1
-	case "prflx":
-		return 2
-	case "srflx":
-		return 3
 	}
-	if ip.To4() != nil && !ip.IsPrivate() {
+	// 同一个公网 endpoint 同时以 host/srflx 出现时，host 代表无需 NAT 映射的
+	// 直接可达地址，应优先于反射/运行时发现候选。
+	if ip.To4() != nil && !ip.IsPrivate() && strings.EqualFold(c.Type, "host") {
+		return 2
+	}
+	switch strings.ToLower(c.Type) {
+	case "prflx":
+		return 3
+	case "srflx":
 		return 4
 	}
 	if ip.To4() == nil {
