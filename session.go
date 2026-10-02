@@ -37,8 +37,8 @@ func (s *peerSession) readLoop() {
 	for {
 		f, err := readFrame(s.br)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !isClosedErr(err) {
-				consolePrintf("[连接] 读取失败: %v\n", err)
+			if !errors.Is(err, io.EOF) {
+				s.reportTransportError("连接", err)
 			}
 			return
 		}

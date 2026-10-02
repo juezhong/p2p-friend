@@ -18,10 +18,10 @@ import (
 
 func TestSignalCodeRoundTrip(t *testing.T) {
 	in := signalCode{
-		Version: signalVersion,
-		Kind: "offer",
-		Token: "abc",
-		Candidates: []string{"[2001:db8::1]:5000", "203.0.113.1:40000"},
+		Version:     signalVersion,
+		Kind:        "offer",
+		Token:       "abc",
+		Candidates:  []string{"[2001:db8::1]:5000", "203.0.113.1:40000"},
 		Fingerprint: strings.Repeat("ab", 32),
 	}
 	s, err := encodeSignal(in)
@@ -498,6 +498,38 @@ func TestSessionAuthenticationTokenAndRoles(t *testing.T) {
 	}
 }
 
+func TestTransferTuningProfiles(t *testing.T) {
+	win := transferTuning("windows")
+	if win.chunkSize != 64*1024 || win.lanes != 2 || win.pace <= 0 {
+		t.Fatalf("unexpected Windows tuning: %#v", win)
+	}
+	linux := transferTuning("linux")
+	if linux.chunkSize != maxDataChunkSize || linux.lanes != parallelLanes || linux.pace != 0 {
+		t.Fatalf("unexpected Linux tuning: %#v", linux)
+	}
+}
+
+func TestLineEditorRedrawAvoidsCursorSaveRestore(t *testing.T) {
+	var out bytes.Buffer
+	e := &lineEditor{
+		out:    &out,
+		active: true,
+		prompt: "p2p[JOIN remote:/tmp]> ",
+		line:   []rune("get 中文"),
+		cursor: len([]rune("get 中")),
+		status: "[GET] 50%",
+	}
+	e.mu.Lock()
+	e.redrawLocked()
+	e.mu.Unlock()
+	got := out.String()
+	if strings.Contains(got, "\x1b[s") || strings.Contains(got, "\x1b[u") {
+		t.Fatalf("redraw still uses cursor save/restore: %q", got)
+	}
+	if !strings.Contains(got, e.prompt+"get 中文") || !strings.Contains(got, "[GET] 50%") {
+		t.Fatalf("redraw missing prompt/input/status: %q", got)
+	}
+}
 
 func ipv4EndpointAddr(t *testing.T, p *rtcPeer) string {
 	t.Helper()

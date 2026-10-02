@@ -210,25 +210,28 @@ func (e *lineEditor) Write(p []byte) (int, error) {
 }
 
 func (e *lineEditor) clearInteractiveLocked() {
-	// 清掉输入行和它下面的进度状态行，再从输入行起点输出异步消息。
-	fmt.Fprint(e.out, "\r\x1b[2K\x1b[E\x1b[2K\x1b[F")
+	// 光标始终停在输入行。显式清除输入行和下一行状态，避免依赖
+	// Windows Console 对 ESC[s / ESC[u 保存恢复光标序列的兼容性。
+	fmt.Fprint(e.out, "\r\x1b[2K\x1b[1E\x1b[2K\x1b[1F")
 }
 
 func (e *lineEditor) redrawLocked() {
+	// 先完整画输入行。
 	fmt.Fprint(e.out, "\r\x1b[2K", e.prompt, string(e.line))
-	if e.cursor < len(e.line) {
-		w := displayWidthRunes(e.line[e.cursor:])
-		if w > 0 {
-			fmt.Fprintf(e.out, "\x1b[%dD", w)
-		}
-	}
 
-	// 状态行放在提示符下一行，然后恢复光标到原输入位置。
-	fmt.Fprint(e.out, "\x1b[s\x1b[E\x1b[2K")
+	// 再画下一行状态。不要用 ESC[s / ESC[u：部分 Windows Terminal /
+	// conhost 组合会把光标留在空白状态行，看起来像“没有提示符”。
+	fmt.Fprint(e.out, "\x1b[1E\x1b[2K")
 	if e.status != "" {
 		fmt.Fprint(e.out, e.status)
 	}
-	fmt.Fprint(e.out, "\x1b[u")
+
+	// 回到输入行，并按显示宽度恢复到逻辑光标位置。
+	fmt.Fprint(e.out, "\x1b[1F")
+	col := displayWidthRunes([]rune(e.prompt)) + displayWidthRunes(e.line[:e.cursor])
+	if col > 0 {
+		fmt.Fprintf(e.out, "\x1b[%dC", col)
+	}
 }
 
 func (e *lineEditor) handleEscapeSequence() {

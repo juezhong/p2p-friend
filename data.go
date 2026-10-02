@@ -5,16 +5,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
-	frameEntryReady = byte(11)
-	dataHeaderSize  = 20
-	dataChunkSize   = 256 * 1024
-	parallelLanes   = 4
+	frameEntryReady  = byte(11)
+	dataHeaderSize   = 20
+	maxDataChunkSize = 256 * 1024
+	parallelLanes    = 4
 )
+
+type transferTuningProfile struct {
+	chunkSize int
+	lanes     int
+	pace      time.Duration
+}
+
+func transferTuning(goos string) transferTuningProfile {
+	if goos == "windows" {
+		// Winsock can return WSAENOBUFS when several QUIC streams enqueue
+		// large writes faster than the UDP send queue can drain. Keep the
+		// protocol at four lanes, but use two active writers and smaller
+		// application chunks on Windows. This still allows QUIC to packetize
+		// and pace efficiently while avoiding large bursts into Winsock.
+		return transferTuningProfile{chunkSize: 64 * 1024, lanes: 2, pace: 200 * time.Microsecond}
+	}
+	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: parallelLanes}
+}
+
+func currentTransferTuning() transferTuningProfile { return transferTuning(runtime.GOOS) }
 
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
@@ -120,7 +142,7 @@ func (s *peerSession) writeDataChunkOnLane(idx int, id uint64, offset int64, pay
 	if st == nil || idx < 0 || idx >= len(st.lanes) {
 		return fmt.Errorf("invalid data lane: %d", idx)
 	}
-	if len(payload) > dataChunkSize {
+	if len(payload) > maxDataChunkSize {
 		return fmt.Errorf("data chunk too large: %d", len(payload))
 	}
 	buf := make([]byte, dataHeaderSize+len(payload))
@@ -142,23 +164,21 @@ func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
 	header := make([]byte, dataHeaderSize)
 	for {
 		if _, err := io.ReadFull(lane, header); err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isClosedErr(err) {
-				consolePrintf("[数据流] 读取帧头失败: %v\n", err)
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				s.reportTransportError("数据流", err)
 			}
 			return
 		}
 		id := binary.BigEndian.Uint64(header[0:8])
 		offset := int64(binary.BigEndian.Uint64(header[8:16]))
 		want := int(binary.BigEndian.Uint32(header[16:20]))
-		if want > dataChunkSize {
+		if want > maxDataChunkSize {
 			consolePrintf("[数据流] 无效数据长度: %d\n", want)
 			return
 		}
 		data := make([]byte, want)
 		if _, err := io.ReadFull(lane, data); err != nil {
-			if !isClosedErr(err) {
-				consolePrintf("[数据流] 读取 payload 失败: %v\n", err)
-			}
+			s.reportTransportError("数据流", err)
 			return
 		}
 		if err := s.handleTransferDataAt(id, offset, data); err != nil {

@@ -55,7 +55,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	ot := &outboundTransfer{
 		id: id, ctx: ctx, cancel: cancel,
 		result: make(chan transferResult, 1),
-		done: make(chan error, 1),
+		done:   make(chan error, 1),
 	}
 	setOutboundReady(ot)
 	s.transferMu.Lock()
@@ -165,9 +165,10 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 	}
 	defer f.Close()
 
+	tuning := currentTransferTuning()
 	ds := dataState(s)
 	if ds == nil || len(ds.lanes) == 0 {
-		buf := make([]byte, dataChunkSize)
+		buf := make([]byte, tuning.chunkSize)
 		for off := int64(0); off < size; {
 			select {
 			case <-ctx.Done():
@@ -188,6 +189,9 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 			if err := s.writeDataChunk(id, off, buf[:n]); err != nil {
 				return err
 			}
+			if tuning.pace > 0 {
+				time.Sleep(tuning.pace)
+			}
 			off += int64(n)
 			p.Done += int64(n)
 			p.CurrentDone += int64(n)
@@ -196,18 +200,29 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		return nil
 	}
 
+	activeLanes := tuning.lanes
+	if activeLanes > len(ds.lanes) {
+		activeLanes = len(ds.lanes)
+	}
+	if activeLanes < 1 {
+		activeLanes = 1
+	}
+
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	jobs := make(chan int64, len(ds.lanes)*2)
+	// Keep at most one queued chunk per active writer. QUIC already has its own
+	// congestion / flow-control queues; a large application queue just creates
+	// bursts and is especially harmful to Winsock UDP send queues.
+	jobs := make(chan int64, activeLanes)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
 	var progressMu sync.Mutex
-	for lane := range ds.lanes {
+	for lane := 0; lane < activeLanes; lane++ {
 		lane := lane
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			buf := make([]byte, dataChunkSize)
+			buf := make([]byte, tuning.chunkSize)
 			for {
 				select {
 				case <-workerCtx.Done():
@@ -222,19 +237,31 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					}
 					n, rerr := f.ReadAt(buf[:nwant], off)
 					if rerr != nil && !errors.Is(rerr, io.EOF) {
-						select { case errCh <- rerr: default: }
+						select {
+						case errCh <- rerr:
+						default:
+						}
 						cancel()
 						return
 					}
 					if n == 0 {
-						select { case errCh <- io.ErrUnexpectedEOF: default: }
+						select {
+						case errCh <- io.ErrUnexpectedEOF:
+						default:
+						}
 						cancel()
 						return
 					}
 					if werr := s.writeDataChunkOnLane(lane, id, off, buf[:n]); werr != nil {
-						select { case errCh <- werr: default: }
+						select {
+						case errCh <- werr:
+						default:
+						}
 						cancel()
 						return
+					}
+					if tuning.pace > 0 {
+						time.Sleep(tuning.pace)
 					}
 					progressMu.Lock()
 					p.Done += int64(n)
@@ -247,7 +274,7 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 	}
 
 produce:
-	for off := int64(0); off < size; off += dataChunkSize {
+	for off := int64(0); off < size; off += int64(tuning.chunkSize) {
 		select {
 		case <-workerCtx.Done():
 			break produce
