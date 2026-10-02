@@ -3,6 +3,9 @@ module github.com/juezhong/p2p-friend
 go 1.23
 
 require (
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/gateway v1.1.1
+	github.com/jackpal/go-nat-pmp v1.1.0
 	github.com/pion/stun/v3 v3.0.0
 	github.com/quic-go/quic-go v0.53.0
 )
