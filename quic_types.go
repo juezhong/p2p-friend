@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	signalVersion     = 10
-	signalCreatePrefix = "P2PF-CREATE-"
-	signalJoinPrefix   = "P2PF-JOIN-"
-	quicALPN           = "p2p-friend/10"
-	punchMagic         = "P2PF10PUNCH"
+	signalVersion      = 11
+	signalInvitePrefix = "P2PF-INVITE-"
+	signalReplyPrefix  = "P2PF-REPLY-"
+	quicALPN           = "p2p-friend/11"
+	punchMagic         = "P2PF11PUNCH"
 )
 
 type signalCandidate struct {
