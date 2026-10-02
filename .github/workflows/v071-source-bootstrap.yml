@@ -1,0 +1,23 @@
+name: v0.7.1 Source Bootstrap
+
+on:
+  push:
+    branches:
+      - fix/v0.7.1-windows-quic-stability
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pack source
+        run: tar --exclude=.git -czf /tmp/p2p-friend-source.tar.gz .
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-friend-v0.7.1-source
+          path: /tmp/p2p-friend-source.tar.gz
+          retention-days: 1
