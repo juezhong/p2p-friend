@@ -143,7 +143,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 	if err != nil {
 		return err
 	}
-	peer = nil // rtcConn owns peer resources from here.
+	peer = nil // 从这里开始由 rtcConn 接管 peer 及底层 UDP/QUIC 资源。
 	if err := authenticateListener(conn, token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
