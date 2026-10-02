@@ -62,9 +62,12 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		if ep.family == 6 {
 			family = "IPv6"
 		}
-		mode := "主动连接 + 打洞"
+		mode := "主动连接"
 		if ep.listener != nil {
-			mode = "监听 + 打洞"
+			mode = "监听"
+		}
+		if ep.family == 4 {
+			mode += " + NAT 打洞"
 		}
 		isSelected := false
 		if selected != nil {
