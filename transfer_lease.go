@@ -15,6 +15,14 @@ type transferLeaseState struct {
 	Since time.Time
 }
 
+type transferLeaseBusyError struct {
+	Lease transferLeaseState
+}
+
+func (e *transferLeaseBusyError) Error() string {
+	return formatTransferLeaseBusy(e.Lease, false)
+}
+
 func (s *peerSession) acquireTransferLease(kind, path string) (uint64, error) {
 	kind = strings.ToUpper(strings.TrimSpace(kind))
 	id := s.nextRequestID()
@@ -52,8 +60,7 @@ func (s *peerSession) tryAcquireTransferLease(id uint64, owner, kind, path strin
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if s.lease.ID != 0 {
-		return fmt.Errorf("当前已有传输任务：%s %s（%s）",
-			s.lease.Kind, displayLeasePath(s.lease.Path), displayLeaseOwner(s.lease.Owner))
+		return &transferLeaseBusyError{Lease: s.lease}
 	}
 	s.lease = transferLeaseState{
 		ID: id, Owner: owner, Kind: strings.ToUpper(kind), Path: path, Since: time.Now(),
@@ -123,6 +130,11 @@ func (s *peerSession) handleTransferAcquire(req rpcRequest) rpcResponse {
 		return rpcResponse{OK: false, Error: "无效的传输租约"}
 	}
 	if err := s.tryAcquireTransferLease(req.LeaseID, "remote", req.TransferKind, req.Path); err != nil {
+		var busy *transferLeaseBusyError
+		if errors.As(err, &busy) {
+			// 该错误要展示给 RPC 请求方，因此把仲裁端的 local/remote 视角翻转。
+			return rpcResponse{OK: false, Error: formatTransferLeaseBusy(busy.Lease, true)}
+		}
 		return rpcResponse{OK: false, Error: err.Error()}
 	}
 	return rpcResponse{OK: true}
@@ -134,6 +146,26 @@ func (s *peerSession) handleTransferRelease(req rpcRequest) rpcResponse {
 	}
 	s.releaseCoordinatorLease(req.LeaseID)
 	return rpcResponse{OK: true}
+}
+
+func formatTransferLeaseBusy(lease transferLeaseState, remoteView bool) string {
+	owner := lease.Owner
+	if remoteView {
+		owner = invertLeaseOwner(owner)
+	}
+	return fmt.Sprintf("当前已有传输任务：%s %s（%s）",
+		lease.Kind, displayLeasePath(lease.Path), displayLeaseOwner(owner))
+}
+
+func invertLeaseOwner(owner string) string {
+	switch owner {
+	case "local":
+		return "remote"
+	case "remote":
+		return "local"
+	default:
+		return owner
+	}
 }
 
 func displayLeaseOwner(owner string) string {
