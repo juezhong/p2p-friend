@@ -55,7 +55,7 @@ func printHelp() {
   quit / exit           断开并退出
 
 说明：
-  * 邀请码使用 P2PF-INVITE-...；只有需要双向 NAT 打洞时才会出现 P2PF-REPLY-... 回传码。
+  * 邀请码使用 P2PF-INVITE-...；只有需要双向 NAT 打洞时才会出现 P2PF-REPLY-... 回传码；收到它的人就是创建方。
   * IPv6/公网 IPv4 等可直连场景只需交换一次邀请码。
   * 双方都在较严格 IPv4 NAT 后时，无信令服务器模式仍需要回传码返回加入方的公网 UDP candidate。
   * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。
@@ -135,7 +135,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 	consolePrintln("")
 	consolePrintln("程序会先尝试只用这个邀请码直接连接；IPv6 / 公网 IPv4 等场景无需第二个码。")
 	consolePrintln("如果加入方提示需要双向 NAT 打洞，它会生成 P2PF-REPLY 回传码，再粘贴到这里。")
-	consolePrintf("P2PF-REPLY 回传码（仅 NAT 打洞需要）: ")
+	consolePrintf("P2PF-REPLY P2PF-REPLY 回传码（仅 NAT 打洞需要）: ")
 
 	for {
 		select {
@@ -164,12 +164,12 @@ func runHost(in *bufio.Reader, cwd string) error {
 			return err
 		}
 		if strings.TrimSpace(joinCode) == "" {
-			consolePrintf("回传码（仅 NAT 打洞需要）: ")
+			consolePrintf("P2PF-REPLY 回传码（仅 NAT 打洞需要）: ")
 			continue
 		}
 		if err := peer.applyConfirmation(joinCode); err != nil {
 			consolePrintf("P2PF-REPLY 回传码无效: %v\n", err)
-			consolePrintf("回传码（仅 NAT 打洞需要）: ")
+			consolePrintf("P2PF-REPLY 回传码（仅 NAT 打洞需要）: ")
 			continue
 		}
 		consolePrintln("[连接] 已接收 P2PF-REPLY 回传码，继续等待 P2P 建连。")
