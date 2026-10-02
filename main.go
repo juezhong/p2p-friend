@@ -41,7 +41,7 @@ func printHelp() {
   1. 创建连接：生成 P2PF-INVITE 邀请码
   2. 加入连接：输入 P2PF-INVITE 邀请码
 
-程序会在同一 UDP socket 上自动尝试 IPv6 / IPv4 直连和 IPv4 NAT 打洞，
+程序会在同一 UDP socket 上自动尝试 IPv6 直连/防火墙探测、IPv4 直连和 IPv4 NAT 打洞，
 使用 QUIC 提供加密、可靠重传、拥塞控制和多 stream 传输。
 
 连接后采用类似 SFTP 的命令：
@@ -56,9 +56,9 @@ func printHelp() {
 说明：
   * 连接流程固定交换两类短识别码：P2PF-INVITE-... 邀请码和 P2PF-REPLY-... 回传码。
   * 两个识别码都交换完成后才开始真实 QUIC 建连，不再使用“先试几秒再决定是否需要回传码”的启发式流程。
-  * 双方拿齐 candidate 后优先 IPv6 直连；IPv6 不可达时自动回退 IPv4 / NAT 打洞。
+  * 双方拿齐 candidate 后优先 IPv6；双方都会主动发送 IPv6 UDP 探测以打开有状态防火墙，仍不可达时自动回退 IPv4 / NAT 打洞。
   * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。
-  * IPv6 选中后不执行 NAT 打洞；STUN 只用于预先准备 IPv4 失败回退候选。
+  * IPv6 不做 NAT 映射，只做双向 UDP 防火墙探测；STUN 只用于预先准备 IPv4 失败回退候选。
   * 不使用 TURN/relay；最终连接失败时会提示交换创建/加入角色重试。
 `, appVersion)
 }
@@ -121,7 +121,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 	consolePrintln(code)
 	consolePrintln("")
 	consolePrintln("对方会立即返回一个 P2PF-REPLY 回传码。")
-	consolePrintln("双方交换完两个识别码后，程序才开始选择 IPv6 直连或 IPv4 NAT 打洞路径。")
+	consolePrintln("双方交换完两个识别码后，程序才开始选择 IPv6 直连/防火墙探测或 IPv4 NAT 打洞路径。")
 	consolePrintf("P2PF-REPLY 回传码: ")
 
 	replyCode, err := readSignalLine(in)
