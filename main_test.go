@@ -708,3 +708,39 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 		t.Fatalf("QUIC hash mismatch sender=%x receiver=%x", wantHash, gotHash)
 	}
 }
+
+func TestLineEditorInitialPromptUsesSingleRow(t *testing.T) {
+	var out bytes.Buffer
+	e := &lineEditor{
+		out:    &out,
+		active: true,
+		prompt: "p2p[IPv4-NAT-PUNCH remote:/tmp]> ",
+		line:   nil,
+		cursor: 0,
+		status: "",
+	}
+	e.mu.Lock()
+	e.redrawLocked()
+	e.mu.Unlock()
+	got := out.String()
+	if !strings.Contains(got, e.prompt) {
+		t.Fatalf("initial redraw missing prompt: %q", got)
+	}
+	if strings.Contains(got, "\x1b[1E") || strings.Contains(got, "\x1b[1F") {
+		t.Fatalf("initial redraw still touches a second row: %q", got)
+	}
+}
+
+func TestInitPeerSessionStoresLinkMode(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	s := initPeerSession(left, "test", t.TempDir())
+	defer s.close(false)
+	if s.linkMode == "" {
+		t.Fatal("session link mode is empty")
+	}
+	if prompt := shellPrompt(s); !strings.Contains(prompt, s.linkMode) {
+		t.Fatalf("prompt %q does not contain link mode %q", prompt, s.linkMode)
+	}
+}

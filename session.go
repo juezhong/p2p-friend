@@ -27,6 +27,7 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		localCwd:   cwd,
 		serveCwd:   cwd,
 		roleName:   roleName,
+		linkMode:   connectionMode(conn),
 	}
 	attachDataLanes(s, conn)
 	return s
@@ -408,6 +409,7 @@ func (s *peerSession) status() {
 	}
 	consolePrintf("远端目录: %s\n", remote)
 	consolePrintf("本机接收覆盖: %s\n", onOff(s.getOverwrite()))
+	consolePrintf("链路: %s\n", s.linkMode)
 	consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
 	consolePrintf("活动传输 ID: %v\n", s.debugActiveTransfers())
 }

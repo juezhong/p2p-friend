@@ -78,8 +78,6 @@ func runInteractive() error {
 	consolePrintln("2) 加入连接（输入连接码）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
-	consolePrintln("网络：同一 UDP socket 自动尝试 IPv6 直连与 IPv4 STUN/NAT 打洞，传输使用 QUIC；不使用 TURN/relay。")
-	consolePrintln("")
 
 	for {
 		consolePrintf("请选择 [1/2/3]: ")
