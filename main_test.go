@@ -1043,3 +1043,73 @@ func TestQUICCanConnectWithCreateCodeOnly(t *testing.T) {
 	_ = hc.Close()
 	_ = jc.Close()
 }
+
+func TestDeterministicInviteReplyHandshake(t *testing.T) {
+	host, invite, err := createConnectionCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	join, reply, token, err := createJoinConfirmation(invite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	if !strings.HasPrefix(invite, signalInvitePrefix) {
+		t.Fatalf("invite prefix=%q", invite)
+	}
+	if !strings.HasPrefix(reply, signalReplyPrefix) {
+		t.Fatalf("reply prefix=%q", reply)
+	}
+	if err := host.applyConfirmation(reply); err != nil {
+		t.Fatalf("apply reply: %v", err)
+	}
+
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	hostCh := make(chan result, 1)
+	joinCh := make(chan result, 1)
+	go func() {
+		conn, err := host.acceptQUIC()
+		hostCh <- result{conn: conn, err: err}
+	}()
+	go func() {
+		conn, err := join.waitConn()
+		joinCh <- result{conn: conn, err: err}
+	}()
+
+	var hc, jc net.Conn
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatalf("creator accept failed: %v", r.err)
+		}
+		hc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("creator accept timed out")
+	}
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatalf("join dial failed: %v", r.err)
+		}
+		jc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("join dial timed out")
+	}
+	defer hc.Close()
+	defer jc.Close()
+
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- authenticateListener(hc, token, roleHost) }()
+	if err := authenticateDialer(jc, token, roleJoin); err != nil {
+		t.Fatalf("join auth failed: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("creator auth failed: %v", err)
+	}
+}
