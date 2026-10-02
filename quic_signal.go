@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,8 +30,8 @@ func newPeer(server bool) (*rtcPeer, error) {
 			return nil, err
 		}
 		p.cert = cert
-		sum := sha256Sum(der)
-		p.fingerprint = sum
+		sum := sha256.Sum256(der)
+		p.fingerprint = append([]byte(nil), sum[:]...)
 	}
 	for _, network := range []string{"udp6", "udp4"} {
 		conn, err := net.ListenUDP(network, &net.UDPAddr{Port: 0})
