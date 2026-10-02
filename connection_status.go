@@ -68,6 +68,8 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		}
 		if ep.family == 4 {
 			mode += " + NAT 打洞"
+		} else {
+			mode += " + 防火墙探测"
 		}
 		isSelected := false
 		if selected != nil {

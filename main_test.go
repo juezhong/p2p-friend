@@ -820,6 +820,45 @@ func TestSessionRejectsSecondConcurrentTransfer(t *testing.T) {
 	}
 }
 
+func TestTransferLeaseBusyShowsRemoteOwnerToCoordinator(t *testing.T) {
+	s := &peerSession{transferCoordinator: true}
+	resp := s.handleTransferAcquire(rpcRequest{
+		LeaseID:      1,
+		TransferKind: "GET",
+		Path:         "siyuan-3.6.4-win.exe",
+	})
+	if !resp.OK {
+		t.Fatalf("remote lease acquire failed: %s", resp.Error)
+	}
+
+	_, err := s.acquireTransferLease("GET", "1GB.bin")
+	if err == nil {
+		t.Fatal("expected busy lease error")
+	}
+	if !strings.Contains(err.Error(), "对端发起") || strings.Contains(err.Error(), "本机发起") {
+		t.Fatalf("wrong coordinator-side owner perspective: %q", err)
+	}
+}
+
+func TestTransferLeaseBusyFlipsOwnerForRemoteRequester(t *testing.T) {
+	s := &peerSession{transferCoordinator: true}
+	if err := s.tryAcquireTransferLease(1, "local", "PUT", "local.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := s.handleTransferAcquire(rpcRequest{
+		LeaseID:      2,
+		TransferKind: "GET",
+		Path:         "remote.bin",
+	})
+	if resp.OK {
+		t.Fatal("expected busy lease response")
+	}
+	if !strings.Contains(resp.Error, "对端发起") || strings.Contains(resp.Error, "本机发起") {
+		t.Fatalf("wrong requester-side owner perspective: %q", resp.Error)
+	}
+}
+
 func TestSilentProgressProducesNoOutput(t *testing.T) {
 	var out bytes.Buffer
 	restore := setConsoleWriter(&out)

@@ -44,9 +44,8 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 				}
 			}
 		}(ln)
-		if ep.family == 4 {
-			go punchLoop(ctx, p, ep.transport, ep.family)
-		}
+		// IPv4 用于 NAT 打洞；IPv6 用同样的双向 UDP 探测打开有状态防火墙。
+		go punchLoop(ctx, p, ep.transport, ep.family)
 	}
 	if started == 0 {
 		return nil, errors.New("无法启动 QUIC UDP listener")
@@ -98,9 +97,8 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	}
 	var targets []target
 	for _, ep := range p.endpoints {
-		if ep.family == 4 {
-			go punchLoop(ctx, p, ep.transport, ep.family)
-		}
+		// IPv4 用于 NAT 打洞；IPv6 用同样的双向 UDP 探测打开有状态防火墙。
+		go punchLoop(ctx, p, ep.transport, ep.family)
 		for _, raw := range p.remoteCandidates() {
 			addr, family, err := parseCandidate(raw)
 			if err != nil || family != ep.family {
