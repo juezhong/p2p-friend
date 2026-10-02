@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// 每个会话只允许一个文件传输任务。创建方/QUIC 监听端作为唯一仲裁端，避免双方
+// 同时执行 put/get 时出现分布式抢占竞态；另一端通过 transfer_acquire RPC 申请。
+// Owner 的 local/remote 永远相对“当前保存该状态的一端”，跨 RPC 展示时需要翻转视角。
 type transferLeaseState struct {
 	ID    uint64
 	Owner string
@@ -101,7 +104,7 @@ func (s *peerSession) releaseTransferLease(id uint64) {
 	if s.transferCoordinator {
 		return
 	}
-	// Best-effort release. If the transport is closing there is nothing left to arbitrate.
+	// 释放是 best-effort：连接正在关闭时即使 RPC 失败，会话销毁也会清空仲裁状态。
 	_, _ = s.callRPCRequest(s.nextRequestID(), rpcRequest{
 		Op:      "transfer_release",
 		LeaseID: id,
