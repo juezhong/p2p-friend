@@ -195,7 +195,7 @@ func connectionTimeoutError() error {
 
 // punchLoop 只负责 UDP 可达性探测，不承载文件数据，也不替代 QUIC 握手。
 // IPv4 侧用于建立/刷新 NAT 映射与过滤状态；IPv6 侧没有 NAT 映射，主要用于
- // 尽量打开 stateful firewall 的返回流量状态。
+// 尽量打开 stateful firewall 的返回流量状态。
 func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
 	payload := append([]byte{0x00}, []byte(punchMagic)...)
 	ticker := time.NewTicker(250 * time.Millisecond)
