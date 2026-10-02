@@ -279,21 +279,47 @@ func parseCandidate(raw signalCandidate) (*net.UDPAddr, int, error) {
 	return addr, family, nil
 }
 
+func signalPrefixForKind(kind string) (string, error) {
+	switch kind {
+	case "connect":
+		return signalCreatePrefix, nil
+	case "confirm":
+		return signalJoinPrefix, nil
+	default:
+		return "", fmt.Errorf("unknown signal kind: %s", kind)
+	}
+}
+
 func encodeSignal(c signalCode) (string, error) {
+	prefix, err := signalPrefixForKind(c.Kind)
+	if err != nil {
+		return "", err
+	}
 	b, err := json.Marshal(c)
 	if err != nil {
 		return "", err
 	}
-	return signalPrefix + base64.RawURLEncoding.EncodeToString(b), nil
+	return prefix + base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func decodeSignal(s, expectedKind string) (signalCode, error) {
 	var c signalCode
 	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, signalPrefix) {
-		return c, fmt.Errorf("连接码格式错误：需要 %s...", signalPrefix)
+	expectedPrefix, err := signalPrefixForKind(expectedKind)
+	if err != nil {
+		return c, err
 	}
-	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, signalPrefix))
+	if !strings.HasPrefix(s, expectedPrefix) {
+		switch {
+		case strings.HasPrefix(s, signalCreatePrefix) && expectedKind == "confirm":
+			return c, errors.New("这是 P2PF-CREATE 创建码；当前需要加入方返回的 P2PF-JOIN 加入码")
+		case strings.HasPrefix(s, signalJoinPrefix) && expectedKind == "connect":
+			return c, errors.New("这是 P2PF-JOIN 加入码；它应粘贴给创建方。加入连接需要 P2PF-CREATE 创建码")
+		default:
+			return c, fmt.Errorf("识别码格式错误：当前需要 %s...", expectedPrefix)
+		}
+	}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, expectedPrefix))
 	if err != nil {
 		return c, err
 	}
@@ -301,7 +327,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		return c, err
 	}
 	if c.Version != signalVersion || c.Kind != expectedKind || len(c.Candidates) == 0 {
-		return c, errors.New("连接码协议版本或类型不匹配")
+		return c, errors.New("识别码协议版本或类型不匹配")
 	}
 	return c, nil
 }

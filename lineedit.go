@@ -17,6 +17,7 @@ import (
 )
 
 var errLineInterrupt = errors.New("line input interrupted")
+var errSessionClosed = errors.New("session closed")
 
 var shellCommands = []string{
 	"pwd", "ls", "cd",
@@ -66,6 +67,21 @@ func newLineEditor(s *peerSession, r *bufio.Reader) *lineEditor {
 	return &lineEditor{s: s, reader: r, out: os.Stdout}
 }
 
+func (e *lineEditor) nextRune() (rune, int, error) {
+	for {
+		if e.s != nil {
+			select {
+			case <-e.s.closed:
+				return 0, 0, errSessionClosed
+			default:
+			}
+		}
+		if e.reader.Buffered() > 0 || consoleInputReady(100*time.Millisecond) {
+			return readTerminalRune(e.reader)
+		}
+	}
+}
+
 func (e *lineEditor) ReadLine(prompt string) (string, error) {
 	state, err := enterTerminalRaw()
 	if err != nil {
@@ -94,7 +110,7 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 	}()
 
 	for {
-		r, _, err := readTerminalRune(e.reader)
+		r, _, err := e.nextRune()
 		if err != nil {
 			return "", err
 		}
@@ -240,11 +256,11 @@ func (e *lineEditor) redrawLocked() {
 }
 
 func (e *lineEditor) handleEscapeSequence() {
-	r2, _, err := readTerminalRune(e.reader)
+	r2, _, err := e.nextRune()
 	if err != nil || r2 != '[' {
 		return
 	}
-	r3, _, err := readTerminalRune(e.reader)
+	r3, _, err := e.nextRune()
 	if err != nil {
 		return
 	}
@@ -268,7 +284,7 @@ func (e *lineEditor) handleEscapeSequence() {
 	case 'B':
 		e.historyMoveLocked(1)
 	case '3':
-		r4, _, _ := readTerminalRune(e.reader)
+		r4, _, _ := e.nextRune()
 		if r4 == '~' && e.cursor < len(e.line) {
 			e.line = append(e.line[:e.cursor], e.line[e.cursor+1:]...)
 		}

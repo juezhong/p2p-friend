@@ -11,6 +11,7 @@
 - macOS amd64 / arm64
 - IPv6 UDP 直连
 - IPv4 UDP 直连 / LAN / STUN 辅助 NAT 打洞
+- IPv6 选中后不执行 NAT punching；STUN 映射只作为 IPv4 fallback 候选预先探测
 - QUIC TLS 1.3、可靠重传、拥塞控制和多 stream
 - 1 条 control stream + 4 条 data stream
 - 自适应 data lane / chunk / pacing
@@ -24,30 +25,40 @@
 - `Ctrl-C` 只取消当前传输，不退出会话
 - `status` 显示实际 QUIC / UDP 链路、端口、候选和传输状态
 
-当前协议版本使用统一的 `P2PF-...` 连接码前缀。版本与信令类型存放在连接码内部。
+当前协议使用可辨识的两类识别码：`P2PF-CREATE-...` 表示创建方生成的创建码；`P2PF-JOIN-...` 表示加入方在需要双向 NAT 打洞时返回的加入码。
 
 ## 建立连接
 
 启动后选择：
 
 ```text
-1) 发起连接（生成连接码）
-2) 加入连接（输入连接码）
+1) 创建连接（生成 P2PF-CREATE 创建码）
+2) 加入连接（输入 P2PF-CREATE 创建码）
 3) 退出
 ```
 
-发起连接的一方生成 `P2PF-...` 连接码后立即开始监听真实 QUIC 握手，不会等确认码粘贴后才启动网络监听。
+创建方生成 `P2PF-CREATE-...` 创建码后立即监听真实 QUIC 握手。加入方粘贴创建码后会先尝试直接连接。
 
-加入连接的一方输入连接码后生成另一个 `P2PF-...` 确认码，将确认码发回即可。
-
-纯手工、无信令服务器模式下，IPv4 NAT 打洞需要双方交换各自启动 UDP socket 后才能得到的 candidate，因此通用 NAT 场景仍需要两次人工交换：
+如果 IPv6、公开 IPv4，或当前 NAT 允许加入方向创建方直接建立 QUIC，则只需要交换一次创建码：
 
 ```text
-发起端 -> 连接码 -> 加入端
-发起端 <- 确认码 <- 加入端
+创建方 -> P2PF-CREATE -> 加入方
+                    -> QUIC connected
 ```
 
-连接过程中的 candidate 重试保持静默。只有最终超时才提示交换“发起连接 / 加入连接”角色重试。
+如果数秒内仍无法直接建立连接，加入方才会显示 `P2PF-JOIN-...` 加入码。这个码包含加入方启动 UDP socket 后获得的 candidate，用于双方都在较严格 IPv4 NAT 后时完成双向 UDP hole punching：
+
+```text
+创建方 -> P2PF-CREATE -> 加入方
+创建方 <- P2PF-JOIN   <- 加入方
+              -> IPv4 NAT punching -> QUIC
+```
+
+因此 v0.10 是“一次优先、两次兜底”，而不是所有网络都强制交换两次。若要在所有双 NAT 场景中都只复制一次，就必须引入一个外部 rendezvous/signaling 服务来自动交换第二端 candidate；当前项目仍保持无信令服务器设计。
+
+识别码前缀也直接表示来源角色：收到 `P2PF-CREATE-...` 时应选择“加入连接”；收到 `P2PF-JOIN-...` 时说明自己应是创建方并将其粘贴到创建端。
+
+连接过程中的 candidate retry 保持静默。只有最终超时才提示交换“创建连接 / 加入连接”角色重试。
 
 ## 链路类型
 
@@ -83,13 +94,16 @@ file
 receiver -> WriteAt(offset) -> .part
 ```
 
-发送器根据实际 QUIC `Write` 背压动态调节：
+发送器使用吞吐量窗口做自适应，而不是用某一次 `Write` 花了多少毫秒来判断“网络拥塞”：
 
 - 1~4 条 active data lane
-- 32~256 KiB application chunk
-- 0~2 ms pacing
+- 64~256 KiB application chunk
+- Linux / macOS 正常档位不额外 pacing
+- Windows 高并发档位只保留极轻的 burst pacing，用来降低 Winsock send queue 峰值
 
-这些调节是静默的，不会在正常传输过程中不断插入日志。持续顺畅时自动升档，出现明显阻塞时自动降档。
+算法会周期性探测更高并发档位，并比较实际 bytes/sec。吞吐没有明显恶化就保留高档；探测导致吞吐下降时回退并进入短暂冷却。真正的丢包、RTT、拥塞窗口与公平性仍交给 QUIC congestion control。
+
+这种测量会自然包含远端处理能力：接收端磁盘写入或 CPU 较慢时，QUIC stream / flow-control 会形成 backpressure，发送端最终看到的有效吞吐也会下降。因此它不是只按本机 CPU 调节，也不会再因为“慢链路单批写入超过 80/200 ms”而错误地降到 1 lane。
 
 ### 单传输模式
 
@@ -131,13 +145,14 @@ status
 
 会显示包括：
 
+- 本机连接角色（创建方 / 加入方）
 - 实际链路类型
 - QUIC / UDP / TLS 1.3 传输栈
 - 本机当前选中的 UDP socket
 - 对端当前 UDP endpoint
 - QUIC 是监听端还是主动连接端
 - IPv4 / IPv6 UDP socket 与监听 / 打洞状态
-- 本机 STUN 映射
+- 本机 STUN 映射（IPv6 链路时明确标为 IPv4 备用）
 - 对端 candidate 类型
 - control / data stream 数量
 - 当前是否存在文件传输任务

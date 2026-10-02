@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -38,8 +39,8 @@ func printHelp() {
 	fmt.Printf(`p2p-friend v%s - P2P 文件/目录传输
 
 启动后选择：
-  1. 发起连接：生成连接码
-  2. 加入连接：输入连接码，并把确认码发回发起方
+  1. 创建连接：生成 P2PF-CREATE 创建码
+  2. 加入连接：输入 P2PF-CREATE 创建码
 
 程序会在同一 UDP socket 上自动尝试 IPv6 / IPv4 直连和 IPv4 NAT 打洞，
 使用 QUIC 提供加密、可靠重传、拥塞控制和多 stream 传输。
@@ -54,10 +55,12 @@ func printHelp() {
   quit / exit           断开并退出
 
 说明：
-  * 连接码和确认码统一使用 P2PF-... 前缀，协议版本和类型在码内部。
-  * 发起方生成连接码后立即开始等待 QUIC 连接，不会等确认码粘贴后才监听。
-  * IPv4 NAT 场景仍需要确认码把加入方的 STUN/NAT candidate 返回给发起方。
-  * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。\n  * 不使用 TURN/relay；最终连接失败时会提示交换发起/加入角色重试。
+  * 创建码使用 P2PF-CREATE-...；只有需要双向 NAT 打洞时才会出现 P2PF-JOIN-... 加入码。
+  * IPv6/公网 IPv4 等可直连场景只需交换一次创建码。
+  * 双方都在较严格 IPv4 NAT 后时，无信令服务器模式仍需要加入码返回加入方的公网 UDP candidate。
+  * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。
+  * IPv6 选中后不执行 NAT 打洞；STUN 只用于预先准备 IPv4 失败回退候选。
+  * 不使用 TURN/relay；最终连接失败时会提示交换创建/加入角色重试。
 `, appVersion)
 }
 
@@ -74,8 +77,8 @@ func runInteractive() error {
 
 	consolePrintf("\nP2P Friend v%s\n", appVersion)
 	consolePrintln("========================================")
-	consolePrintln("1) 发起连接（生成连接码）")
-	consolePrintln("2) 加入连接（输入连接码）")
+	consolePrintln("1) 创建连接（生成 P2PF-CREATE 创建码）")
+	consolePrintln("2) 加入连接（输入 P2PF-CREATE 创建码）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
 
@@ -102,6 +105,13 @@ func runInteractive() error {
 	}
 }
 
+func inputLineReady(in *bufio.Reader, timeout time.Duration) bool {
+	if in.Buffered() > 0 {
+		return true
+	}
+	return consoleInputReady(timeout)
+}
+
 func runHost(in *bufio.Reader, cwd string) error {
 	peer, code, err := createConnectionCode()
 	if err != nil {
@@ -118,70 +128,111 @@ func runHost(in *bufio.Reader, cwd string) error {
 		acceptCh <- connResult{conn: conn, err: err}
 	}()
 
-	consolePrintf("\n[发起连接] 初始目录: %s\n", cwd)
+	consolePrintf("\n[创建连接] 初始目录: %s\n", cwd)
 	consolePrintln("")
-	consolePrintln("把下面的连接码发给对方：")
+	consolePrintln("把下面的 P2PF-CREATE 创建码发给对方：")
 	consolePrintln(code)
 	consolePrintln("")
-	consolePrintln("对方会返回一个 P2PF-... 确认码；粘贴后可完成 IPv4 NAT 双向打洞。")
-	consolePrintf("确认码: ")
-	confirm, err := readSignalLine(in)
-	if err != nil {
-		_ = peer.Close()
-		return err
-	}
-	if confirm == "" {
-		_ = peer.Close()
-		return errors.New("确认码为空")
-	}
-	if err := peer.applyConfirmation(confirm); err != nil {
-		_ = peer.Close()
-		return err
-	}
+	consolePrintln("程序会先尝试只用这个创建码直接连接；IPv6 / 公网 IPv4 等场景无需第二个码。")
+	consolePrintln("如果加入方提示需要双向 NAT 打洞，它会生成 P2PF-JOIN 加入码，再粘贴到这里。")
+	consolePrintf("加入码（仅 NAT 打洞需要）: ")
 
-	res := <-acceptCh
-	if res.err != nil {
-		_ = peer.Close()
-		return res.err
+	for {
+		select {
+		case res := <-acceptCh:
+			consolePrintln("")
+			if res.err != nil {
+				_ = peer.Close()
+				return res.err
+			}
+			conn := res.conn
+			if err := authenticateListener(conn, peer.token, roleHost); err != nil {
+				_ = conn.Close()
+				return err
+			}
+			consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(conn))
+			return runPeerShell(conn, "创建方", cwd, in)
+		default:
+		}
+
+		if !inputLineReady(in, 150*time.Millisecond) {
+			continue
+		}
+		joinCode, err := readSignalLine(in)
+		if err != nil {
+			_ = peer.Close()
+			return err
+		}
+		if strings.TrimSpace(joinCode) == "" {
+			consolePrintf("加入码（仅 NAT 打洞需要）: ")
+			continue
+		}
+		if err := peer.applyConfirmation(joinCode); err != nil {
+			consolePrintf("加入码无效: %v\n", err)
+			consolePrintf("加入码（仅 NAT 打洞需要）: ")
+			continue
+		}
+		consolePrintln("[连接] 已接收 P2PF-JOIN 加入码，继续等待 P2P 建连。")
 	}
-	conn := res.conn
-	if err := authenticateListener(conn, peer.token, roleHost); err != nil {
-		_ = conn.Close()
-		return err
-	}
-	consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(conn))
-	return runPeerShell(conn, "发起方", cwd, in)
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("\n[加入连接] 请粘贴对方发来的 P2PF-... 连接码。")
-	consolePrintf("连接码: ")
+	consolePrintln("\n[加入连接] 请粘贴对方发来的 P2PF-CREATE-... 创建码。")
+	consolePrintf("创建码: ")
 	code, err := readSignalLine(in)
 	if err != nil {
 		return err
 	}
 	if code == "" {
-		return errors.New("连接码为空")
+		return errors.New("创建码为空")
 	}
-	peer, confirm, token, err := createJoinConfirmation(code)
+	peer, joinCode, token, err := createJoinConfirmation(code)
 	if err != nil {
 		return err
 	}
+
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	connCh := make(chan connResult, 1)
+	go func() {
+		conn, err := peer.waitConn()
+		connCh <- connResult{conn: conn, err: err}
+	}()
+
 	consolePrintln("")
-	consolePrintln("把下面的确认码发回发起方：")
-	consolePrintln(confirm)
-	consolePrintln("")
-	conn, err := peer.waitConn()
-	if err != nil {
+	consolePrintln("正在尝试仅使用创建码直接连接；成功时不需要返回第二个码。")
+	select {
+	case res := <-connCh:
+		if res.err != nil {
+			_ = peer.Close()
+			return res.err
+		}
+		if err := authenticateDialer(res.conn, token, roleJoin); err != nil {
+			_ = res.conn.Close()
+			return err
+		}
+		consolePrintf("已建立 P2P 连接：QUIC / %s（单创建码）\n", connectionMode(res.conn))
+		return runPeerShell(res.conn, "加入方", cwd, in)
+	case <-time.After(4 * time.Second):
+	}
+
+	consolePrintln("直连暂未建立；为兼容双方都在 IPv4 NAT 后的情况，请把下面的 P2PF-JOIN 加入码发回创建方：")
+	consolePrintln(joinCode)
+	consolePrintln("发送后无需其它操作，程序会继续静默等待连接。")
+
+	res := <-connCh
+	if res.err != nil {
 		_ = peer.Close()
+		return res.err
+	}
+	if err := authenticateDialer(res.conn, token, roleJoin); err != nil {
+		_ = res.conn.Close()
 		return err
 	}
-	if err := authenticateDialer(conn, token, roleJoin); err != nil {
-		_ = conn.Close()
-		return err
-	}
-	consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(conn))
-	return runPeerShell(conn, "加入方", cwd, in)
+	consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(res.conn))
+	return runPeerShell(res.conn, "加入方", cwd, in)
 }
 
 func connectionMode(conn net.Conn) string {

@@ -34,8 +34,8 @@ func TestSignalCodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(s, signalPrefix) {
-		t.Fatalf("unexpected code prefix: %s", s)
+	if !strings.HasPrefix(s, signalCreatePrefix) {
+		t.Fatalf("unexpected CREATE code prefix: %s", s)
 	}
 	out, err := decodeSignal(s, "connect")
 	if err != nil {
@@ -506,20 +506,32 @@ func TestSessionAuthenticationTokenAndRoles(t *testing.T) {
 
 func TestAdaptiveTransferTuner(t *testing.T) {
 	tuner := newAdaptiveTransferTuner("windows", 4)
-	if got := tuner.current(); got.lanes != 1 || got.chunkSize != 64*1024 {
+	if got := tuner.current(); got.lanes != 2 || got.chunkSize != 128*1024 || got.pace != 0 {
 		t.Fatalf("unexpected initial tuning: %#v", got)
 	}
-	for i := 0; i < 8; i++ {
-		tuner.observe(5*time.Millisecond, nil)
+
+	// Even a slow but healthy 1 MiB/s path must be allowed to probe upward.
+	for i := 0; i < 6; i++ {
+		tuner.observe(512*1024, 500*time.Millisecond, nil)
 	}
-	if got := tuner.current(); got.lanes < 2 {
-		t.Fatalf("tuner did not ramp up: %#v", got)
+	if got := tuner.current(); got.lanes < 3 {
+		t.Fatalf("throughput-based tuner failed to ramp on a slow healthy path: %#v", got)
 	}
+
+	// A higher profile that materially reduces throughput should be reverted.
+	tuner = newAdaptiveTransferTuner("linux", 4)
 	before := tuner.current()
-	tuner.observe(300*time.Millisecond, nil)
+	for i := 0; i < 2; i++ {
+		tuner.observe(4*1024*1024, 400*time.Millisecond, nil) // 10 MiB/s baseline
+	}
+	probed := tuner.current()
+	if probed == before {
+		t.Fatalf("tuner did not probe a higher profile: before=%#v probed=%#v", before, probed)
+	}
+	tuner.observe(4*1024*1024, 800*time.Millisecond, nil) // 5 MiB/s, clear regression
 	after := tuner.current()
-	if after.lanes >= before.lanes && after.chunkSize >= before.chunkSize && after.pace <= before.pace {
-		t.Fatalf("tuner did not back off: before=%#v after=%#v", before, after)
+	if after.lanes > probed.lanes || after.chunkSize > probed.chunkSize {
+		t.Fatalf("tuner failed to reject a slower probe: probed=%#v after=%#v", probed, after)
 	}
 }
 
@@ -903,4 +915,92 @@ func TestShutdownRemovesPartialReceive(t *testing.T) {
 	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
 		t.Fatalf("partial file still exists after shutdown: %v", err)
 	}
+}
+
+func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
+	create := signalCode{
+		Version: signalVersion, Kind: "connect", Token: "x",
+		Candidates: []signalCandidate{{Addr: "127.0.0.1:1", Type: "host"}},
+	}
+	createCode, err := encodeSignal(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(createCode, signalCreatePrefix) {
+		t.Fatalf("create prefix=%q", createCode)
+	}
+	if _, err := decodeSignal(createCode, "confirm"); err == nil || !strings.Contains(err.Error(), "P2PF-CREATE") {
+		t.Fatalf("wrong-role CREATE code should be explained, got %v", err)
+	}
+
+	join := signalCode{
+		Version: signalVersion, Kind: "confirm", Token: "x",
+		Candidates: []signalCandidate{{Addr: "127.0.0.1:2", Type: "host"}},
+	}
+	joinCode, err := encodeSignal(join)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(joinCode, signalJoinPrefix) {
+		t.Fatalf("join prefix=%q", joinCode)
+	}
+	if _, err := decodeSignal(joinCode, "connect"); err == nil || !strings.Contains(err.Error(), "P2PF-JOIN") {
+		t.Fatalf("wrong-role JOIN code should be explained, got %v", err)
+	}
+}
+
+func TestQUICCanConnectWithCreateCodeOnly(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	join.fingerprint = append([]byte(nil), host.fingerprint...)
+	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
+	// Deliberately do not give the creator any join-side candidate.
+	// A directly reachable creator must be able to accept the incoming QUIC handshake.
+
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	hostCh := make(chan result, 1)
+	joinCh := make(chan result, 1)
+	go func() {
+		conn, err := host.acceptQUIC()
+		hostCh <- result{conn: conn, err: err}
+	}()
+	go func() {
+		conn, err := join.dialQUIC()
+		joinCh <- result{conn: conn, err: err}
+	}()
+
+	var hc, jc net.Conn
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		hc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("creator did not accept one-code direct QUIC")
+	}
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		jc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("joiner did not establish one-code direct QUIC")
+	}
+	_ = hc.Close()
+	_ = jc.Close()
 }
