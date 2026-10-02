@@ -475,6 +475,7 @@ func (s *peerSession) cleanupTransfersForShutdown() {
 
 func (s *peerSession) status() {
 	consolePrintln("=== Session Status ===")
+	consolePrintf("连接角色: %s\n", s.roleName)
 	consolePrintf("链路: %s\n", s.linkMode)
 	consolePrintln("传输栈: QUIC / UDP / TLS 1.3")
 	if p, ok := s.conn.(interface{ ConnectionInfo() quicConnectionInfo }); ok {
@@ -493,7 +494,11 @@ func (s *peerSession) status() {
 			consolePrintf("  - %s\n", formatSocketStatus(ep))
 		}
 		if len(info.STUNMappings) > 0 {
+			if strings.HasPrefix(s.linkMode, "IPv6-") {
+			consolePrintln("本机 STUN 映射（IPv4 备用，当前 IPv6 链路未使用）:")
+		} else {
 			consolePrintln("本机 STUN 映射:")
+		}
 			for _, addr := range info.STUNMappings {
 				consolePrintf("  - %s\n", addr)
 			}
