@@ -35,14 +35,14 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Printf(`p2p-friend v%s - UDP P2P 文件/目录传输
+	fmt.Printf(`p2p-friend v%s - P2P 文件/目录传输
 
 启动后选择：
-  1. 创建会话：生成 OFFER，收到朋友的 ANSWER 后建立连接
-  2. 加入会话：输入 OFFER，生成 ANSWER 发回创建方
+  1. 发起连接：生成连接码
+  2. 加入连接：输入连接码，并把确认码发回发起方
 
-连接阶段会收集 IPv6 / IPv4 / STUN UDP 候选，并在同一 UDP socket 上执行直连或 hole punching；
-QUIC 握手、会话认证和 4 条数据 stream 全部建立成功后才进入文件命令行。
+程序会在同一 UDP socket 上自动尝试 IPv6 / IPv4 直连和 IPv4 NAT 打洞，
+使用 QUIC 提供加密、可靠重传、拥塞控制和多 stream 传输。
 
 连接后采用类似 SFTP 的命令：
   pwd / ls / cd         操作远端目录
@@ -53,11 +53,11 @@ QUIC 握手、会话认证和 4 条数据 stream 全部建立成功后才进入�
   cancel / Ctrl-C       取消当前传输，不退出会话
   quit / exit           断开并退出
 
-传输：
-  * 底层是 UDP + QUIC（TLS 1.3、可靠重传、拥塞控制、多 stream）。
-  * 4 条 QUIC data stream 并行传输，UDP 丢包由 QUIC 自动重传。
-  * 发送文件前计算 SHA-256；接收端落盘后重新计算，匹配才报告完成。
-  * 不配置 TURN/relay；全部候选失败时会明确报连接失败。
+说明：
+  * 连接码和确认码统一使用 P2PF-... 前缀，协议版本和类型在码内部。
+  * 发起方生成连接码后立即开始等待 QUIC 连接，不会等确认码粘贴后才监听。
+  * IPv4 NAT 场景仍需要确认码把加入方的 STUN/NAT candidate 返回给发起方。
+  * 不使用 TURN/relay；最终连接失败时会提示交换发起/加入角色重试。
 `, appVersion)
 }
 
@@ -74,8 +74,8 @@ func runInteractive() error {
 
 	consolePrintf("\nP2P Friend v%s\n", appVersion)
 	consolePrintln("========================================")
-	consolePrintln("1) 创建会话（生成 OFFER）")
-	consolePrintln("2) 加入会话（输入 OFFER / 生成 ANSWER）")
+	consolePrintln("1) 发起连接（生成连接码）")
+	consolePrintln("2) 加入连接（输入连接码）")
 	consolePrintln("3) 退出")
 	consolePrintln("")
 	consolePrintln("网络：同一 UDP socket 自动尝试 IPv6 直连与 IPv4 STUN/NAT 打洞，传输使用 QUIC；不使用 TURN/relay。")
@@ -105,60 +105,77 @@ func runInteractive() error {
 }
 
 func runHost(in *bufio.Reader, cwd string) error {
-	peer, offer, err := createHostOffer()
+	peer, code, err := createConnectionCode()
 	if err != nil {
-		return fmt.Errorf("创建 UDP/QUIC 会话失败: %w", err)
+		return fmt.Errorf("创建 P2P 连接失败: %w", err)
 	}
-	consolePrintf("\n[创建会话] 初始目录: %s\n", cwd)
-	consolePrintln("[创建会话] 已收集 IPv6 / IPv4 / STUN 候选；传输将复用同一 UDP socket。")
+
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	acceptCh := make(chan connResult, 1)
+	go func() {
+		conn, err := peer.acceptQUIC()
+		acceptCh <- connResult{conn: conn, err: err}
+	}()
+
+	consolePrintf("\n[发起连接] 初始目录: %s\n", cwd)
+	consolePrintln("[发起连接] 已开始等待对端 QUIC 握手。")
 	consolePrintln("")
-	consolePrintln("把下面的 OFFER 发给朋友：")
-	consolePrintln(offer)
+	consolePrintln("把下面的连接码发给对方：")
+	consolePrintln(code)
 	consolePrintln("")
-	consolePrintln("朋友会返回一个 P2P7-ANSWER-...，粘贴后开始 UDP/QUIC 连通性检查。")
-	consolePrintf("ANSWER: ")
-	answer, err := readSignalLine(in)
+	consolePrintln("对方会返回一个 P2PF-... 确认码；粘贴后可完成 IPv4 NAT 双向打洞。")
+	consolePrintf("确认码: ")
+	confirm, err := readSignalLine(in)
 	if err != nil {
 		_ = peer.Close()
 		return err
 	}
-	if answer == "" {
+	if confirm == "" {
 		_ = peer.Close()
-		return errors.New("ANSWER 为空")
+		return errors.New("确认码为空")
 	}
-	consolePrintln("正在建立 P2P UDP 连接（IPv6 direct / IPv4 hole punching）...")
-	conn, token, err := peer.acceptAnswer(answer)
-	if err != nil {
+	if err := peer.applyConfirmation(confirm); err != nil {
 		_ = peer.Close()
 		return err
 	}
-	if err := authenticateListener(conn, token, roleHost); err != nil {
+	consolePrintln("已收到确认码，等待 P2P 链路完成...")
+
+	res := <-acceptCh
+	if res.err != nil {
+		_ = peer.Close()
+		return res.err
+	}
+	conn := res.conn
+	if err := authenticateListener(conn, peer.token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
 	}
-	consolePrintln("已建立 P2P UDP 加密连接：QUIC + TLS 1.3，多数据 stream 已就绪。")
-	return runPeerShell(conn, "HOST", cwd, in)
+	consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(conn))
+	return runPeerShell(conn, "发起方", cwd, in)
 }
 
 func runJoin(in *bufio.Reader, cwd string) error {
-	consolePrintln("\n[加入会话] 请粘贴朋友发来的 P2P7-OFFER-...。")
-	consolePrintf("OFFER: ")
-	offer, err := readSignalLine(in)
+	consolePrintln("\n[加入连接] 请粘贴对方发来的 P2PF-... 连接码。")
+	consolePrintf("连接码: ")
+	code, err := readSignalLine(in)
 	if err != nil {
 		return err
 	}
-	if offer == "" {
-		return errors.New("OFFER 为空")
+	if code == "" {
+		return errors.New("连接码为空")
 	}
-	peer, answer, token, err := createJoinAnswer(offer)
+	peer, confirm, token, err := createJoinConfirmation(code)
 	if err != nil {
 		return err
 	}
 	consolePrintln("")
-	consolePrintln("把下面的 ANSWER 发回创建方：")
-	consolePrintln(answer)
+	consolePrintln("把下面的确认码发回发起方：")
+	consolePrintln(confirm)
 	consolePrintln("")
-	consolePrintln("等待创建方粘贴 ANSWER，并自动执行 UDP/QUIC 连通性检查...")
+	consolePrintln("正在等待对端就绪并建立 P2P 链路...")
 	conn, err := peer.waitConn()
 	if err != nil {
 		_ = peer.Close()
@@ -168,8 +185,17 @@ func runJoin(in *bufio.Reader, cwd string) error {
 		_ = conn.Close()
 		return err
 	}
-	consolePrintln("已建立 P2P UDP 加密连接：QUIC + TLS 1.3，多数据 stream 已就绪。")
-	return runPeerShell(conn, "JOIN", cwd, in)
+	consolePrintf("已建立 P2P 连接：QUIC / %s\n", connectionMode(conn))
+	return runPeerShell(conn, "加入方", cwd, in)
+}
+
+func connectionMode(conn net.Conn) string {
+	if p, ok := conn.(interface{ LinkMode() string }); ok {
+		if mode := p.LinkMode(); mode != "" {
+			return mode
+		}
+	}
+	return "UDP"
 }
 
 func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
