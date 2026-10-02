@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 )
@@ -23,7 +24,8 @@ var (
 	kernel32           = syscall.NewLazyDLL("kernel32.dll")
 	procGetConsoleMode = kernel32.NewProc("GetConsoleMode")
 	procSetConsoleMode = kernel32.NewProc("SetConsoleMode")
-	procReadConsoleW   = kernel32.NewProc("ReadConsoleW")
+	procReadConsoleW        = kernel32.NewProc("ReadConsoleW")
+	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
 )
 
 type terminalState struct {
@@ -117,4 +119,16 @@ func setConsoleMode(h syscall.Handle, mode uint32) error {
 		return fmt.Errorf("SetConsoleMode: %w", e)
 	}
 	return nil
+}
+
+func consoleInputReady(timeout time.Duration) bool {
+	ms := uint32(timeout / time.Millisecond)
+	if timeout < 0 {
+		ms = 0xffffffff
+	}
+	r, _, _ := procWaitForSingleObject.Call(
+		uintptr(syscall.Handle(os.Stdin.Fd())),
+		uintptr(ms),
+	)
+	return uint32(r) == 0 // WAIT_OBJECT_0
 }
