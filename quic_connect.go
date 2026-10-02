@@ -12,8 +12,10 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
+const connectionWaitTimeout = 5 * time.Minute
+
 func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
 
 	acceptCh := make(chan *quic.Conn, 1)
@@ -39,7 +41,7 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 				_ = qc.CloseWithError(0, "cancelled")
 			}
 		}(ln)
-		go punchLoop(ctx, ep.transport, p.remote, ep.family)
+		go punchLoop(ctx, p, ep.transport, ep.family)
 	}
 	if started == 0 {
 		return nil, errors.New("无法启动 QUIC UDP listener")
@@ -56,14 +58,14 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 		cancel()
 		return establishStreams(qc, p, true)
 	case <-done:
-		return nil, errors.New("所有 QUIC listener 均已停止，未建立连接")
+		return nil, errors.New("QUIC listener 已停止，未建立连接")
 	case <-ctx.Done():
-		return nil, errors.New("QUIC/UDP 连接超时：IPv6 直连和 IPv4 UDP 打洞均未建立")
+		return nil, connectionTimeoutError()
 	}
 }
 
 func (p *rtcPeer) dialQUIC() (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
 
 	type target struct {
@@ -72,8 +74,8 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	}
 	var targets []target
 	for _, ep := range p.endpoints {
-		go punchLoop(ctx, ep.transport, p.remote, ep.family)
-		for _, raw := range p.remote {
+		go punchLoop(ctx, p, ep.transport, ep.family)
+		for _, raw := range p.remoteCandidates() {
 			addr, family, err := parseCandidate(raw)
 			if err != nil || family != ep.family {
 				continue
@@ -82,17 +84,15 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 		}
 	}
 	if len(targets) == 0 {
-		return nil, errors.New("连接码中没有与本机 UDP socket 匹配的 candidate")
+		return nil, errors.New("连接码中没有与本机 UDP socket 匹配的候选地址")
 	}
 
-	consolePrintln("[连接] 已生成 ANSWER，等待创建方粘贴；在 180 秒窗口内会持续重试 QUIC candidate。")
-
-	round := 0
+	// 长生命周期连接管理器：等待远端真正出现，而不是把一次 candidate
+	// 握手失败当成最终结果。远端开始监听后，下一次握手会立即成功返回。
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
+		if ctx.Err() != nil {
+			return nil, connectionTimeoutError()
 		}
-		round++
 
 		result := make(chan *quic.Conn, 1)
 		roundCtx, stopRound := context.WithCancel(ctx)
@@ -102,7 +102,7 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				dialCtx, stop := context.WithTimeout(roundCtx, 4*time.Second)
+				dialCtx, stop := context.WithTimeout(roundCtx, 6*time.Second)
 				defer stop()
 				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
 				if err != nil {
@@ -132,28 +132,29 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			return establishStreams(qc, p, false)
 		case <-ctx.Done():
 			stopRound()
-			return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
+			return nil, connectionTimeoutError()
 		case <-done:
 			stopRound()
-			if round == 1 {
-				consolePrintln("[连接] 创建方可能仍在粘贴 ANSWER，继续等待并重试，不会因为首轮失败退出。")
-			}
 			select {
 			case <-ctx.Done():
-				return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
-			case <-time.After(500 * time.Millisecond):
+				return nil, connectionTimeoutError()
+			case <-time.After(350 * time.Millisecond):
 			}
 		}
 	}
 }
 
-func punchLoop(ctx context.Context, tr *quic.Transport, candidates []string, family int) {
+func connectionTimeoutError() error {
+	return errors.New("P2P UDP/QUIC 连接超时；如果持续失败，可以交换“发起连接 / 加入连接”角色后重试")
+}
+
+func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
 	payload := append([]byte{0x00}, []byte(punchMagic)...)
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		for _, raw := range candidates {
+		for _, raw := range p.remoteCandidates() {
 			addr, fam, err := parseCandidate(raw)
 			if err != nil || fam != family {
 				continue

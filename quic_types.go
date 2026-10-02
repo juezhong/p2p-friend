@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,19 +20,23 @@ import (
 )
 
 const (
-	signalVersion      = 7
-	signalPrefixOffer  = "P2P7-OFFER-"
-	signalPrefixAnswer = "P2P7-ANSWER-"
-	quicALPN           = "p2p-friend/7"
-	punchMagic         = "P2P7PUNCH"
+	signalVersion = 8
+	signalPrefix  = "P2PF-"
+	quicALPN      = "p2p-friend/8"
+	punchMagic    = "P2PF8PUNCH"
 )
 
+type signalCandidate struct {
+	Addr string `json:"addr"`
+	Type string `json:"type"`
+}
+
 type signalCode struct {
-	Version     int      `json:"v"`
-	Kind        string   `json:"kind"`
-	Token       string   `json:"token"`
-	Candidates  []string `json:"candidates"`
-	Fingerprint string   `json:"fingerprint,omitempty"`
+	Version     int               `json:"v"`
+	Kind        string            `json:"kind"`
+	Token       string            `json:"token"`
+	Candidates  []signalCandidate `json:"candidates"`
+	Fingerprint string            `json:"fingerprint,omitempty"`
 }
 
 type udpEndpoint struct {
@@ -46,9 +51,12 @@ type rtcPeer struct {
 	fingerprint []byte
 	cert        tls.Certificate
 	endpoints   []*udpEndpoint
-	remote      []string
-	server      bool
-	closeOnce   sync.Once
+
+	remoteMu sync.RWMutex
+	remote   []signalCandidate
+
+	server    bool
+	closeOnce sync.Once
 }
 
 type quicStreamConn struct{ *quic.Stream }
@@ -72,14 +80,17 @@ func (a quicAddr) Network() string {
 	return "quic/" + a.Addr.Network()
 }
 
-func (c *rtcConn) Read(p []byte) (int, error)       { return c.control.Read(p) }
-func (c *rtcConn) Write(p []byte) (int, error)      { return c.control.Write(p) }
-func (c *rtcConn) LocalAddr() net.Addr              { return quicAddr{c.qc.LocalAddr()} }
-func (c *rtcConn) RemoteAddr() net.Addr             { return quicAddr{c.qc.RemoteAddr()} }
+func (c *rtcConn) Read(p []byte) (int, error)         { return c.control.Read(p) }
+func (c *rtcConn) Write(p []byte) (int, error)        { return c.control.Write(p) }
+func (c *rtcConn) LocalAddr() net.Addr                { return quicAddr{c.qc.LocalAddr()} }
+func (c *rtcConn) RemoteAddr() net.Addr               { return quicAddr{c.qc.RemoteAddr()} }
 func (c *rtcConn) SetReadDeadline(t time.Time) error  { return c.control.SetReadDeadline(t) }
 func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.control.SetWriteDeadline(t) }
 func (c *rtcConn) SetDeadline(t time.Time) error      { return c.control.SetDeadline(t) }
 func (c *rtcConn) DataLanes() []io.ReadWriteCloser    { return c.lanes }
+func (c *rtcConn) LinkMode() string {
+	return classifyQUICLink(c.qc, c.peer.remoteCandidates())
+}
 
 func (c *rtcConn) Close() error {
 	var err error
@@ -92,6 +103,62 @@ func (c *rtcConn) Close() error {
 		_ = c.peer.Close()
 	})
 	return err
+}
+
+func (p *rtcPeer) setRemoteCandidates(cands []signalCandidate) {
+	p.remoteMu.Lock()
+	p.remote = append([]signalCandidate(nil), cands...)
+	p.remoteMu.Unlock()
+}
+
+func (p *rtcPeer) remoteCandidates() []signalCandidate {
+	p.remoteMu.RLock()
+	defer p.remoteMu.RUnlock()
+	return append([]signalCandidate(nil), p.remote...)
+}
+
+func classifyQUICLink(qc *quic.Conn, candidates []signalCandidate) string {
+	addr, ok := qc.RemoteAddr().(*net.UDPAddr)
+	if !ok || addr == nil || addr.IP == nil {
+		return "QUIC"
+	}
+	ip := addr.IP
+	if ip.To4() == nil {
+		if ip.IsPrivate() {
+			return "IPv6-LAN"
+		}
+		return "IPv6-DIRECT"
+	}
+	if ip.IsPrivate() {
+		return "IPv4-LAN"
+	}
+	remote := addr.String()
+	hostMatch := false
+	srflxMatch := false
+	for _, c := range candidates {
+		if !sameUDPAddress(c.Addr, remote) {
+			continue
+		}
+		switch strings.ToLower(c.Type) {
+		case "host":
+			hostMatch = true
+		case "srflx":
+			srflxMatch = true
+		}
+	}
+	if srflxMatch && !hostMatch {
+		return "IPv4-NAT-PUNCH"
+	}
+	return "IPv4-DIRECT"
+}
+
+func sameUDPAddress(a, b string) bool {
+	aa, errA := net.ResolveUDPAddr("udp", a)
+	bb, errB := net.ResolveUDPAddr("udp", b)
+	if errA != nil || errB != nil || aa == nil || bb == nil {
+		return a == b
+	}
+	return aa.Port == bb.Port && aa.IP.Equal(bb.IP)
 }
 
 func newToken() ([]byte, error) {
@@ -113,11 +180,11 @@ func generateQUICCertificate() (tls.Certificate, []byte, error) {
 	now := time.Now()
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
-		Subject: pkix.Name{CommonName: "p2p-friend ephemeral"},
-		NotBefore: now.Add(-time.Minute),
-		NotAfter: now.Add(24 * time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		Subject:      pkix.Name{CommonName: "p2p-friend ephemeral"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
@@ -128,22 +195,22 @@ func generateQUICCertificate() (tls.Certificate, []byte, error) {
 
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		HandshakeIdleTimeout: 12 * time.Second,
-		MaxIdleTimeout: 60 * time.Second,
-		KeepAlivePeriod: 15 * time.Second,
-		InitialStreamReceiveWindow: 16 * 1024 * 1024,
-		MaxStreamReceiveWindow: 64 * 1024 * 1024,
+		HandshakeIdleTimeout:           12 * time.Second,
+		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                15 * time.Second,
+		InitialStreamReceiveWindow:     16 * 1024 * 1024,
+		MaxStreamReceiveWindow:         64 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
-		MaxConnectionReceiveWindow: 256 * 1024 * 1024,
-		MaxIncomingStreams: int64(parallelLanes + 8),
+		MaxConnectionReceiveWindow:     256 * 1024 * 1024,
+		MaxIncomingStreams:             int64(parallelLanes + 8),
 	}
 }
 
 func (p *rtcPeer) serverTLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{p.cert},
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{quicALPN},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{quicALPN},
 	}
 }
 
@@ -151,8 +218,8 @@ func (p *rtcPeer) clientTLSConfig() *tls.Config {
 	expected := append([]byte(nil), p.fingerprint...)
 	return &tls.Config{
 		InsecureSkipVerify: true,
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{quicALPN},
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{quicALPN},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) != 1 {
 				return errors.New("unexpected QUIC certificate chain")

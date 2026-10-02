@@ -66,8 +66,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}"             -o dist/p2p-friend-linux-amd64 .
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}"             -o dist/p2p-friend-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+            -o dist/p2p-friend-linux-amd64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+            -o dist/p2p-friend-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+            -o dist/p2p-friend-darwin-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+            -o dist/p2p-friend-darwin-arm64 .
           (cd dist && sha256sum p2p-friend-* > SHA256SUMS.txt)
 
       - name: Create version tag
@@ -91,9 +101,26 @@ jobs:
           set -euo pipefail
           NOTES="docs/releases/${TAG}.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt --clobber
+            gh release upload "$TAG" \
+              dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-windows-amd64.exe \
+              dist/p2p-friend-darwin-amd64 \
+              dist/p2p-friend-darwin-arm64 \
+              dist/SHA256SUMS.txt --clobber
           elif [[ -f "$NOTES" ]]; then
-            gh release create "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt               --verify-tag --title "$TAG" --notes-file "$NOTES"
+            gh release create "$TAG" \
+              dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-windows-amd64.exe \
+              dist/p2p-friend-darwin-amd64 \
+              dist/p2p-friend-darwin-arm64 \
+              dist/SHA256SUMS.txt \
+              --verify-tag --title "$TAG" --notes-file "$NOTES"
           else
-            gh release create "$TAG"               dist/p2p-friend-linux-amd64               dist/p2p-friend-windows-amd64.exe               dist/SHA256SUMS.txt               --verify-tag --title "$TAG" --generate-notes
+            gh release create "$TAG" \
+              dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-windows-amd64.exe \
+              dist/p2p-friend-darwin-amd64 \
+              dist/p2p-friend-darwin-arm64 \
+              dist/SHA256SUMS.txt \
+              --verify-tag --title "$TAG" --generate-notes
           fi

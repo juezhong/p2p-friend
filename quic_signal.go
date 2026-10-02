@@ -75,7 +75,7 @@ func (p *rtcPeer) Close() error {
 	return first
 }
 
-func createHostOffer() (*rtcPeer, string, error) {
+func createConnectionCode() (*rtcPeer, string, error) {
 	p, err := newPeer(true)
 	if err != nil {
 		return nil, "", err
@@ -86,10 +86,10 @@ func createHostOffer() (*rtcPeer, string, error) {
 		return nil, "", errors.New("没有可用 UDP candidate")
 	}
 	code, err := encodeSignal(signalCode{
-		Version: signalVersion,
-		Kind: "offer",
-		Token: base64.RawURLEncoding.EncodeToString(p.token),
-		Candidates: cands,
+		Version:     signalVersion,
+		Kind:        "connect",
+		Token:       base64.RawURLEncoding.EncodeToString(p.token),
+		Candidates:  cands,
 		Fingerprint: hex.EncodeToString(p.fingerprint),
 	})
 	if err != nil {
@@ -99,18 +99,18 @@ func createHostOffer() (*rtcPeer, string, error) {
 	return p, code, nil
 }
 
-func createJoinAnswer(rawOffer string) (*rtcPeer, string, []byte, error) {
-	code, err := decodeSignal(rawOffer, "offer")
+func createJoinConfirmation(rawCode string) (*rtcPeer, string, []byte, error) {
+	code, err := decodeSignal(rawCode, "connect")
 	if err != nil {
 		return nil, "", nil, err
 	}
 	token, err := base64.RawURLEncoding.DecodeString(code.Token)
 	if err != nil || len(token) != 32 {
-		return nil, "", nil, errors.New("OFFER 中的会话 token 无效")
+		return nil, "", nil, errors.New("连接码中的会话 token 无效")
 	}
 	fp, err := hex.DecodeString(code.Fingerprint)
 	if err != nil || len(fp) != 32 {
-		return nil, "", nil, errors.New("OFFER 中的 QUIC 证书指纹无效")
+		return nil, "", nil, errors.New("连接码中的 QUIC 证书指纹无效")
 	}
 	p, err := newPeer(false)
 	if err != nil {
@@ -118,43 +118,42 @@ func createJoinAnswer(rawOffer string) (*rtcPeer, string, []byte, error) {
 	}
 	p.token = token
 	p.fingerprint = fp
-	p.remote = append([]string(nil), code.Candidates...)
+	p.setRemoteCandidates(code.Candidates)
 	cands := gatherCandidates(p.endpoints)
 	if len(cands) == 0 {
 		_ = p.Close()
 		return nil, "", nil, errors.New("没有可用 UDP candidate")
 	}
-	answer, err := encodeSignal(signalCode{
-		Version: signalVersion,
-		Kind: "answer",
-		Token: code.Token,
+	confirm, err := encodeSignal(signalCode{
+		Version:    signalVersion,
+		Kind:       "confirm",
+		Token:      code.Token,
 		Candidates: cands,
 	})
 	if err != nil {
 		_ = p.Close()
 		return nil, "", nil, err
 	}
-	return p, answer, token, nil
+	return p, confirm, token, nil
 }
 
-func (p *rtcPeer) acceptAnswer(raw string) (net.Conn, []byte, error) {
-	code, err := decodeSignal(raw, "answer")
+func (p *rtcPeer) applyConfirmation(raw string) error {
+	code, err := decodeSignal(raw, "confirm")
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	token, err := base64.RawURLEncoding.DecodeString(code.Token)
 	if err != nil || !equalBytes(token, p.token) {
-		return nil, nil, errors.New("ANSWER 与当前会话不匹配")
+		return errors.New("确认码与当前连接不匹配")
 	}
-	p.remote = append([]string(nil), code.Candidates...)
-	conn, err := p.acceptQUIC()
-	return conn, p.token, err
+	p.setRemoteCandidates(code.Candidates)
+	return nil
 }
 
 func (p *rtcPeer) waitConn() (net.Conn, error) { return p.dialQUIC() }
 
-func gatherCandidates(endpoints []*udpEndpoint) []string {
-	set := map[string]struct{}{}
+func gatherCandidates(endpoints []*udpEndpoint) []signalCandidate {
+	set := map[string]signalCandidate{}
 	ifaces, _ := net.Interfaces()
 	for _, ep := range endpoints {
 		port := ep.conn.LocalAddr().(*net.UDPAddr).Port
@@ -180,25 +179,34 @@ func gatherCandidates(endpoints []*udpEndpoint) []string {
 				if ep.family == 6 && ip.To4() != nil {
 					continue
 				}
-				set[net.JoinHostPort(ip.String(), fmt.Sprint(port))] = struct{}{}
+				addr := net.JoinHostPort(ip.String(), fmt.Sprint(port))
+				set["host|"+addr] = signalCandidate{Addr: addr, Type: "host"}
 			}
 		}
 		if ep.family == 4 {
 			if addr, err := stunMappedAddress(ep.conn); err == nil {
-				set[addr.String()] = struct{}{}
+				key := "srflx|" + addr.String()
+				set[key] = signalCandidate{Addr: addr.String(), Type: "srflx"}
 			}
 		}
 	}
-	out := make([]string, 0, len(set))
-	for s := range set {
-		out = append(out, s)
+	out := make([]signalCandidate, 0, len(set))
+	for _, c := range set {
+		out = append(out, c)
 	}
-	sort.Slice(out, func(i, j int) bool { return candidateRank(out[i]) < candidateRank(out[j]) })
+	sort.Slice(out, func(i, j int) bool {
+		ri := candidateRank(out[i])
+		rj := candidateRank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].Addr < out[j].Addr
+	})
 	return out
 }
 
-func candidateRank(s string) int {
-	host, _, err := net.SplitHostPort(s)
+func candidateRank(c signalCandidate) int {
+	host, _, err := net.SplitHostPort(c.Addr)
 	if err != nil {
 		return 9
 	}
@@ -209,13 +217,16 @@ func candidateRank(s string) int {
 	if ip.To4() == nil && !ip.IsPrivate() {
 		return 0
 	}
-	if ip.To4() != nil && !ip.IsPrivate() {
+	if c.Type == "srflx" {
 		return 1
 	}
-	if ip.To4() == nil {
+	if ip.To4() != nil && !ip.IsPrivate() {
 		return 2
 	}
-	return 3
+	if ip.To4() == nil {
+		return 3
+	}
+	return 4
 }
 
 func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
@@ -250,8 +261,8 @@ func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
 	return nil, errors.New("STUN failed")
 }
 
-func parseCandidate(raw string) (*net.UDPAddr, int, error) {
-	addr, err := net.ResolveUDPAddr("udp", raw)
+func parseCandidate(raw signalCandidate) (*net.UDPAddr, int, error) {
+	addr, err := net.ResolveUDPAddr("udp", raw.Addr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -267,24 +278,16 @@ func encodeSignal(c signalCode) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	prefix := signalPrefixOffer
-	if c.Kind == "answer" {
-		prefix = signalPrefixAnswer
-	}
-	return prefix + base64.RawURLEncoding.EncodeToString(b), nil
+	return signalPrefix + base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func decodeSignal(s, expectedKind string) (signalCode, error) {
 	var c signalCode
 	s = strings.TrimSpace(s)
-	prefix := signalPrefixOffer
-	if expectedKind == "answer" {
-		prefix = signalPrefixAnswer
+	if !strings.HasPrefix(s, signalPrefix) {
+		return c, fmt.Errorf("连接码格式错误：需要 %s...", signalPrefix)
 	}
-	if !strings.HasPrefix(s, prefix) {
-		return c, fmt.Errorf("连接码类型错误：需要 %s", strings.TrimSuffix(prefix, "-"))
-	}
-	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, prefix))
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, signalPrefix))
 	if err != nil {
 		return c, err
 	}
