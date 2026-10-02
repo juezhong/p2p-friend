@@ -25,111 +25,165 @@ type transferTuningProfile struct {
 }
 
 type adaptiveTransferTuner struct {
-	goos       string
-	maxLanes   int
-	profile    transferTuningProfile
-	stableRuns int
+	goos     string
+	maxLanes int
+
+	levels []transferTuningProfile
+	level  int
+
+	windowBytes   int64
+	windowElapsed time.Duration
+
+	baselineBps float64
+	bestBps     float64
+	probeBase   float64
+	probing     bool
+	stable      int
+	cooldown    int
 }
 
-func initialTransferTuning(goos string, maxLanes int) transferTuningProfile {
+func transferTuningLevels(maxLanes int) []transferTuningProfile {
 	if maxLanes < 1 {
 		maxLanes = 1
 	}
-	if goos == "windows" {
-		return transferTuningProfile{chunkSize: 64 * 1024, lanes: 1}
+	raw := []transferTuningProfile{
+		{chunkSize: 64 * 1024, lanes: 1, pace: 250 * time.Microsecond},
+		{chunkSize: 128 * 1024, lanes: 1},
+		{chunkSize: 128 * 1024, lanes: 2},
+		{chunkSize: 192 * 1024, lanes: 3},
+		{chunkSize: 256 * 1024, lanes: 4},
 	}
-	lanes := parallelLanes
-	if lanes > maxLanes {
-		lanes = maxLanes
+	out := make([]transferTuningProfile, 0, len(raw))
+	for _, p := range raw {
+		if p.lanes <= maxLanes {
+			out = append(out, p)
+		}
 	}
-	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: lanes}
+	if len(out) == 0 {
+		out = append(out, transferTuningProfile{chunkSize: 64 * 1024, lanes: 1})
+	}
+	return out
 }
 
 func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner {
-	if maxLanes < 1 {
-		maxLanes = 1
+	levels := transferTuningLevels(maxLanes)
+	initial := len(levels) - 1
+	// Windows 从 2 lane / 128 KiB 起步，避免一次把 Winsock 队列压满；
+	// Linux/macOS 从 3 lane 左右起步。之后都按实际吞吐探测到最高档。
+	if goos == "windows" {
+		for i, p := range levels {
+			if p.lanes >= 2 && p.chunkSize >= 128*1024 {
+				initial = i
+				break
+			}
+		}
+	} else {
+		for i, p := range levels {
+			if p.lanes >= 3 {
+				initial = i
+				break
+			}
+		}
 	}
 	return &adaptiveTransferTuner{
 		goos:     goos,
 		maxLanes: maxLanes,
-		profile:  initialTransferTuning(goos, maxLanes),
+		levels:   levels,
+		level:    initial,
 	}
 }
 
 func (t *adaptiveTransferTuner) current() transferTuningProfile {
-	p := t.profile
-	if p.lanes < 1 {
-		p.lanes = 1
+	if t.level < 0 {
+		t.level = 0
 	}
-	if p.lanes > t.maxLanes {
-		p.lanes = t.maxLanes
+	if t.level >= len(t.levels) {
+		t.level = len(t.levels) - 1
 	}
-	if p.chunkSize < 32*1024 {
-		p.chunkSize = 32 * 1024
-	}
-	if p.chunkSize > maxDataChunkSize {
-		p.chunkSize = maxDataChunkSize
-	}
-	return p
+	return t.levels[t.level]
 }
 
-func (t *adaptiveTransferTuner) observe(batch time.Duration, err error) (transferTuningProfile, bool) {
+func (t *adaptiveTransferTuner) resetWindow() {
+	t.windowBytes = 0
+	t.windowElapsed = 0
+}
+
+func (t *adaptiveTransferTuner) observe(bytes int64, elapsed time.Duration, err error) (transferTuningProfile, bool) {
 	old := t.current()
 
-	switch {
-	case err != nil || batch >= 200*time.Millisecond:
-		t.stableRuns = 0
-		if t.profile.lanes > 1 {
-			t.profile.lanes--
-		} else if t.profile.chunkSize > 32*1024 {
-			t.profile.chunkSize /= 2
+	if err != nil {
+		// 真正的 socket / QUIC 写错误优先降档。正常网络拥塞由 QUIC 自己处理，
+		// 不再用“某一批写了多久”这种绝对阈值误判慢链路。
+		if t.level > 0 {
+			t.level--
 		}
-		if t.profile.pace == 0 {
-			t.profile.pace = 250 * time.Microsecond
-		} else if t.profile.pace < 2*time.Millisecond {
-			t.profile.pace *= 2
-			if t.profile.pace > 2*time.Millisecond {
-				t.profile.pace = 2 * time.Millisecond
-			}
-		}
-
-	case batch >= 80*time.Millisecond:
-		t.stableRuns = 0
-		if t.profile.pace < time.Millisecond {
-			t.profile.pace += 100 * time.Microsecond
-		}
-
-	case batch <= 20*time.Millisecond:
-		t.stableRuns++
-		needed := 8
-		if t.profile.lanes >= 3 {
-			needed = 16
-		}
-		if t.stableRuns >= needed {
-			t.stableRuns = 0
-			if t.profile.pace > 0 {
-				t.profile.pace /= 2
-				if t.profile.pace < 50*time.Microsecond {
-					t.profile.pace = 0
-				}
-			} else if t.profile.lanes < t.maxLanes {
-				t.profile.lanes++
-			} else if t.profile.chunkSize < maxDataChunkSize {
-				t.profile.chunkSize *= 2
-				if t.profile.chunkSize > maxDataChunkSize {
-					t.profile.chunkSize = maxDataChunkSize
-				}
-			}
-		}
-
-	default:
-		if t.stableRuns > 0 {
-			t.stableRuns--
-		}
+		t.probing = false
+		t.stable = 0
+		t.cooldown = 3
+		t.resetWindow()
+		return t.current(), old != t.current()
 	}
 
-	now := t.current()
-	return now, old != now
+	if bytes > 0 {
+		t.windowBytes += bytes
+	}
+	if elapsed > 0 {
+		t.windowElapsed += elapsed
+	}
+	// 以吞吐窗口而不是单次 Write 延迟做判断。这样 1 MiB/s 和 100 MiB/s
+	// 链路都能正常升档，不会因为 WAN RTT 或接收端背压被错误降到 1 lane。
+	if t.windowElapsed < 800*time.Millisecond && t.windowBytes < 4*1024*1024 {
+		return old, false
+	}
+	if t.windowElapsed <= 0 || t.windowBytes <= 0 {
+		t.resetWindow()
+		return old, false
+	}
+
+	rate := float64(t.windowBytes) / t.windowElapsed.Seconds()
+	t.resetWindow()
+	if rate > t.bestBps {
+		t.bestBps = rate
+	}
+
+	if t.probing {
+		// 探测更高档后，只要吞吐没有明显恶化就保留；若下降超过约 10%，
+		// 回到上一档并冷却几个窗口，避免在两个档位间频繁振荡。
+		if t.probeBase > 0 && rate < t.probeBase*0.90 {
+			if t.level > 0 {
+				t.level--
+			}
+			t.baselineBps = t.probeBase
+			t.cooldown = 3
+		} else {
+			t.baselineBps = rate
+		}
+		t.probing = false
+		t.stable = 0
+		return t.current(), old != t.current()
+	}
+
+	if t.baselineBps == 0 {
+		t.baselineBps = rate
+	} else {
+		// 平滑基线，只用于下一次升档探测比较，不作为“网络拥塞”判断。
+		t.baselineBps = t.baselineBps*0.70 + rate*0.30
+	}
+
+	if t.cooldown > 0 {
+		t.cooldown--
+		return old, false
+	}
+
+	t.stable++
+	if t.stable >= 2 && t.level+1 < len(t.levels) {
+		t.stable = 0
+		t.probeBase = t.baselineBps
+		t.level++
+		t.probing = true
+		return t.current(), true
+	}
+	return old, false
 }
 
 func currentTransferTuner(maxLanes int) *adaptiveTransferTuner {
