@@ -780,17 +780,10 @@ func (s *peerSession) handleTransferEnd(id uint64, payload []byte) error {
 	if !s.transferCoordinator && t.getReqID == 0 {
 		s.releasePassiveTransfer()
 	}
-	if !t.progress.Silent {
-		if cancelled {
-			consolePrintf("%s 已取消: %s\n", t.progress.Prefix, reason)
-			if len(overwrote) > 0 {
-				consolePrintf("%s 注意：overwrite on 时已完成覆盖的文件无法自动恢复：\n", t.progress.Prefix)
-				for _, p := range overwrote {
-					consolePrintf("  %s\n", p)
-				}
-			}
-		} else {
-			consolePrintf("%s 完成。\n", t.progress.Prefix)
+	if !t.progress.Silent && cancelled && len(overwrote) > 0 {
+		consolePrintf("%s 注意：overwrite on 时已完成覆盖的文件无法自动恢复：\n", t.progress.Prefix)
+		for _, p := range overwrote {
+			consolePrintf("  %s\n", p)
 		}
 	}
 	return nil
