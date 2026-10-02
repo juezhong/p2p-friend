@@ -431,7 +431,49 @@ func (s *peerSession) close(sendBye bool) {
 }
 
 func (s *peerSession) status() {
-	consolePrintf("角色: %s\n", s.roleName)
+	consolePrintln("=== Session Status ===")
+	consolePrintf("链路: %s\n", s.linkMode)
+	consolePrintln("传输栈: QUIC / UDP / TLS 1.3")
+	if p, ok := s.conn.(interface{ ConnectionInfo() quicConnectionInfo }); ok {
+		info := p.ConnectionInfo()
+		consolePrintf("QUIC 连接方式: %s\n", info.QUICRole)
+		consolePrintf("本机选中 UDP: %s\n", info.LocalUDP)
+		consolePrintf("对端选中 UDP: %s\n", info.RemoteUDP)
+		consolePrintf("对端 candidate: %s\n", info.RemoteCandidateType)
+		if info.QUICRole == "主动连接端" {
+			consolePrintf("主动连接源端口: %s\n", info.LocalUDP)
+		} else {
+			consolePrintf("当前监听/传输端口: %s\n", info.LocalUDP)
+		}
+		consolePrintln("UDP sockets:")
+		for _, ep := range info.Sockets {
+			consolePrintf("  - %s\n", formatSocketStatus(ep))
+		}
+		if len(info.STUNMappings) > 0 {
+			consolePrintln("本机 STUN 映射:")
+			for _, addr := range info.STUNMappings {
+				consolePrintf("  - %s\n", addr)
+			}
+		}
+		consolePrintf("QUIC streams: control=1, data=%d\n", info.Streams)
+		consolePrintln("端口关系: 连通性检查、NAT 打洞、QUIC 握手和文件传输复用选中的 UDP socket。")
+	} else {
+		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
+	}
+
+	lease := s.leaseSnapshot()
+	if lease.ID == 0 {
+		consolePrintln("传输任务: idle")
+	} else {
+		consolePrintf("传输任务: busy / %s / %s / %s / %s\n",
+			displayLeaseOwner(lease.Owner), lease.Kind, displayLeasePath(lease.Path), time.Since(lease.Since).Round(time.Second))
+	}
+	tuning := s.currentTuning()
+	if tuning.lanes > 0 {
+		consolePrintf("发送自适应: lanes=%d, chunk=%s, pacing=%s\n",
+			tuning.lanes, humanBytes(int64(tuning.chunkSize)), tuning.pace)
+	}
+
 	consolePrintf("本地目录: %s\n", s.getLocalCwd())
 	consolePrintf("对方看到的本机目录: %s\n", s.getServeCwd())
 	remote := s.getRemoteCwd()
@@ -440,9 +482,6 @@ func (s *peerSession) status() {
 	}
 	consolePrintf("远端目录: %s\n", remote)
 	consolePrintf("本机接收覆盖: %s\n", onOff(s.getOverwrite()))
-	consolePrintf("链路: %s\n", s.linkMode)
-	consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
-	consolePrintf("活动传输 ID: %v\n", s.debugActiveTransfers())
 }
 
 func onOff(v bool) string {
