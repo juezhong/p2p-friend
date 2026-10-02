@@ -498,14 +498,22 @@ func TestSessionAuthenticationTokenAndRoles(t *testing.T) {
 	}
 }
 
-func TestTransferTuningProfiles(t *testing.T) {
-	win := transferTuning("windows")
-	if win.chunkSize != 64*1024 || win.lanes != 2 || win.pace <= 0 {
-		t.Fatalf("unexpected Windows tuning: %#v", win)
+func TestAdaptiveTransferTuner(t *testing.T) {
+	tuner := newAdaptiveTransferTuner("windows", 4)
+	if got := tuner.current(); got.lanes != 1 || got.chunkSize != 64*1024 {
+		t.Fatalf("unexpected initial tuning: %#v", got)
 	}
-	linux := transferTuning("linux")
-	if linux.chunkSize != maxDataChunkSize || linux.lanes != parallelLanes || linux.pace != 0 {
-		t.Fatalf("unexpected Linux tuning: %#v", linux)
+	for i := 0; i < 8; i++ {
+		tuner.observe(5*time.Millisecond, nil)
+	}
+	if got := tuner.current(); got.lanes < 2 {
+		t.Fatalf("tuner did not ramp up: %#v", got)
+	}
+	before := tuner.current()
+	tuner.observe(300*time.Millisecond, nil)
+	after := tuner.current()
+	if after.lanes >= before.lanes && after.chunkSize >= before.chunkSize && after.pace <= before.pace {
+		t.Fatalf("tuner did not back off: before=%#v after=%#v", before, after)
 	}
 }
 
@@ -541,6 +549,71 @@ func ipv4EndpointAddr(t *testing.T, p *rtcPeer) string {
 	}
 	t.Fatal("no IPv4 endpoint")
 	return ""
+}
+
+func TestQUICDialWaitsForDelayedHost(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	join.fingerprint = append([]byte(nil), host.fingerprint...)
+	host.remote = []string{ipv4EndpointAddr(t, join)}
+	join.remote = []string{ipv4EndpointAddr(t, host)}
+
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	joinCh := make(chan connResult, 1)
+	go func() {
+		conn, err := join.dialQUIC()
+		joinCh <- connResult{conn: conn, err: err}
+	}()
+
+	select {
+	case r := <-joinCh:
+		if r.conn != nil {
+			_ = r.conn.Close()
+		}
+		t.Fatalf("join returned before host started listening: %v", r.err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+
+	hostCh := make(chan connResult, 1)
+	go func() {
+		conn, err := host.acceptQUIC()
+		hostCh <- connResult{conn: conn, err: err}
+	}()
+
+	var joinConn net.Conn
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatalf("join failed after delayed host start: %v", r.err)
+		}
+		joinConn = r.conn
+	case <-time.After(15 * time.Second):
+		t.Fatal("join did not connect after host started")
+	}
+	defer joinConn.Close()
+
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatalf("host accept failed: %v", r.err)
+		}
+		_ = r.conn.Close()
+	case <-time.After(15 * time.Second):
+		t.Fatal("host did not accept delayed join")
+	}
 }
 
 func TestQUICLoopbackParallelTransfer(t *testing.T) {
