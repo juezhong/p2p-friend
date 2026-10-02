@@ -11,6 +11,12 @@ import (
 var consoleOut io.Writer = os.Stdout
 
 func (p *progress) print(force bool) {
+	if p == nil || p.Silent {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	now := time.Now()
 	if !force && now.Sub(p.LastPrint) < 500*time.Millisecond {
 		return
@@ -30,10 +36,28 @@ func (p *progress) print(force bool) {
 	}
 	if force {
 		line += "\n"
+		p.lineOpen = false
+	} else {
+		p.lineOpen = true
 	}
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	_, _ = io.WriteString(consoleOut, line)
+}
+
+func (p *progress) closeLine() {
+	if p == nil || p.Silent {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.lineOpen {
+		return
+	}
+	consoleMu.Lock()
+	_, _ = io.WriteString(consoleOut, "\r\n")
+	consoleMu.Unlock()
+	p.lineOpen = false
 }
 
 func truncate(s string, n int) string {

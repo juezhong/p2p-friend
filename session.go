@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,10 @@ import (
 )
 
 func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
+	coordinator := roleName == "发起方" || roleName == "HOST" || roleName == "A"
+	if p, ok := conn.(interface{ TransferCoordinator() bool }); ok {
+		coordinator = p.TransferCoordinator()
+	}
 	s := &peerSession{
 		conn:       conn,
 		br:         bufio.NewReaderSize(conn, chunkSize*2),
@@ -26,8 +29,9 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		inbound:    make(map[uint64]*inboundTransfer),
 		localCwd:   cwd,
 		serveCwd:   cwd,
-		roleName:   roleName,
-		linkMode:   connectionMode(conn),
+		roleName:             roleName,
+		linkMode:             connectionMode(conn),
+		transferCoordinator: coordinator,
 	}
 	attachDataLanes(s, conn)
 	return s
@@ -106,6 +110,10 @@ func (s *peerSession) handleRPCRequest(id uint64, payload []byte) {
 	}
 	resp := rpcResponse{}
 	switch req.Op {
+	case "transfer_acquire":
+		resp = s.handleTransferAcquire(req)
+	case "transfer_release":
+		resp = s.handleTransferRelease(req)
 	case "pwd":
 		resp.OK = true
 		resp.Cwd = s.getServeCwd()
@@ -129,12 +137,23 @@ func (s *peerSession) handleRPCRequest(id uint64, payload []byte) {
 		resp.OK = true
 		resp.Cwd = next
 	case "get":
+		passiveLease := false
+		if !s.transferCoordinator {
+			s.notePassiveTransfer("GET", req.Path)
+			passiveLease = true
+		}
 		source, err := cleanExistingPath(s.getServeCwd(), req.Path)
 		if err != nil {
+			if passiveLease {
+				s.releasePassiveTransfer()
+			}
 			resp.Error = err.Error()
 			break
 		}
 		if _, _, _, err := buildEntries(source); err != nil {
+			if passiveLease {
+				s.releasePassiveTransfer()
+			}
 			resp.Error = err.Error()
 			break
 		}
@@ -146,8 +165,9 @@ func (s *peerSession) handleRPCRequest(id uint64, payload []byte) {
 			return
 		}
 		go func() {
-			if err := s.sendTransfer(source, "", id, false, tid); err != nil && !errors.Is(err, context.Canceled) {
-				consolePrintf("[REMOTE GET] 发送失败: %v\n", err)
+			_ = s.sendTransfer(source, "", id, false, tid)
+			if passiveLease {
+				s.releasePassiveTransfer()
 			}
 		}()
 		return
@@ -183,6 +203,10 @@ func (s *peerSession) callRPC(op, path string, timeout time.Duration) (rpcRespon
 }
 
 func (s *peerSession) callRPCWithID(id uint64, op, path string, timeout time.Duration) (rpcResponse, error) {
+	return s.callRPCRequest(id, rpcRequest{Op: op, Path: path}, timeout)
+}
+
+func (s *peerSession) callRPCRequest(id uint64, req rpcRequest, timeout time.Duration) (rpcResponse, error) {
 	var zero rpcResponse
 	ch := make(chan rpcResponse, 1)
 	s.pendingMu.Lock()
@@ -193,7 +217,7 @@ func (s *peerSession) callRPCWithID(id uint64, op, path string, timeout time.Dur
 		delete(s.pendingRPC, id)
 		s.pendingMu.Unlock()
 	}()
-	if err := s.writeJSONFrame(frameRPCRequest, id, rpcRequest{Op: op, Path: path}); err != nil {
+	if err := s.writeJSONFrame(frameRPCRequest, id, req); err != nil {
 		return zero, err
 	}
 	if timeout <= 0 {
@@ -211,7 +235,7 @@ func (s *peerSession) callRPCWithID(id uint64, op, path string, timeout time.Dur
 	case <-s.closed:
 		return zero, errors.New("connection closed")
 	case <-time.After(timeout):
-		return zero, fmt.Errorf("remote %s timeout", op)
+		return zero, fmt.Errorf("remote %s timeout", req.Op)
 	}
 }
 
@@ -248,6 +272,12 @@ func (s *peerSession) get(remotePath, localDest string) error {
 	if strings.TrimSpace(remotePath) == "" {
 		return errors.New("get 需要远端路径")
 	}
+	leaseID, err := s.acquireTransferLease("GET", remotePath)
+	if err != nil {
+		return err
+	}
+	defer s.releaseTransferLease(leaseID)
+
 	id := s.nextRequestID()
 	pg := &pendingGet{dest: localDest, done: make(chan error, 1)}
 	s.pendingMu.Lock()
@@ -400,7 +430,49 @@ func (s *peerSession) close(sendBye bool) {
 }
 
 func (s *peerSession) status() {
-	consolePrintf("角色: %s\n", s.roleName)
+	consolePrintln("=== Session Status ===")
+	consolePrintf("链路: %s\n", s.linkMode)
+	consolePrintln("传输栈: QUIC / UDP / TLS 1.3")
+	if p, ok := s.conn.(interface{ ConnectionInfo() quicConnectionInfo }); ok {
+		info := p.ConnectionInfo()
+		consolePrintf("QUIC 连接方式: %s\n", info.QUICRole)
+		consolePrintf("本机选中 UDP: %s\n", info.LocalUDP)
+		consolePrintf("对端选中 UDP: %s\n", info.RemoteUDP)
+		consolePrintf("对端 candidate: %s\n", info.RemoteCandidateType)
+		if info.QUICRole == "主动连接端" {
+			consolePrintf("主动连接源端口: %s\n", info.LocalUDP)
+		} else {
+			consolePrintf("当前监听/传输端口: %s\n", info.LocalUDP)
+		}
+		consolePrintln("UDP sockets:")
+		for _, ep := range info.Sockets {
+			consolePrintf("  - %s\n", formatSocketStatus(ep))
+		}
+		if len(info.STUNMappings) > 0 {
+			consolePrintln("本机 STUN 映射:")
+			for _, addr := range info.STUNMappings {
+				consolePrintf("  - %s\n", addr)
+			}
+		}
+		consolePrintf("QUIC streams: control=1, data=%d\n", info.Streams)
+		consolePrintln("端口关系: 连通性检查、NAT 打洞、QUIC 握手和文件传输复用选中的 UDP socket。")
+	} else {
+		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
+	}
+
+	lease := s.leaseSnapshot()
+	if lease.ID == 0 {
+		consolePrintln("传输任务: idle")
+	} else {
+		consolePrintf("传输任务: busy / %s / %s / %s / %s\n",
+			displayLeaseOwner(lease.Owner), lease.Kind, displayLeasePath(lease.Path), time.Since(lease.Since).Round(time.Second))
+	}
+	tuning := s.currentTuning()
+	if tuning.lanes > 0 {
+		consolePrintf("发送自适应: lanes=%d, chunk=%s, pacing=%s\n",
+			tuning.lanes, humanBytes(int64(tuning.chunkSize)), tuning.pace)
+	}
+
 	consolePrintf("本地目录: %s\n", s.getLocalCwd())
 	consolePrintf("对方看到的本机目录: %s\n", s.getServeCwd())
 	remote := s.getRemoteCwd()
@@ -409,9 +481,6 @@ func (s *peerSession) status() {
 	}
 	consolePrintf("远端目录: %s\n", remote)
 	consolePrintf("本机接收覆盖: %s\n", onOff(s.getOverwrite()))
-	consolePrintf("链路: %s\n", s.linkMode)
-	consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
-	consolePrintf("活动传输 ID: %v\n", s.debugActiveTransfers())
 }
 
 func onOff(v bool) string {

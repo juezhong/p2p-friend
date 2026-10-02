@@ -744,3 +744,80 @@ func TestInitPeerSessionStoresLinkMode(t *testing.T) {
 		t.Fatalf("prompt %q does not contain link mode %q", prompt, s.linkMode)
 	}
 }
+
+func TestSessionRejectsSecondConcurrentTransfer(t *testing.T) {
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+
+	large := bytes.Repeat([]byte("single-transfer-lease-"), 1024*512)
+	if err := os.WriteFile(filepath.Join(bLocal, "large.bin"), large, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bLocal, "second.bin"), []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, b := newSessionPair(t, aLocal, bLocal, 3*time.Millisecond)
+	defer a.close(false)
+	defer b.close(false)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- a.get("large.bin", "download.bin")
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if lease := a.leaseSnapshot(); lease.ID != 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if lease := a.leaseSnapshot(); lease.ID == 0 {
+		t.Fatal("first transfer never acquired the session lease")
+	}
+
+	err := b.put("second.bin", "should-not-start.bin")
+	if err == nil || !strings.Contains(err.Error(), "当前已有传输任务") {
+		t.Fatalf("second concurrent transfer error=%v, want busy rejection", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first transfer failed: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("first transfer did not finish")
+	}
+
+	if lease := a.leaseSnapshot(); lease.ID != 0 {
+		t.Fatalf("lease not released after transfer: %#v", lease)
+	}
+
+	if err := b.put("second.bin", "after.bin"); err != nil {
+		t.Fatalf("transfer after lease release failed: %v", err)
+	}
+}
+
+func TestSilentProgressProducesNoOutput(t *testing.T) {
+	var out bytes.Buffer
+	restore := setConsoleWriter(&out)
+	defer restore()
+
+	p := &progress{
+		Start: time.Now().Add(-time.Second),
+		LastPrint: time.Time{},
+		Done: 512,
+		Total: 1024,
+		Current: "file.bin",
+		Prefix: "[SEND]",
+		Silent: true,
+	}
+	p.print(false)
+	p.print(true)
+	p.closeLine()
+	if got := out.String(); got != "" {
+		t.Fatalf("silent progress wrote output: %q", got)
+	}
+}

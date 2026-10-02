@@ -22,6 +22,11 @@ func (s *peerSession) put(localPath, remoteDest string) error {
 	if err != nil {
 		return err
 	}
+	leaseID, err := s.acquireTransferLease("PUT", localPath)
+	if err != nil {
+		return err
+	}
+	defer s.releaseTransferLease(leaseID)
 	return s.sendTransfer(source, remoteDest, 0, true, 0)
 }
 
@@ -34,6 +39,9 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 		return err
 	}
 
+	if foreground {
+		consolePrintf("[PUT] %s -> %s (%s)\n", source, remoteDisplay(remoteDest), humanBytes(total))
+	}
 	hashes := make(map[string][]byte)
 	for _, e := range entries {
 		if e.IsDir {
@@ -44,7 +52,9 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 			return fmt.Errorf("hash %s: %w", e.FullPath, err)
 		}
 		hashes[e.RelPath] = sum
-		consolePrintf("[HASH] %s  SHA-256 %x\n", e.RelPath, sum)
+		if foreground {
+			consolePrintf("[PUT] SHA-256 %s  %x\n", e.RelPath, sum)
+		}
 	}
 
 	id := fixedID
@@ -82,12 +92,14 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 
 	prefix := "[PUT]"
 	if requestID != 0 {
-		prefix = "[REMOTE GET]"
-		consolePrintf("[REMOTE GET] 对方请求下载: %s (%s)\n", source, humanBytes(total))
-	} else {
-		consolePrintf("[PUT] %s -> %s (%s)\n", source, remoteDisplay(remoteDest), humanBytes(total))
+		prefix = "[SEND]"
 	}
-	p := &progress{Start: time.Now(), LastPrint: time.Now(), Total: total, Prefix: prefix}
+	p := &progress{
+		Start: time.Now(), LastPrint: time.Now(), Total: total,
+		Prefix: prefix, Silent: !foreground,
+	}
+	defer p.closeLine()
+	defer s.clearCurrentTuning()
 
 	for _, e := range entries {
 		if cause := context.Cause(ctx); cause != nil {
@@ -116,6 +128,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 			}
 			return fmt.Errorf("send %s: %w", e.RelPath, err)
 		}
+		p.print(true)
 		if err := s.writeFrame(frameEntryEnd, id, hashes[e.RelPath]); err != nil {
 			return fmt.Errorf("send checksum %s: %w", e.RelPath, err)
 		}
@@ -124,7 +137,6 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	if err := s.writeJSONFrame(frameTransferEnd, id, transferEnd{}); err != nil {
 		return fmt.Errorf("send transfer end: %w", err)
 	}
-	p.print(true)
 	return s.waitTransferResult(ot)
 }
 
@@ -171,17 +183,6 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		maxLanes = len(ds.lanes)
 	}
 	tuner := currentTransferTuner(maxLanes)
-	lastPrinted := transferTuningProfile{}
-
-	printTuning := func(profile transferTuningProfile) {
-		if profile == lastPrinted {
-			return
-		}
-		lastPrinted = profile
-		consolePrintf("[传输] 自适应发送: %d lane, chunk=%s, pacing=%s\n",
-			profile.lanes, humanBytes(int64(profile.chunkSize)), profile.pace)
-	}
-
 	nextOff := int64(0)
 	for nextOff < size {
 		select {
@@ -194,7 +195,7 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		if ds == nil || len(ds.lanes) == 0 {
 			profile.lanes = 1
 		}
-		printTuning(profile)
+		s.setCurrentTuning(profile)
 
 		type chunkJob struct {
 			lane int
@@ -245,10 +246,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 			}
 		}
 		elapsed := time.Since(start)
-		newProfile, changed := tuner.observe(elapsed, batchErr)
-		if changed {
-			printTuning(newProfile)
-		}
+		newProfile, _ := tuner.observe(elapsed, batchErr)
+		s.setCurrentTuning(newProfile)
 		if batchErr != nil {
 			return batchErr
 		}
@@ -356,16 +355,23 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 	}
 
 	root, err := resolveReceiveRoot(base, dest, meta.Name)
-	recvPrefix := "[REMOTE PUT]"
-	if meta.RequestID != 0 {
+	activeUI := meta.RequestID != 0
+	recvPrefix := "[RECV]"
+	if activeUI {
 		recvPrefix = "[GET]"
+	}
+	if !s.transferCoordinator && !activeUI {
+		s.notePassiveTransfer("PUT", meta.Name)
 	}
 	t := &inboundTransfer{
 		id:         id,
 		meta:       meta,
 		targetRoot: root,
-		progress:   &progress{Start: time.Now(), LastPrint: time.Now(), Total: meta.Total, Prefix: recvPrefix},
-		getReqID:   meta.RequestID,
+		progress: &progress{
+			Start: time.Now(), LastPrint: time.Now(), Total: meta.Total,
+			Prefix: recvPrefix, Silent: !activeUI,
+		},
+		getReqID: meta.RequestID,
 	}
 	if err != nil {
 		t.cancelled = true
@@ -392,8 +398,6 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 	}
 	if meta.RequestID != 0 {
 		consolePrintf("[GET] %s -> %s (%s)\n", meta.Name, root, humanBytes(meta.Total))
-	} else {
-		consolePrintf("[REMOTE PUT] 对方发送: %s -> %s (%s)\n", meta.Name, root, humanBytes(meta.Total))
 	}
 	return nil
 }
@@ -662,13 +666,18 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 		return nil
 	}
 	actual := h.Sum(nil)
+	t.progress.print(true)
 	if !equalBytes(actual, payload) {
-		consolePrintf("[VERIFY] %s  SHA-256 %x  FAIL（发送端 %x）\n", path, actual, payload)
+		if !t.progress.Silent {
+			consolePrintf("%s SHA-256 %x  FAIL（发送端 %x）\n", t.progress.Prefix, actual, payload)
+		}
 		t.markCancelledLocked("SHA-256 mismatch for " + path)
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	consolePrintf("[VERIFY] %s  SHA-256 %x  OK\n", path, actual)
+	if !t.progress.Silent {
+		consolePrintf("%s SHA-256 %x  OK\n", t.progress.Prefix, actual)
+	}
 
 	if err := f.Chmod(mode.Perm()); err != nil && runtime.GOOS != "windows" {
 		t.markCancelledLocked(err.Error())
@@ -742,9 +751,7 @@ func (s *peerSession) handleTransferEnd(id uint64, payload []byte) error {
 	cancelled := t.cancelled
 	reason := t.cancelWhy
 	overwrote := append([]string(nil), t.overwritten...)
-	if !cancelled {
-		t.progress.print(true)
-	}
+	t.progress.closeLine()
 	t.mu.Unlock()
 
 	res := transferResult{OK: !cancelled, Cancelled: cancelled, Error: reason}
@@ -770,16 +777,14 @@ func (s *peerSession) handleTransferEnd(id uint64, payload []byte) error {
 	}
 	s.clearForeground("recv", id)
 
-	if cancelled {
-		consolePrintf("%s 已取消: %s\n", t.progress.Prefix, reason)
-		if len(overwrote) > 0 {
-			consolePrintf("%s 注意：overwrite on 时已完成覆盖的文件无法自动恢复：\n", t.progress.Prefix)
-			for _, p := range overwrote {
-				consolePrintf("  %s\n", p)
-			}
+	if !s.transferCoordinator && t.getReqID == 0 {
+		s.releasePassiveTransfer()
+	}
+	if !t.progress.Silent && cancelled && len(overwrote) > 0 {
+		consolePrintf("%s 注意：overwrite on 时已完成覆盖的文件无法自动恢复：\n", t.progress.Prefix)
+		for _, p := range overwrote {
+			consolePrintf("  %s\n", p)
 		}
-	} else {
-		consolePrintf("%s 完成。\n", t.progress.Prefix)
 	}
 	return nil
 }

@@ -20,10 +20,10 @@ import (
 )
 
 const (
-	signalVersion = 8
+	signalVersion = 9
 	signalPrefix  = "P2PF-"
-	quicALPN      = "p2p-friend/8"
-	punchMagic    = "P2PF8PUNCH"
+	quicALPN      = "p2p-friend/9"
+	punchMagic    = "P2PF9PUNCH"
 )
 
 type signalCandidate struct {
@@ -51,6 +51,9 @@ type rtcPeer struct {
 	fingerprint []byte
 	cert        tls.Certificate
 	endpoints   []*udpEndpoint
+
+	localMu sync.RWMutex
+	local   []signalCandidate
 
 	remoteMu sync.RWMutex
 	remote   []signalCandidate
@@ -88,6 +91,7 @@ func (c *rtcConn) SetReadDeadline(t time.Time) error  { return c.control.SetRead
 func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.control.SetWriteDeadline(t) }
 func (c *rtcConn) SetDeadline(t time.Time) error      { return c.control.SetDeadline(t) }
 func (c *rtcConn) DataLanes() []io.ReadWriteCloser    { return c.lanes }
+func (c *rtcConn) TransferCoordinator() bool            { return c.peer.server }
 func (c *rtcConn) LinkMode() string {
 	return classifyQUICLink(c.qc, c.peer.remoteCandidates())
 }
@@ -103,6 +107,18 @@ func (c *rtcConn) Close() error {
 		_ = c.peer.Close()
 	})
 	return err
+}
+
+func (p *rtcPeer) setLocalCandidates(cands []signalCandidate) {
+	p.localMu.Lock()
+	p.local = append([]signalCandidate(nil), cands...)
+	p.localMu.Unlock()
+}
+
+func (p *rtcPeer) localCandidates() []signalCandidate {
+	p.localMu.RLock()
+	defer p.localMu.RUnlock()
+	return append([]signalCandidate(nil), p.local...)
 }
 
 func (p *rtcPeer) setRemoteCandidates(cands []signalCandidate) {
