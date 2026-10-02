@@ -149,7 +149,7 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 }
 
 func connectionTimeoutError() error {
-	return errors.New("P2P UDP/QUIC 连接超时；如果持续失败，可以交换“发起连接 / 加入连接”角色后重试")
+	return errors.New("P2P UDP/QUIC 连接超时；如果持续失败，可以交换“创建连接 / 加入连接”角色后重试")
 }
 
 func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
