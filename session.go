@@ -14,7 +14,7 @@ import (
 )
 
 func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
-	coordinator := roleName == "发起方" || roleName == "HOST" || roleName == "A"
+	coordinator := roleName == "创建方" || roleName == "发起方" || roleName == "HOST" || roleName == "A"
 	if p, ok := conn.(interface{ TransferCoordinator() bool }); ok {
 		coordinator = p.TransferCoordinator()
 	}
