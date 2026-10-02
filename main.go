@@ -57,7 +57,7 @@ func printHelp() {
   * 连接码和确认码统一使用 P2PF-... 前缀，协议版本和类型在码内部。
   * 发起方生成连接码后立即开始等待 QUIC 连接，不会等确认码粘贴后才监听。
   * IPv4 NAT 场景仍需要确认码把加入方的 STUN/NAT candidate 返回给发起方。
-  * 不使用 TURN/relay；最终连接失败时会提示交换发起/加入角色重试。
+  * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。\n  * 不使用 TURN/relay；最终连接失败时会提示交换发起/加入角色重试。
 `, appVersion)
 }
 
@@ -119,7 +119,6 @@ func runHost(in *bufio.Reader, cwd string) error {
 	}()
 
 	consolePrintf("\n[发起连接] 初始目录: %s\n", cwd)
-	consolePrintln("[发起连接] 已开始等待对端 QUIC 握手。")
 	consolePrintln("")
 	consolePrintln("把下面的连接码发给对方：")
 	consolePrintln(code)
@@ -139,7 +138,6 @@ func runHost(in *bufio.Reader, cwd string) error {
 		_ = peer.Close()
 		return err
 	}
-	consolePrintln("已收到确认码，等待 P2P 链路完成...")
 
 	res := <-acceptCh
 	if res.err != nil {
@@ -173,7 +171,6 @@ func runJoin(in *bufio.Reader, cwd string) error {
 	consolePrintln("把下面的确认码发回发起方：")
 	consolePrintln(confirm)
 	consolePrintln("")
-	consolePrintln("正在等待对端就绪并建立 P2P 链路...")
 	conn, err := peer.waitConn()
 	if err != nil {
 		_ = peer.Close()
@@ -426,7 +423,7 @@ Windows 的 D:\... 路径和 Linux 的 /home/... 路径都会按远端系统风�
 
 其他：
   overwrite on|off            是否允许覆盖本机已有接收文件（默认 off）
-  status                      显示连接和目录状态
+  status                      显示 QUIC/UDP 端口、链路、传输状态和目录
   help                        显示帮助
   quit / exit                 断开并退出
 
