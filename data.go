@@ -204,7 +204,7 @@ func currentTransferTuner(maxLanes int) *adaptiveTransferTuner {
 
 // dataLaneProvider 把 QUIC connection 上预先建立的多条 data stream 暴露给会话。
 // control stream 仍由 peerSession.conn 使用；这里只处理带 transferID/offset 的
- // 文件块，从而允许单文件按 offset 并行发送。
+// 文件块，从而允许单文件按 offset 并行发送。
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
 }
