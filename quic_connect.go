@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,73 +16,115 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
-const connectionWaitTimeout = 5 * time.Minute
+const (
+	connectionWaitTimeout = 5 * time.Minute
+	punchClockSkew        = 2 * time.Minute
+	punchRetryInterval    = 250 * time.Millisecond
+	pathPreferenceWindow  = 600 * time.Millisecond
+)
 
-// acceptQUIC 由创建方执行。创建方在每个可用 UDP family 上监听 QUIC，同时仍会
-// 主动发送 UDP 探测包，因此“QUIC 监听端”并不等于网络层完全被动。
-func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
+type quicConnectResult struct {
+	conn     net.Conn
+	err      error
+	outbound bool
+}
+
+// connectQUIC 是 v12 的默认建链入口。双方都先启动 QUIC listener，再同时对远端
+// candidates 拨号。创建方优先保留 inbound，加入方优先保留 outbound，从而在两条
+// 方向同时成功时稳定选中同一条 connection；首选方向不可达时短暂等待后使用反向路径。
+func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
 
-	acceptCh := make(chan *quic.Conn, 8)
-	var wg sync.WaitGroup
-	started := 0
-	for _, ep := range p.endpoints {
-		ln, err := ep.transport.Listen(p.serverTLSConfig(), quicConfig())
-		if err != nil {
-			continue
-		}
-		ep.listener = ln
-		started++
-		wg.Add(1)
-		go func(ln *quic.Listener) {
-			defer wg.Done()
-			for {
-				qc, err := ln.Accept(ctx)
-				if err != nil {
-					return
-				}
-				select {
-				case acceptCh <- qc:
-				case <-ctx.Done():
-					_ = qc.CloseWithError(0, "cancelled")
-					return
-				}
-			}
-		}(ln)
-		// IPv4 用于 NAT 打洞；IPv6 用同样的双向 UDP 探测打开有状态防火墙。
-		go punchLoop(ctx, p, ep.transport, ep.family)
-	}
-	if started == 0 {
+	results := make(chan quicConnectResult, 16)
+	startedListeners := p.startAcceptWorkers(ctx, results)
+	if startedListeners == 0 {
 		return nil, errors.New("无法启动 QUIC UDP listener")
 	}
 
-	done := make(chan struct{})
+	for _, ep := range p.endpoints {
+		go punchLoop(ctx, p, ep.transport, ep.family)
+		go punchReadLoop(ctx, p, ep.transport, ep.family)
+	}
 	go func() {
-		wg.Wait()
-		close(done)
+		conn, err := p.dialQUICContext(ctx)
+		select {
+		case results <- quicConnectResult{conn: conn, err: err, outbound: true}:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
 	}()
 
+	preferOutbound := !p.server
+	var fallback net.Conn
+	var fallbackTimer <-chan time.Time
+	var lastErr error
+
+	for {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				lastErr = res.err
+				continue
+			}
+			if res.conn == nil {
+				continue
+			}
+			preferred := res.outbound == preferOutbound
+			if preferred {
+				if fallback != nil {
+					_ = fallback.Close()
+				}
+				cancel()
+				return res.conn, nil
+			}
+			if fallback == nil {
+				fallback = res.conn
+				fallbackTimer = time.After(pathPreferenceWindow)
+			} else {
+				_ = res.conn.Close()
+			}
+		case <-fallbackTimer:
+			if fallback != nil {
+				cancel()
+				return fallback, nil
+			}
+		case <-ctx.Done():
+			if fallback != nil {
+				return fallback, nil
+			}
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w；最后一次候选错误: %v", connectionTimeoutError(), lastErr)
+			}
+			return nil, connectionTimeoutError()
+		}
+	}
+}
+
+// acceptQUIC 保留给测试/兼容调用：只监听，不发起 QUIC Dial，但仍执行安全 punch。
+func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
+	defer cancel()
+	results := make(chan quicConnectResult, 16)
+	if p.startAcceptWorkers(ctx, results) == 0 {
+		return nil, errors.New("无法启动 QUIC UDP listener")
+	}
+	for _, ep := range p.endpoints {
+		go punchLoop(ctx, p, ep.transport, ep.family)
+		go punchReadLoop(ctx, p, ep.transport, ep.family)
+	}
 	var lastErr error
 	for {
 		select {
-		case qc := <-acceptCh:
-			conn, err := establishStreams(qc, p, true)
-			if err == nil {
-				cancel()
-				return conn, nil
+		case res := <-results:
+			if res.err == nil && res.conn != nil {
+				return res.conn, nil
 			}
-			lastErr = err
-			_ = qc.CloseWithError(0, "candidate rejected")
-			// 多个 candidate 会并行竞争。监听端可能先 Accept 到一条随后被拨号端
-			// 放弃的连接（另一条路径已经获胜），因此必须继续 Accept，直到应用
-			// control/data stream 也完整建立。
-			continue
-		case <-done:
-			if lastErr != nil {
-				return nil, fmt.Errorf("QUIC listener 已停止，候选连接均未完成: %w", lastErr)
+			if res.err != nil {
+				lastErr = res.err
 			}
-			return nil, errors.New("QUIC listener 已停止，未建立连接")
 		case <-ctx.Done():
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w；最后一次候选错误: %v", connectionTimeoutError(), lastErr)
@@ -88,58 +134,103 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 	}
 }
 
-// dialQUIC 由加入方执行。它会对双方交换得到的所有匹配 candidate 发起并行尝试，
-// 但给公网 IPv6 一个短暂优先窗口；IPv6 不通时 IPv4 会自动继续竞争。
+func (p *rtcPeer) startAcceptWorkers(ctx context.Context, results chan<- quicConnectResult) int {
+	started := 0
+	for _, ep := range p.endpoints {
+		ln, err := ep.transport.Listen(p.serverTLSConfig(), quicConfig())
+		if err != nil {
+			continue
+		}
+		ep.listener = ln
+		started++
+		go func(ln *quic.Listener) {
+			for {
+				qc, err := ln.Accept(ctx)
+				if err != nil {
+					return
+				}
+				go func(qc *quic.Conn) {
+					conn, err := establishStreams(qc, p, false)
+					if err != nil {
+						_ = qc.CloseWithError(0, "candidate rejected")
+					}
+					select {
+					case results <- quicConnectResult{conn: conn, err: err, outbound: false}:
+					case <-ctx.Done():
+						if conn != nil {
+							_ = conn.Close()
+						}
+					}
+				}(qc)
+			}
+		}(ln)
+	}
+	return started
+}
+
+// dialQUIC 保留为主动连接入口；v12 默认使用 connectQUIC。
 func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
+	for _, ep := range p.endpoints {
+		go punchLoop(ctx, p, ep.transport, ep.family)
+		go punchReadLoop(ctx, p, ep.transport, ep.family)
+	}
+	return p.dialQUICContext(ctx)
+}
 
+// dialQUICContext 每一轮都重新读取 remoteCandidates，因此运行时从安全 punch
+// 学到的 prflx endpoint 会立即进入下一轮，而不是像旧实现一样固定初始 targets。
+func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 	type target struct {
 		ep   *udpEndpoint
 		addr *net.UDPAddr
 		rank int
-	}
-	var targets []target
-	for _, ep := range p.endpoints {
-		// IPv4 用于 NAT 打洞；IPv6 用同样的双向 UDP 探测打开有状态防火墙。
-		go punchLoop(ctx, p, ep.transport, ep.family)
-		for _, raw := range p.remoteCandidates() {
-			addr, family, err := parseCandidate(raw)
-			if err != nil || family != ep.family {
-				continue
-			}
-			targets = append(targets, target{ep: ep, addr: addr, rank: candidateRank(raw)})
-		}
-	}
-	if len(targets) == 0 {
-		return nil, errors.New("连接码中没有与本机 UDP socket 匹配的候选地址")
+		key  string
 	}
 
-	// 长生命周期连接管理器：等待远端真正出现，而不是把一次 candidate
-	// 握手失败当成最终结果。远端开始监听后，下一次握手会立即成功返回。
 	for {
 		if ctx.Err() != nil {
 			return nil, connectionTimeoutError()
+		}
+		var targets []target
+		seen := map[string]struct{}{}
+		preferGlobalIPv6 := false
+		for _, ep := range p.endpoints {
+			for _, raw := range p.remoteCandidates() {
+				addr, family, err := parseCandidate(raw)
+				if err != nil || family != ep.family {
+					continue
+				}
+				key := fmt.Sprintf("%d|%s", family, addr.String())
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				rank := candidateRank(raw)
+				if rank == 0 {
+					preferGlobalIPv6 = true
+				}
+				targets = append(targets, target{ep: ep, addr: addr, rank: rank, key: key})
+			}
+		}
+		if len(targets) == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, connectionTimeoutError()
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
 		}
 
 		result := make(chan *quic.Conn, 1)
 		roundCtx, stopRound := context.WithCancel(ctx)
 		var wg sync.WaitGroup
 		var winOnce sync.Once
-		preferGlobalIPv6 := false
-		for _, t := range targets {
-			if t.rank == 0 {
-				preferGlobalIPv6 = true
-				break
-			}
-		}
 		for _, t := range targets {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				// 此时双方已经完整交换 candidate。公网 IPv6 获得 250ms 优先窗口，
-				// 让双栈环境尽量选择 IPv6；IPv6 被过滤或不可达时，IPv4 仍会自动
-				// 进入竞争，不需要再次交换识别码。
 				if preferGlobalIPv6 && t.rank != 0 {
 					select {
 					case <-roundCtx.Done():
@@ -147,7 +238,7 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 					case <-time.After(250 * time.Millisecond):
 					}
 				}
-				dialCtx, stop := context.WithTimeout(roundCtx, 6*time.Second)
+				dialCtx, stop := context.WithTimeout(roundCtx, 4*time.Second)
 				defer stop()
 				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
 				if err != nil {
@@ -174,7 +265,17 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 		select {
 		case qc := <-result:
 			stopRound()
-			return establishStreams(qc, p, false)
+			conn, err := establishStreams(qc, p, true)
+			if err != nil {
+				_ = qc.CloseWithError(0, "stream setup failed")
+				select {
+				case <-ctx.Done():
+					return nil, connectionTimeoutError()
+				case <-time.After(120 * time.Millisecond):
+					continue
+				}
+			}
+			return conn, nil
 		case <-ctx.Done():
 			stopRound()
 			return nil, connectionTimeoutError()
@@ -183,36 +284,147 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			select {
 			case <-ctx.Done():
 				return nil, connectionTimeoutError()
-			case <-time.After(350 * time.Millisecond):
+			case <-time.After(180 * time.Millisecond):
 			}
 		}
 	}
 }
 
 func connectionTimeoutError() error {
-	return errors.New("P2P UDP/QUIC 连接超时；如果持续失败，可以交换“创建连接 / 加入连接”角色后重试")
+	return errors.New("P2P UDP/QUIC 连接超时；当前网络的 NAT/防火墙没有形成可用直连路径")
 }
 
-// punchLoop 只负责 UDP 可达性探测，不承载文件数据，也不替代 QUIC 握手。
-// IPv4 侧用于建立/刷新 NAT 映射与过滤状态；IPv6 侧没有 NAT 映射，主要用于
-// 尽量打开 stateful firewall 的返回流量状态。
-func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
-	payload := append([]byte{0x00}, []byte(punchMagic)...)
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
+// punch packet:
+// 0x00 | magic | role(1) | unixSeconds(8) | nonce(8) | HMAC-SHA256[:16]
+// HMAC key 是本次 INVITE/REPLY 的 256-bit session token。
+func buildPunchPacket(p *rtcPeer) ([]byte, error) {
+	if len(p.token) != 32 {
+		return nil, errors.New("invalid punch token")
+	}
+	role := roleJoin
+	if p.server {
+		role = roleHost
+	}
+	prefixLen := 1 + len(punchMagic) + 1 + 8 + 8
+	buf := make([]byte, prefixLen+16)
+	buf[0] = 0
+	copy(buf[1:], punchMagic)
+	pos := 1 + len(punchMagic)
+	buf[pos] = role
+	pos++
+	binary.BigEndian.PutUint64(buf[pos:pos+8], uint64(time.Now().Unix()))
+	pos += 8
+	if _, err := rand.Read(buf[pos : pos+8]); err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, p.token)
+	_, _ = mac.Write(buf[:prefixLen])
+	copy(buf[prefixLen:], mac.Sum(nil)[:16])
+	return buf, nil
+}
 
+func (p *rtcPeer) verifyPunchPacket(buf []byte) bool {
+	prefixLen := 1 + len(punchMagic) + 1 + 8 + 8
+	if len(buf) != prefixLen+16 || buf[0] != 0 || string(buf[1:1+len(punchMagic)]) != punchMagic {
+		return false
+	}
+	if len(p.token) != 32 {
+		return false
+	}
+	pos := 1 + len(punchMagic)
+	remoteRole := buf[pos]
+	localRole := roleJoin
+	if p.server {
+		localRole = roleHost
+	}
+	if (remoteRole != roleHost && remoteRole != roleJoin) || remoteRole == localRole {
+		return false
+	}
+	pos++
+	ts := int64(binary.BigEndian.Uint64(buf[pos : pos+8]))
+	now := time.Now()
+	when := time.Unix(ts, 0)
+	if when.Before(now.Add(-punchClockSkew)) || when.After(now.Add(punchClockSkew)) {
+		return false
+	}
+	pos += 8
+	var nonce [8]byte
+	copy(nonce[:], buf[pos:pos+8])
+
+	mac := hmac.New(sha256.New, p.token)
+	_, _ = mac.Write(buf[:prefixLen])
+	if !hmac.Equal(buf[prefixLen:], mac.Sum(nil)[:16]) {
+		return false
+	}
+
+	p.punchSeenMu.Lock()
+	defer p.punchSeenMu.Unlock()
+	if p.punchSeen == nil {
+		p.punchSeen = make(map[[8]byte]time.Time)
+	}
+	for n, expiry := range p.punchSeen {
+		if now.After(expiry) {
+			delete(p.punchSeen, n)
+		}
+	}
+	if _, replay := p.punchSeen[nonce]; replay {
+		return false
+	}
+	p.punchSeen[nonce] = now.Add(punchClockSkew)
+	return true
+}
+
+// punchLoop 负责持续建立/刷新 NAT 和 stateful firewall 状态，不承载文件数据。
+func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
+	ticker := time.NewTicker(punchRetryInterval)
+	defer ticker.Stop()
 	for {
-		for _, raw := range p.remoteCandidates() {
-			addr, fam, err := parseCandidate(raw)
-			if err != nil || fam != family {
-				continue
+		payload, err := buildPunchPacket(p)
+		if err == nil {
+			for _, raw := range p.remoteCandidates() {
+				addr, fam, err := parseCandidate(raw)
+				if err != nil || fam != family {
+					continue
+				}
+				_, _ = tr.WriteTo(payload, addr)
 			}
-			_, _ = tr.WriteTo(payload, addr)
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+	}
+}
+
+// punchReadLoop 读取 quic-go 从同一 UDP socket 分流出的非 QUIC 包。
+// 只有通过 token/HMAC、角色、时间窗、nonce 重放检查的 probe 才能生成 prflx candidate。
+func punchReadLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
+	buf := make([]byte, 512)
+	for {
+		n, addr, err := tr.ReadNonQUICPacket(ctx, buf)
+		if err != nil {
+			return
+		}
+		if !p.verifyPunchPacket(buf[:n]) {
+			continue
+		}
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok || udpAddr == nil || udpAddr.IP == nil || udpAddr.IP.IsUnspecified() || udpAddr.IP.IsLoopback() {
+			continue
+		}
+		if family == 4 && udpAddr.IP.To4() == nil {
+			continue
+		}
+		if family == 6 && udpAddr.IP.To4() != nil {
+			continue
+		}
+		cand := signalCandidate{Addr: udpAddr.String(), Type: "prflx"}
+		if p.addRemoteCandidate(cand) {
+			// 立即向观察到的真实 endpoint 回探测，加快双方建立对称状态。
+			if reply, err := buildPunchPacket(p); err == nil {
+				_, _ = tr.WriteTo(reply, udpAddr)
+			}
 		}
 	}
 }
@@ -275,5 +487,5 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			lanes = append(lanes, &quicStreamConn{st})
 		}
 	}
-	return &rtcConn{control: control, lanes: lanes, qc: qc, peer: p}, nil
+	return &rtcConn{control: control, lanes: lanes, qc: qc, peer: p, outbound: opener}, nil
 }

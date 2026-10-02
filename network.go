@@ -67,3 +67,11 @@ func authenticateListener(conn net.Conn, token []byte, localRole byte) error {
 	}
 	return nil
 }
+
+
+func authenticatePeerConn(conn net.Conn, token []byte, localRole byte) error {
+	if q, ok := conn.(interface{ QUICOutbound() bool }); ok && q.QUICOutbound() {
+		return authenticateDialer(conn, token, localRole)
+	}
+	return authenticateListener(conn, token, localRole)
+}

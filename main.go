@@ -56,10 +56,11 @@ func printHelp() {
 说明：
   * 连接流程固定交换两类短识别码：P2PF-INVITE-... 邀请码和 P2PF-REPLY-... 回传码。
   * 两个识别码都交换完成后才开始真实 QUIC 建连，不再使用“先试几秒再决定是否需要回传码”的启发式流程。
-  * 双方拿齐 candidate 后优先 IPv6；双方都会主动发送 IPv6 UDP 探测以打开有状态防火墙，仍不可达时自动回退 IPv4 / NAT 打洞。
+  * 双方拿齐 candidate 后会同时 QUIC Listen + Dial；公网 IPv6、显式端口映射和 IPv4 NAT 打洞会自动竞争。
+  * UDP punch 包带会话 HMAC、时间戳和 nonce；合法探测到达后可学习真实 peer-reflexive 地址。
+  * IPv4 会使用多个 STUN endpoint 判断公网映射是否稳定，并尝试 PCP / NAT-PMP / UPnP 显式端口映射。
   * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。
-  * IPv6 不做 NAT 映射，只做双向 UDP 防火墙探测；STUN 只用于预先准备 IPv4 失败回退候选。
-  * 不使用 TURN/relay；最终连接失败时会提示交换创建/加入角色重试。
+  * 不使用 TURN/relay；业务数据始终直接在两个端点之间传输。
 `, appVersion)
 }
 
@@ -137,14 +138,14 @@ func runHost(in *bufio.Reader, cwd string) error {
 
 	consolePrintln("识别码交换完成，正在建立 P2P 连接...")
 	token := append([]byte(nil), peer.token...)
-	// 创建方负责 QUIC Listen；双方仍会主动发 UDP 探测，因此 NAT/IPv6 防火墙
-	// 穿透能力不取决于谁是 QUIC client/server。
-	conn, err := peer.acceptQUIC()
+	// v12 双方都会同时 Listen + Dial；创建/加入身份只用于传输仲裁和路径决胜，
+	// 不再决定谁必须充当 QUIC client/server。
+	conn, err := peer.connectQUIC()
 	if err != nil {
 		return err
 	}
 	peer = nil // 从这里开始由 rtcConn 接管 peer 及底层 UDP/QUIC 资源。
-	if err := authenticateListener(conn, token, roleHost); err != nil {
+	if err := authenticatePeerConn(conn, token, roleHost); err != nil {
 		_ = conn.Close()
 		return err
 	}
@@ -178,14 +179,13 @@ func runJoin(in *bufio.Reader, cwd string) error {
 	consolePrintln(replyCode)
 	consolePrintln("发送后程序会静默等待创建方粘贴回传码并开始建连。")
 
-	// 加入方作为 QUIC Dialer。这个角色只影响连接握手方向，不限制后续 put/get
-	// 的数据方向；QUIC 建立后双方都可以发送和接收文件。
+	// 加入方同样同时 Listen + Dial；最终由双方一致的方向偏好选择同一条直连路径。
 	conn, err := peer.waitConn()
 	if err != nil {
 		return err
 	}
 	peer = nil // rtcConn owns peer resources from here.
-	if err := authenticateDialer(conn, token, roleJoin); err != nil {
+	if err := authenticatePeerConn(conn, token, roleJoin); err != nil {
 		_ = conn.Close()
 		return err
 	}

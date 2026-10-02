@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,24 +20,28 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
-// newPeer 为 IPv4/IPv6 各打开一个 UDP socket。后续 candidate 收集、STUN、
-// 防火墙/NAT 探测、QUIC 握手和文件传输都复用这些 socket，避免端口变化导致
-// NAT 映射或防火墙状态失效。
+// newPeer 为 IPv4/IPv6 各打开一个 UDP socket。STUN、端口映射、punch、QUIC
+// 握手和文件传输尽量复用同一个本地 UDP 端口，避免 NAT 映射在建链过程中变化。
 func newPeer(server bool) (*rtcPeer, error) {
 	token, err := newToken()
 	if err != nil {
 		return nil, err
 	}
-	p := &rtcPeer{token: token, server: server}
+	cert, der, err := generateQUICCertificate()
+	if err != nil {
+		return nil, err
+	}
+	p := &rtcPeer{token: token, server: server, cert: cert}
+	sum := sha256.Sum256(der)
+	p.localFingerprint = append([]byte(nil), sum[:]...)
 	if server {
-		cert, der, err := generateQUICCertificate()
-		if err != nil {
-			return nil, err
-		}
-		p.cert = cert
-		sum := sha256.Sum256(der)
+		// 保留旧测试辅助路径的语义。
 		p.fingerprint = append([]byte(nil), sum[:]...)
 	}
+	if _, err := rand.Read(p.punchNonce[:]); err != nil {
+		return nil, err
+	}
+
 	for _, network := range []string{"udp6", "udp4"} {
 		conn, err := net.ListenUDP(network, &net.UDPAddr{Port: 0})
 		if err != nil {
@@ -61,6 +66,13 @@ func newPeer(server bool) (*rtcPeer, error) {
 func (p *rtcPeer) Close() error {
 	var first error
 	p.closeOnce.Do(func() {
+		p.cleanupMu.Lock()
+		cleanups := append([]func(){}, p.cleanups...)
+		p.cleanups = nil
+		p.cleanupMu.Unlock()
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
 		for _, ep := range p.endpoints {
 			if ep.listener != nil {
 				_ = ep.listener.Close()
@@ -70,8 +82,6 @@ func (p *rtcPeer) Close() error {
 					first = err
 				}
 			}
-			// quic.Transport / Listener 与底层 UDPConn 生命周期并不完全等价；
-			// 这里显式关闭自己创建的 socket，确保正常退出后端口立即释放。
 			if ep.conn != nil {
 				if err := ep.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && first == nil {
 					first = err
@@ -87,7 +97,7 @@ func createConnectionCode() (*rtcPeer, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	cands := gatherCandidates(p.endpoints)
+	cands := gatherCandidates(p)
 	p.setLocalCandidates(cands)
 	if len(cands) == 0 {
 		_ = p.Close()
@@ -98,7 +108,7 @@ func createConnectionCode() (*rtcPeer, string, error) {
 		Kind:        "connect",
 		Token:       base64.RawURLEncoding.EncodeToString(p.token),
 		Candidates:  cands,
-		Fingerprint: hex.EncodeToString(p.fingerprint),
+		Fingerprint: hex.EncodeToString(p.localFingerprint),
 	})
 	if err != nil {
 		_ = p.Close()
@@ -120,24 +130,28 @@ func createJoinConfirmation(rawCode string) (*rtcPeer, string, []byte, error) {
 	if err != nil || len(fp) != 32 {
 		return nil, "", nil, errors.New("连接码中的 QUIC 证书指纹无效")
 	}
+
 	p, err := newPeer(false)
 	if err != nil {
 		return nil, "", nil, err
 	}
-	p.token = token
-	p.fingerprint = fp
+	p.token = append([]byte(nil), token...)
+	p.remoteFingerprint = append([]byte(nil), fp...)
+	p.fingerprint = append([]byte(nil), fp...)
 	p.setRemoteCandidates(code.Candidates)
-	cands := gatherCandidates(p.endpoints)
+
+	cands := gatherCandidates(p)
 	p.setLocalCandidates(cands)
 	if len(cands) == 0 {
 		_ = p.Close()
 		return nil, "", nil, errors.New("没有可用 UDP candidate")
 	}
 	confirm, err := encodeSignal(signalCode{
-		Version:    signalVersion,
-		Kind:       "confirm",
-		Token:      code.Token,
-		Candidates: cands,
+		Version:     signalVersion,
+		Kind:        "confirm",
+		Token:       code.Token,
+		Candidates:  cands,
+		Fingerprint: hex.EncodeToString(p.localFingerprint),
 	})
 	if err != nil {
 		_ = p.Close()
@@ -155,19 +169,27 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 	if err != nil || !equalBytes(token, p.token) {
 		return errors.New("确认码与当前连接不匹配")
 	}
+	fp, err := hex.DecodeString(code.Fingerprint)
+	if err != nil || len(fp) != 32 {
+		return errors.New("回传码中的 QUIC 证书指纹无效")
+	}
+	p.remoteFingerprint = append([]byte(nil), fp...)
 	p.setRemoteCandidates(code.Candidates)
 	return nil
 }
 
-func (p *rtcPeer) waitConn() (net.Conn, error) { return p.dialQUIC() }
+func (p *rtcPeer) waitConn() (net.Conn, error) { return p.connectQUIC() }
 
-// gatherCandidates 收集可直接使用的 host candidate；IPv4 额外通过 STUN 获取
-// srflx（NAT 映射）candidate。IPv6 不做 NAT 映射发现，公网 IPv6 直接作为 host
-// candidate，遇到有状态防火墙时由双方主动 UDP 探测尽量打开返回流量状态。
-func gatherCandidates(endpoints []*udpEndpoint) []signalCandidate {
+// gatherCandidates 收集 host、多个 STUN srflx 和可用的显式端口映射。
+// 端口映射是可选增强；失败时不会阻止 STUN/直连候选继续工作。
+func gatherCandidates(p *rtcPeer) []signalCandidate {
 	set := map[string]signalCandidate{}
 	ifaces, _ := net.Interfaces()
-	for _, ep := range endpoints {
+	var observations []string
+	behavior := "unknown"
+	var mappings []string
+
+	for _, ep := range p.endpoints {
 		port := ep.conn.LocalAddr().(*net.UDPAddr).Port
 		for _, iface := range ifaces {
 			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
@@ -195,17 +217,43 @@ func gatherCandidates(endpoints []*udpEndpoint) []signalCandidate {
 				set["host|"+addr] = signalCandidate{Addr: addr, Type: "host"}
 			}
 		}
-		if ep.family == 4 {
-			if addr, err := stunMappedAddress(ep.conn); err == nil {
-				key := "srflx|" + addr.String()
-				set[key] = signalCandidate{Addr: addr.String(), Type: "srflx"}
+		if ep.family != 4 {
+			continue
+		}
+
+		mapped := stunMappedAddresses(ep.conn)
+		if len(mapped) > 0 {
+			unique := map[string]struct{}{}
+			for _, a := range mapped {
+				s := a.String()
+				unique[s] = struct{}{}
+				observations = append(observations, s)
+				set["srflx|"+s] = signalCandidate{Addr: s, Type: "srflx"}
+			}
+			if len(unique) == 1 {
+				behavior = "stable"
+			} else {
+				behavior = "endpoint-dependent"
 			}
 		}
+
+		if cand, cleanup, method, err := discoverPortMapping(ep); err == nil && cand.Addr != "" {
+			set["portmap|"+cand.Addr] = cand
+			mappings = append(mappings, method+" "+cand.Addr)
+			p.addCleanup(cleanup)
+		}
 	}
+
 	out := make([]signalCandidate, 0, len(set))
 	for _, c := range set {
 		out = append(out, c)
 	}
+	sortCandidates(out)
+	p.setNetworkInfo(behavior, observations, mappings)
+	return out
+}
+
+func sortCandidates(out []signalCandidate) {
 	sort.Slice(out, func(i, j int) bool {
 		ri := candidateRank(out[i])
 		rj := candidateRank(out[j])
@@ -214,7 +262,6 @@ func gatherCandidates(endpoints []*udpEndpoint) []signalCandidate {
 		}
 		return out[i].Addr < out[j].Addr
 	})
-	return out
 }
 
 func candidateRank(c signalCandidate) int {
@@ -229,26 +276,43 @@ func candidateRank(c signalCandidate) int {
 	if ip.To4() == nil && !ip.IsPrivate() {
 		return 0
 	}
-	if c.Type == "srflx" {
+	if strings.EqualFold(c.Type, "portmap") {
 		return 1
 	}
-	if ip.To4() != nil && !ip.IsPrivate() {
+	// 同一个公网 endpoint 同时以 host/srflx 出现时，host 代表无需 NAT 映射的
+	// 直接可达地址，应优先于反射/运行时发现候选。
+	if ip.To4() != nil && !ip.IsPrivate() && strings.EqualFold(c.Type, "host") {
 		return 2
 	}
-	if ip.To4() == nil {
+	switch strings.ToLower(c.Type) {
+	case "prflx":
 		return 3
+	case "srflx":
+		return 4
 	}
-	return 4
+	if ip.To4() == nil {
+		return 5
+	}
+	return 6
 }
 
-func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
-	for _, server := range []string{"stun.cloudflare.com:3478", "stun.l.google.com:19302"} {
+// stunMappedAddresses 对同一个 UDP socket 查询多个 STUN endpoint。
+// 如果不同目标看到不同公网端口，说明单个 srflx 不能代表所有目标的真实映射。
+func stunMappedAddresses(conn *net.UDPConn) []*net.UDPAddr {
+	servers := []string{
+		"stun.cloudflare.com:3478",
+		"stun.l.google.com:19302",
+		"stun1.l.google.com:19302",
+	}
+	var out []*net.UDPAddr
+	seen := map[string]struct{}{}
+	for _, server := range servers {
 		addr, err := net.ResolveUDPAddr("udp4", server)
 		if err != nil {
 			continue
 		}
 		req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-		_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+		_ = conn.SetDeadline(time.Now().Add(900 * time.Millisecond))
 		if _, err := conn.WriteToUDP(req.Raw, addr); err != nil {
 			continue
 		}
@@ -263,14 +327,27 @@ func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
 				continue
 			}
 			var xor stun.XORMappedAddress
-			if err := xor.GetFrom(res); err == nil {
-				_ = conn.SetDeadline(time.Time{})
-				return &net.UDPAddr{IP: xor.IP, Port: xor.Port}, nil
+			if err := xor.GetFrom(res); err != nil {
+				continue
 			}
+			mapped := &net.UDPAddr{IP: xor.IP, Port: xor.Port}
+			if _, ok := seen[mapped.String()]; !ok {
+				seen[mapped.String()] = struct{}{}
+				out = append(out, mapped)
+			}
+			break
 		}
 	}
 	_ = conn.SetDeadline(time.Time{})
-	return nil, errors.New("STUN failed")
+	return out
+}
+
+func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
+	addrs := stunMappedAddresses(conn)
+	if len(addrs) == 0 {
+		return nil, errors.New("STUN failed")
+	}
+	return addrs[0], nil
 }
 
 func parseCandidate(raw signalCandidate) (*net.UDPAddr, int, error) {
@@ -312,7 +389,7 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 			continue
 		}
 		typ := strings.ToLower(strings.TrimSpace(cand.Type))
-		if typ != "host" && typ != "srflx" {
+		if typ != "host" && typ != "srflx" && typ != "portmap" {
 			return nil, fmt.Errorf("unsupported candidate type %q", cand.Type)
 		}
 		ip := addr.IP
@@ -326,12 +403,8 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 		}
 		key := net.JoinHostPort(ip.String(), fmt.Sprint(addr.Port))
 		normalized := signalCandidate{Addr: key, Type: typ}
-		if prev, ok := byAddr[key]; ok {
-			// 同一公网地址同时作为 host / srflx 出现时，host 更能准确表示
-			// “无需 NAT 映射即可直接到达”，同时也减少识别码长度。
-			if prev.Type == "host" || typ != "host" {
-				continue
-			}
+		if prev, ok := byAddr[key]; ok && candidateRank(prev) <= candidateRank(normalized) {
+			continue
 		}
 		byAddr[key] = normalized
 	}
@@ -339,14 +412,7 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 	for _, cand := range byAddr {
 		out = append(out, cand)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		ri := candidateRank(out[i])
-		rj := candidateRank(out[j])
-		if ri != rj {
-			return ri < rj
-		}
-		return out[i].Addr < out[j].Addr
-	})
+	sortCandidates(out)
 	if len(out) > maxSignalCandidates {
 		out = out[:maxSignalCandidates]
 	}
@@ -356,8 +422,7 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 	return out, nil
 }
 
-// encodeSignal 使用紧凑二进制格式编码识别码，而不是 JSON。
-// signalCode 只是内部统一的数据结构，线上格式由本函数和 decodeSignal 定义。
+// v12 的 INVITE 和 REPLY 都携带本端临时证书指纹，使双方都能安全地充当 QUIC server。
 func encodeSignal(c signalCode) (string, error) {
 	prefix, err := signalPrefixForKind(c.Kind)
 	if err != nil {
@@ -366,19 +431,14 @@ func encodeSignal(c signalCode) (string, error) {
 	if c.Version != signalVersion {
 		return "", fmt.Errorf("unsupported signal version %d", c.Version)
 	}
-
 	token, err := base64.RawURLEncoding.DecodeString(c.Token)
 	if err != nil || len(token) != 32 {
 		return "", errors.New("识别码 token 必须是 256-bit")
 	}
-	var fingerprint []byte
-	if c.Kind == "connect" {
-		fingerprint, err = hex.DecodeString(c.Fingerprint)
-		if err != nil || len(fingerprint) != 32 {
-			return "", errors.New("INVITE 证书指纹必须是 SHA-256")
-		}
+	fingerprint, err := hex.DecodeString(c.Fingerprint)
+	if err != nil || len(fingerprint) != 32 {
+		return "", errors.New("证书指纹必须是 SHA-256")
 	}
-
 	cands, err := normalizeSignalCandidates(c.Candidates)
 	if err != nil {
 		return "", err
@@ -389,9 +449,7 @@ func encodeSignal(c signalCode) (string, error) {
 	buf.WriteByte(byte(signalVersion))
 	buf.WriteByte(byte(len(cands)))
 	buf.Write(token)
-	if c.Kind == "connect" {
-		buf.Write(fingerprint)
-	}
+	buf.Write(fingerprint)
 	for _, cand := range cands {
 		addr, err := net.ResolveUDPAddr("udp", cand.Addr)
 		if err != nil {
@@ -403,8 +461,11 @@ func encodeSignal(c signalCode) (string, error) {
 			flags |= 0x01
 			ip = addr.IP.To16()
 		}
-		if strings.EqualFold(cand.Type, "srflx") {
+		switch strings.ToLower(cand.Type) {
+		case "srflx":
 			flags |= 0x02
+		case "portmap":
+			flags |= 0x04
 		}
 		buf.WriteByte(flags)
 		var port [2]byte
@@ -425,9 +486,9 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	if !strings.HasPrefix(s, expectedPrefix) {
 		switch {
 		case strings.HasPrefix(s, signalInvitePrefix) && expectedKind == "confirm":
-			return c, errors.New("这是 P2PF-INVITE 邀请码；它应发给准备加入连接的一方。当前创建方需要 P2PF-REPLY 回传码")
+			return c, errors.New("这是 P2PF-INVITE 邀请码；当前创建方需要 P2PF-REPLY 回传码")
 		case strings.HasPrefix(s, signalReplyPrefix) && expectedKind == "connect":
-			return c, errors.New("这是 P2PF-REPLY 回传码；它应交回创建方。加入连接需要 P2PF-INVITE 邀请码")
+			return c, errors.New("这是 P2PF-REPLY 回传码；加入连接需要 P2PF-INVITE 邀请码")
 		default:
 			return c, fmt.Errorf("识别码格式错误：当前需要 %s...", expectedPrefix)
 		}
@@ -441,7 +502,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	if err != nil {
 		return c, errors.New("识别码 Base64 数据无效")
 	}
-	if len(raw) < 2+32 {
+	if len(raw) < 2+32+32 {
 		return c, errors.New("识别码数据过短")
 	}
 	if int(raw[0]) != signalVersion {
@@ -452,20 +513,10 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		return c, errors.New("识别码 candidate 数量无效")
 	}
 	pos := 2
-	if len(raw) < pos+32 {
-		return c, errors.New("识别码缺少会话 token")
-	}
 	token := append([]byte(nil), raw[pos:pos+32]...)
 	pos += 32
-
-	var fingerprint []byte
-	if expectedKind == "connect" {
-		if len(raw) < pos+32 {
-			return c, errors.New("INVITE 邀请码缺少证书指纹")
-		}
-		fingerprint = append([]byte(nil), raw[pos:pos+32]...)
-		pos += 32
-	}
+	fingerprint := append([]byte(nil), raw[pos:pos+32]...)
+	pos += 32
 
 	cands := make([]signalCandidate, 0, count)
 	for i := 0; i < count; i++ {
@@ -474,7 +525,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		}
 		flags := raw[pos]
 		pos++
-		if flags&^byte(0x03) != 0 {
+		if flags&^byte(0x07) != 0 || flags&0x06 == 0x06 {
 			return c, errors.New("识别码 candidate flags 无效")
 		}
 		port := int(binary.BigEndian.Uint16(raw[pos : pos+2]))
@@ -495,8 +546,11 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 			return c, errors.New("识别码包含不可用 candidate")
 		}
 		typ := "host"
-		if flags&0x02 != 0 {
+		switch flags & 0x06 {
+		case 0x02:
 			typ = "srflx"
+		case 0x04:
+			typ = "portmap"
 		}
 		cands = append(cands, signalCandidate{
 			Addr: net.JoinHostPort(ip.String(), fmt.Sprint(port)),
@@ -508,13 +562,11 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	}
 
 	c = signalCode{
-		Version:    signalVersion,
-		Kind:       expectedKind,
-		Token:      base64.RawURLEncoding.EncodeToString(token),
-		Candidates: cands,
-	}
-	if expectedKind == "connect" {
-		c.Fingerprint = hex.EncodeToString(fingerprint)
+		Version:     signalVersion,
+		Kind:        expectedKind,
+		Token:       base64.RawURLEncoding.EncodeToString(token),
+		Candidates:  cands,
+		Fingerprint: hex.EncodeToString(fingerprint),
 	}
 	return c, nil
 }

@@ -1024,7 +1024,8 @@ func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
 
 	reply := signalCode{
 		Version: signalVersion, Kind: "confirm", Token: token,
-		Candidates: []signalCandidate{{Addr: "198.51.100.2:42002", Type: "srflx"}},
+		Candidates:  []signalCandidate{{Addr: "198.51.100.2:42002", Type: "srflx"}},
+		Fingerprint: strings.Repeat("dc", 32),
 	}
 	replyCode, err := encodeSignal(reply)
 	if err != nil {
@@ -1033,7 +1034,7 @@ func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
 	if !strings.HasPrefix(replyCode, signalReplyPrefix) {
 		t.Fatalf("reply prefix=%q", replyCode)
 	}
-	if len(replyCode) >= 100 {
+	if len(replyCode) >= 160 {
 		t.Fatalf("compact REPLY unexpectedly long: %d chars: %s", len(replyCode), replyCode)
 	}
 	if _, err := decodeSignal(replyCode, "connect"); err == nil || !strings.Contains(err.Error(), "P2PF-REPLY") {
@@ -1193,5 +1194,88 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("creator auth failed: %v", err)
+	}
+}
+
+
+func TestSignalPortmapCandidateRoundTrip(t *testing.T) {
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x33}, 32))
+	in := signalCode{
+		Version: signalVersion,
+		Kind: "confirm",
+		Token: token,
+		Fingerprint: strings.Repeat("12", 32),
+		Candidates: []signalCandidate{
+			{Addr: "198.51.100.20:45670", Type: "portmap"},
+			{Addr: "203.0.113.20:45671", Type: "srflx"},
+		},
+	}
+	code, err := encodeSignal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := decodeSignal(code, "confirm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Fingerprint != in.Fingerprint {
+		t.Fatalf("fingerprint=%q want=%q", out.Fingerprint, in.Fingerprint)
+	}
+	found := false
+	for _, cand := range out.Candidates {
+		if cand.Type == "portmap" && cand.Addr == "198.51.100.20:45670" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("portmap candidate missing: %#v", out.Candidates)
+	}
+}
+
+func TestAuthenticatedPunchRejectsTamperAndReplay(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+	join.token = append([]byte(nil), host.token...)
+
+	pkt, err := buildPunchPacket(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !join.verifyPunchPacket(pkt) {
+		t.Fatal("valid authenticated punch was rejected")
+	}
+	if join.verifyPunchPacket(pkt) {
+		t.Fatal("replayed punch nonce was accepted")
+	}
+
+	tampered, err := buildPunchPacket(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered[len(tampered)-1] ^= 0x01
+	if join.verifyPunchPacket(tampered) {
+		t.Fatal("tampered punch HMAC was accepted")
+	}
+}
+
+func TestPeerReflexiveCandidateDeduplication(t *testing.T) {
+	p := &rtcPeer{}
+	c := signalCandidate{Addr: "198.51.100.44:50000", Type: "prflx"}
+	if !p.addRemoteCandidate(c) {
+		t.Fatal("first prflx candidate was not added")
+	}
+	if p.addRemoteCandidate(c) {
+		t.Fatal("duplicate prflx candidate was added twice")
+	}
+	if got := p.remoteCandidates(); len(got) != 1 || got[0].Type != "prflx" {
+		t.Fatalf("unexpected candidates: %#v", got)
 	}
 }
