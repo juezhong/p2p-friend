@@ -42,3 +42,9 @@ jobs:
 
       - name: Compile Windows amd64 tests
         run: GOOS=windows GOARCH=amd64 go test -c -o /tmp/p2p-friend-windows.test.exe .
+
+      - name: Build macOS amd64
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o /tmp/p2p-friend-darwin-amd64 .
+
+      - name: Build macOS arm64
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /tmp/p2p-friend-darwin-arm64 .
