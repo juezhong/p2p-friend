@@ -8,6 +8,9 @@ import (
 	"io"
 )
 
+// 控制面帧固定使用 13-byte header：type(1) + id(8) + payloadLen(4)。
+// writeMu 保证多个 goroutine 发送 RPC/传输控制帧时不会在同一 QUIC control stream
+// 上发生字节级交错。大块文件数据优先走独立 data streams，不经过这里。
 func (s *peerSession) writeFrame(typ byte, id uint64, payload []byte) error {
 	if len(payload) > maxFramePayload {
 		return fmt.Errorf("frame payload too large: %d", len(payload))
