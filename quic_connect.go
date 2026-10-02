@@ -41,7 +41,9 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 				_ = qc.CloseWithError(0, "cancelled")
 			}
 		}(ln)
-		go punchLoop(ctx, p, ep.transport, ep.family)
+		if ep.family == 4 {
+			go punchLoop(ctx, p, ep.transport, ep.family)
+		}
 	}
 	if started == 0 {
 		return nil, errors.New("无法启动 QUIC UDP listener")
@@ -74,7 +76,9 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	}
 	var targets []target
 	for _, ep := range p.endpoints {
-		go punchLoop(ctx, p, ep.transport, ep.family)
+		if ep.family == 4 {
+			go punchLoop(ctx, p, ep.transport, ep.family)
+		}
 		for _, raw := range p.remoteCandidates() {
 			addr, family, err := parseCandidate(raw)
 			if err != nil || family != ep.family {
