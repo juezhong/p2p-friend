@@ -73,6 +73,7 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	type target struct {
 		ep   *udpEndpoint
 		addr *net.UDPAddr
+		rank int
 	}
 	var targets []target
 	for _, ep := range p.endpoints {
@@ -84,7 +85,7 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			if err != nil || family != ep.family {
 				continue
 			}
-			targets = append(targets, target{ep: ep, addr: addr})
+			targets = append(targets, target{ep: ep, addr: addr, rank: candidateRank(raw)})
 		}
 	}
 	if len(targets) == 0 {
@@ -102,10 +103,28 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 		roundCtx, stopRound := context.WithCancel(ctx)
 		var wg sync.WaitGroup
 		var winOnce sync.Once
+		preferGlobalIPv6 := false
+		for _, t := range targets {
+			if t.rank == 0 {
+				preferGlobalIPv6 = true
+				break
+			}
+		}
 		for _, t := range targets {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
+				// Both sides have already exchanged their full candidate sets.
+				// Give globally routable IPv6 a small head start so dual-stack
+				// peers normally select IPv6-DIRECT, while IPv4 remains an
+				// automatic fallback if IPv6 is filtered or unreachable.
+				if preferGlobalIPv6 && t.rank != 0 {
+					select {
+					case <-roundCtx.Done():
+						return
+					case <-time.After(250 * time.Millisecond):
+					}
+				}
 				dialCtx, stop := context.WithTimeout(roundCtx, 6*time.Second)
 				defer stop()
 				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
