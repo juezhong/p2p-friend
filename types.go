@@ -14,8 +14,8 @@ import (
 var appVersion = "dev"
 
 const (
-	protocolMagic   = "P2PF7"
-	protocolVersion = 7
+	protocolMagic   = "P2PF8"
+	protocolVersion = 8
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
@@ -188,6 +188,7 @@ type peerSession struct {
 	foreground foregroundTransfer
 
 	roleName string
+	linkMode string
 }
 
 var consoleMu sync.Mutex
