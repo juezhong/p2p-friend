@@ -84,6 +84,9 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
             -o dist/p2p-friend-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
+            -o dist/p2p-friend-linux-arm64 .
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
             go build -trimpath -ldflags "-s -w -X main.appVersion=${VERSION}" \
             -o dist/p2p-friend-windows-amd64.exe .
@@ -121,6 +124,7 @@ jobs:
             fi
             gh release upload "$TAG" \
               dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-linux-arm64 \
               dist/p2p-friend-windows-amd64.exe \
               dist/p2p-friend-darwin-amd64 \
               dist/p2p-friend-darwin-arm64 \
@@ -128,6 +132,7 @@ jobs:
           elif [[ -f "$NOTES" ]]; then
             gh release create "$TAG" \
               dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-linux-arm64 \
               dist/p2p-friend-windows-amd64.exe \
               dist/p2p-friend-darwin-amd64 \
               dist/p2p-friend-darwin-arm64 \
@@ -136,6 +141,7 @@ jobs:
           else
             gh release create "$TAG" \
               dist/p2p-friend-linux-amd64 \
+              dist/p2p-friend-linux-arm64 \
               dist/p2p-friend-windows-amd64.exe \
               dist/p2p-friend-darwin-amd64 \
               dist/p2p-friend-darwin-arm64 \
