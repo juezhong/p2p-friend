@@ -63,12 +63,14 @@ func (p *rtcPeer) acceptQUIC() (net.Conn, error) {
 }
 
 func (p *rtcPeer) dialQUIC() (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	result := make(chan *quic.Conn, 1)
-	var wg sync.WaitGroup
-	attempts := 0
+	type target struct {
+		ep   *udpEndpoint
+		addr *net.UDPAddr
+	}
+	var targets []target
 	for _, ep := range p.endpoints {
 		go punchLoop(ctx, ep.transport, p.remote, ep.family)
 		for _, raw := range p.remote {
@@ -76,42 +78,72 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 			if err != nil || family != ep.family {
 				continue
 			}
-			attempts++
-			wg.Add(1)
-			go func(ep *udpEndpoint, addr *net.UDPAddr) {
-				defer wg.Done()
-				dialCtx, stop := context.WithTimeout(ctx, 12*time.Second)
-				defer stop()
-				qc, err := ep.transport.Dial(dialCtx, addr, p.clientTLSConfig(), quicConfig())
-				if err != nil {
-					return
-				}
-				select {
-				case result <- qc:
-				case <-ctx.Done():
-					_ = qc.CloseWithError(0, "another path won")
-				}
-			}(ep, addr)
+			targets = append(targets, target{ep: ep, addr: addr})
 		}
 	}
-	if attempts == 0 {
+	if len(targets) == 0 {
 		return nil, errors.New("连接码中没有与本机 UDP socket 匹配的 candidate")
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+	consolePrintln("[连接] 已生成 ANSWER，等待创建方粘贴；在 180 秒窗口内会持续重试 QUIC candidate。")
 
-	select {
-	case qc := <-result:
-		cancel()
-		return establishStreams(qc, p, false)
-	case <-done:
-		return nil, errors.New("所有 QUIC candidate 均连接失败")
-	case <-ctx.Done():
-		return nil, errors.New("QUIC/UDP 连接超时：IPv6 直连和 IPv4 UDP 打洞均未建立")
+	round := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
+		}
+		round++
+
+		result := make(chan *quic.Conn, 1)
+		roundCtx, stopRound := context.WithCancel(ctx)
+		var wg sync.WaitGroup
+		var winOnce sync.Once
+		for _, t := range targets {
+			wg.Add(1)
+			go func(t target) {
+				defer wg.Done()
+				dialCtx, stop := context.WithTimeout(roundCtx, 4*time.Second)
+				defer stop()
+				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
+				if err != nil {
+					return
+				}
+				won := false
+				winOnce.Do(func() {
+					won = true
+					result <- qc
+					stopRound()
+				})
+				if !won {
+					_ = qc.CloseWithError(0, "another path won")
+				}
+			}(t)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case qc := <-result:
+			stopRound()
+			return establishStreams(qc, p, false)
+		case <-ctx.Done():
+			stopRound()
+			return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
+		case <-done:
+			stopRound()
+			if round == 1 {
+				consolePrintln("[连接] 创建方可能仍在粘贴 ANSWER，继续等待并重试，不会因为首轮失败退出。")
+			}
+			select {
+			case <-ctx.Done():
+				return nil, errors.New("QUIC/UDP 连接超时：创建方可能尚未粘贴 ANSWER，或 IPv6 / IPv4 UDP 打洞未建立")
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 	}
 }
 
@@ -120,7 +152,7 @@ func punchLoop(ctx context.Context, tr *quic.Transport, candidates []string, fam
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
-	for i := 0; i < 16; i++ {
+	for {
 		for _, raw := range candidates {
 			addr, fam, err := parseCandidate(raw)
 			if err != nil || fam != family {
