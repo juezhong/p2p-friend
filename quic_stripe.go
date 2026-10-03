@@ -14,12 +14,13 @@ import (
 
 const (
 	dataStripeTag       = byte(0xF0)
-	dataStripeSetupWait = 2 * time.Second
+	dataStripeSetupWait = 3 * time.Second
 )
 
 // setupDataStripes 在主 QUIC 完成 TLS + 应用 token 认证后扩展额外 data-only
-// QUIC connections。它们复用主连接已经验证可达的 UDP 5-tuple 和同一个
-// quic.Transport，因此不会重新做 STUN / punch，也不会新开 NAT 端口。
+// QUIC connections。v0.14.1 的主动端优先给每条 stripe 分配独立 UDP source port，
+// 形成真正不同的 UDP 5-tuple；目标 endpoint 仍复用主连接已经验证可达的地址。
+// 额外 stripe 不需要重新做 STUN / punch，失败时只退化为更少的 data connection。
 //
 // 主连接的 dialer 负责创建额外连接，主连接的 listener 负责接受。这样双方
 // 对“谁拨号”有完全一致的判断，不需要再做一次角色协商。
@@ -81,13 +82,34 @@ func (c *rtcConn) dialDataStripes(ctx context.Context, token []byte, want int) i
 
 			dialCtx, cancel := context.WithTimeout(ctx, dataStripeSetupWait)
 			defer cancel()
-			qc, err := ep.transport.Dial(dialCtx, remote, c.peer.clientTLSConfig(), quicConfig())
+
+			// 独立 UDP socket 让每条 data QUIC 拥有不同 source port / 5-tuple。
+			// 这能避开某些单 UDP flow 的整形、队列和路径哈希瓶颈。
+			network := "udp6"
+			bind := &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
+			if remote.IP.To4() != nil {
+				network = "udp4"
+				bind = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+			}
+			udpConn, err := net.ListenUDP(network, bind)
 			if err != nil {
+				return
+			}
+			_ = udpConn.SetReadBuffer(16 * 1024 * 1024)
+			_ = udpConn.SetWriteBuffer(16 * 1024 * 1024)
+			tr := &quic.Transport{Conn: udpConn}
+
+			qc, err := tr.Dial(dialCtx, remote, c.peer.clientTLSConfig(), quicConfig())
+			if err != nil {
+				_ = tr.Close()
+				_ = udpConn.Close()
 				return
 			}
 			st, err := qc.OpenStreamSync(dialCtx)
 			if err != nil {
 				_ = qc.CloseWithError(0, "data stripe stream failed")
+				_ = tr.Close()
+				_ = udpConn.Close()
 				return
 			}
 
@@ -97,15 +119,19 @@ func (c *rtcConn) dialDataStripes(ctx context.Context, token []byte, want int) i
 			copy(header[2:], token)
 			if _, err := st.Write(header); err != nil {
 				_ = qc.CloseWithError(0, "data stripe auth failed")
+				_ = tr.Close()
+				_ = udpConn.Close()
 				return
 			}
 			var ack [2]byte
 			if _, err := io.ReadFull(st, ack[:]); err != nil || string(ack[:]) != "OK" {
 				_ = qc.CloseWithError(0, "data stripe rejected")
+				_ = tr.Close()
+				_ = udpConn.Close()
 				return
 			}
 
-			c.addStripe(qc, &quicStreamConn{st})
+			c.addStripe(qc, &quicStreamConn{st}, tr)
 			mu.Lock()
 			added++
 			mu.Unlock()
@@ -120,7 +146,7 @@ func (c *rtcConn) acceptDataStripes(ctx context.Context, token []byte, want int)
 	if ep == nil || ep.listener == nil {
 		return 0
 	}
-	primaryRemote := c.qc.RemoteAddr().String()
+	primaryRemote, _ := c.qc.RemoteAddr().(*net.UDPAddr)
 	added := 0
 
 	for added < want {
@@ -128,7 +154,11 @@ func (c *rtcConn) acceptDataStripes(ctx context.Context, token []byte, want int)
 		if err != nil {
 			break
 		}
-		if !sameUDPAddress(qc.RemoteAddr().String(), primaryRemote) {
+		// v0.14.1 data stripe 会使用不同的远端 source port，所以这里只要求
+		// 来源 IP 与主 QUIC 相同。真正的会话归属继续由 TLS fingerprint +
+		// 下方 256-bit session token 双重校验。
+		stripeRemote, _ := qc.RemoteAddr().(*net.UDPAddr)
+		if primaryRemote == nil || stripeRemote == nil || !stripeRemote.IP.Equal(primaryRemote.IP) {
 			_ = qc.CloseWithError(0, "unexpected stripe endpoint")
 			continue
 		}
@@ -162,6 +192,6 @@ func (c *rtcConn) acceptOneDataStripe(ctx context.Context, qc *quic.Conn, token 
 	if _, err := st.Write([]byte("OK")); err != nil {
 		return err
 	}
-	c.addStripe(qc, &quicStreamConn{st})
+	c.addStripe(qc, &quicStreamConn{st}, nil)
 	return nil
 }
