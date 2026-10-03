@@ -272,13 +272,13 @@ func startResilientDataStripes(c *rtcConn, token []byte) int {
 
 	deadline := time.NewTimer(resilientInitialWait)
 	defer deadline.Stop()
-	for st.count() == 0 {
+	for st.count() < resilientDataLanes {
 		select {
 		case <-st.notify:
 		case <-deadline.C:
-			return 0
+			return st.count()
 		case <-ctx.Done():
-			return 0
+			return st.count()
 		}
 	}
 	return st.count()
