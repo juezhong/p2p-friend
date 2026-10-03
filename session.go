@@ -27,6 +27,7 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		closed:     make(chan struct{}),
 		pendingRPC: make(map[uint64]chan rpcResponse),
 		pendingGet: make(map[uint64]*pendingGet),
+		pendingAck: make(map[uint64]*transferAckState),
 		outbound:   make(map[uint64]*outboundTransfer),
 		inbound:    make(map[uint64]*inboundTransfer),
 		localCwd:   cwd,
@@ -35,7 +36,13 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		linkMode:             connectionMode(conn),
 		transferCoordinator: coordinator,
 	}
-	attachDataLanes(s, conn)
+	if rc, ok := conn.(*rtcConn); ok && rc.ResilientDataV16() {
+		if st := resilientStripeStateFor(rc); st != nil {
+			st.setSession(s)
+		}
+	} else {
+		attachDataLanes(s, conn)
+	}
 	return s
 }
 
@@ -92,6 +99,11 @@ func (s *peerSession) readLoop() {
 		case frameTransferResult:
 			if err := s.handleTransferResult(f.ID, f.Payload); err != nil {
 				consolePrintf("[协议] 传输结果无效: %v\n", err)
+				return
+			}
+		case frameDataAck:
+			if err := s.handleDataAck(f.ID, f.Payload); err != nil {
+				consolePrintf("[协议] 数据确认无效: %v\n", err)
 				return
 			}
 		case frameBye:
