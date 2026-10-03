@@ -28,9 +28,10 @@ const (
 	quicALPN              = "p2p-friend/stable"
 	punchMagic            = "P2PFPUNCH"
 
-	capHostPrefix     uint64 = 1 << 0
-	capMultiUDPStripe uint64 = 1 << 1
-	signalCapabilitiesCurrent = capHostPrefix | capMultiUDPStripe
+	capHostPrefix       uint64 = 1 << 0
+	capMultiUDPStripe   uint64 = 1 << 1
+	capResilientDataV16 uint64 = 1 << 2
+	signalCapabilitiesCurrent = capHostPrefix | capMultiUDPStripe | capResilientDataV16
 
 	maxDynamicCandidates = 16
 	maxRemoteCandidates  = 32
@@ -144,12 +145,27 @@ func (c *rtcConn) RemoteAddr() net.Addr               { return quicAddr{c.qc.Rem
 func (c *rtcConn) SetReadDeadline(t time.Time) error  { return c.control.SetReadDeadline(t) }
 func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.control.SetWriteDeadline(t) }
 func (c *rtcConn) SetDeadline(t time.Time) error      { return c.control.SetDeadline(t) }
+func (c *rtcConn) ResilientDataV16() bool {
+	return c != nil && c.peer != nil && c.peer.supports(capResilientDataV16)
+}
 func (c *rtcConn) DataLanes() []io.ReadWriteCloser {
+	if c.ResilientDataV16() {
+		if st := resilientStripeStateFor(c); st != nil {
+			return st.lanes()
+		}
+		return nil
+	}
 	c.stripeMu.RLock()
 	defer c.stripeMu.RUnlock()
 	return append([]io.ReadWriteCloser(nil), c.lanes...)
 }
 func (c *rtcConn) DataConnectionCount() int {
+	if c.ResilientDataV16() {
+		if st := resilientStripeStateFor(c); st != nil {
+			return st.count()
+		}
+		return 0
+	}
 	c.stripeMu.RLock()
 	defer c.stripeMu.RUnlock()
 	return 1 + len(c.stripeQCs)
@@ -163,6 +179,12 @@ func (c *rtcConn) addStripe(qc *quic.Conn, lane io.ReadWriteCloser, owner io.Clo
 }
 
 func (c *rtcConn) dataQUICs() []*quic.Conn {
+	if c.ResilientDataV16() {
+		if st := resilientStripeStateFor(c); st != nil {
+			return st.quics()
+		}
+		return nil
+	}
 	c.stripeMu.RLock()
 	defer c.stripeMu.RUnlock()
 	out := make([]*quic.Conn, 0, 1+len(c.stripeQCs))
@@ -187,6 +209,7 @@ func (c *rtcConn) closeQUICOnly(reason string) error {
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
+		closeResilientStripeState(c)
 		c.stripeMu.Lock()
 		stripes := append([]*quic.Conn(nil), c.stripeQCs...)
 		owners := append([]io.Closer(nil), c.stripeOwners...)
