@@ -666,6 +666,7 @@ func encodeSignal(c signalCode) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		var rec bytes.Buffer
 		flags := byte(0)
 		ip := addr.IP.To4()
 		if ip == nil {
@@ -681,15 +682,22 @@ func encodeSignal(c signalCode) (string, error) {
 		if cand.Type == "host" && cand.PrefixKnown {
 			flags |= 0x08
 		}
-		buf.WriteByte(flags)
+		rec.WriteByte(flags)
 		var port [2]byte
 		binary.BigEndian.PutUint16(port[:], uint16(addr.Port))
-		buf.Write(port[:])
+		rec.Write(port[:])
 		if flags&0x08 != 0 {
-			buf.WriteByte(cand.PrefixBits)
+			rec.WriteByte(cand.PrefixBits)
 		}
-		buf.Write(ip)
+		rec.Write(ip)
+
+		n := binary.PutUvarint(varint[:], uint64(rec.Len()))
+		buf.Write(varint[:n])
+		buf.Write(rec.Bytes())
 	}
+	// 顶层 extension area：未来新增可选字段时旧程序可以整体跳过，不必更换邀请码格式。
+	n = binary.PutUvarint(varint[:], 0)
+	buf.Write(varint[:n])
 	return prefix + base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
 }
 
@@ -760,8 +768,17 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 
 	cands := make([]signalCandidate, 0, count)
 	for i := 0; i < count; i++ {
-		if len(raw) < pos+3 {
+		recLen, n := binary.Uvarint(raw[pos:])
+		if n <= 0 {
+			return c, errors.New("识别码 candidate 长度无效")
+		}
+		pos += n
+		if recLen == 0 || recLen > uint64(len(raw)-pos) {
 			return c, errors.New("识别码 candidate 数据不完整")
+		}
+		recEnd := pos + int(recLen)
+		if recEnd-pos < 3 {
+			return c, errors.New("识别码 candidate 数据过短")
 		}
 		flags := raw[pos]
 		pos++
@@ -776,7 +793,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		prefixKnown := flags&0x08 != 0
 		var prefixBits uint8
 		if prefixKnown {
-			if len(raw) <= pos {
+			if recEnd <= pos {
 				return c, errors.New("识别码 candidate prefix 不完整")
 			}
 			prefixBits = raw[pos]
@@ -791,7 +808,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		if prefixKnown && prefixBits > maxPrefix {
 			return c, errors.New("识别码 candidate prefix 无效")
 		}
-		if len(raw) < pos+ipLen {
+		if recEnd < pos+ipLen {
 			return c, errors.New("识别码 candidate IP 数据不完整")
 		}
 		ip := net.IP(append([]byte(nil), raw[pos:pos+ipLen]...))
@@ -815,7 +832,18 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 			PrefixBits:  prefixBits,
 			PrefixKnown: prefixKnown,
 		})
+		// recEnd 之后的 candidate 扩展字段由旧实现直接跳过。
+		pos = recEnd
 	}
+	extLen, n := binary.Uvarint(raw[pos:])
+	if n <= 0 {
+		return c, errors.New("识别码 extension 长度无效")
+	}
+	pos += n
+	if extLen > uint64(len(raw)-pos) {
+		return c, errors.New("识别码 extension 数据不完整")
+	}
+	pos += int(extLen)
 	if pos != len(raw) {
 		return c, errors.New("识别码包含多余数据")
 	}
