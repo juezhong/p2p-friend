@@ -1397,23 +1397,24 @@ func TestBidirectionalQUICRaceKeepsWinnerAlive(t *testing.T) {
 	}
 }
 
-func TestCandidateDialDelayPrefersLANBeforeFallbacks(t *testing.T) {
-	// Loopback is deliberately not considered a usable candidate, so use a
-	// synthetic private address only to verify fallback ordering.
-	srflx := candidateDialDelay(
-		signalCandidate{Addr: "198.51.100.10:50000", Type: "srflx"},
-		&net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 50000},
-	)
-	portmap := candidateDialDelay(
-		signalCandidate{Addr: "198.51.100.11:50001", Type: "portmap"},
-		&net.UDPAddr{IP: net.ParseIP("198.51.100.11"), Port: 50001},
-	)
-	prflx := candidateDialDelay(
-		signalCandidate{Addr: "198.51.100.12:50002", Type: "prflx"},
-		&net.UDPAddr{IP: net.ParseIP("198.51.100.12"), Port: 50002},
-	)
-	if !(prflx < portmap && portmap < srflx) {
-		t.Fatalf("unexpected fallback delays: prflx=%v portmap=%v srflx=%v", prflx, portmap, srflx)
+func TestCandidateDialDelayDoesNotStaggerFallbacks(t *testing.T) {
+	cases := []struct {
+		typ  string
+		addr string
+	}{
+		{"host", "198.51.100.9:49999"},
+		{"prflx", "198.51.100.10:50000"},
+		{"portmap", "198.51.100.11:50001"},
+		{"srflx", "198.51.100.12:50002"},
+	}
+	for _, tc := range cases {
+		addr, err := net.ResolveUDPAddr("udp", tc.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := candidateDialDelay(signalCandidate{Addr: tc.addr, Type: tc.typ}, addr); got != 0 {
+			t.Fatalf("%s delay=%v want=0", tc.typ, got)
+		}
 	}
 }
 
