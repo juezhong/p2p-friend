@@ -464,25 +464,10 @@ func connectionTimeoutError() error {
 // portmap、STUN 和运行时 prflx 作为自动 fallback。这里不是永久屏蔽后续路径，
 // 只是避免同一局域网中公网 hairpin/NAT 路径抢先赢得 QUIC race。
 func candidateDialDelay(c signalCandidate, addr *net.UDPAddr) time.Duration {
-	if addr == nil || addr.IP == nil {
-		return 250 * time.Millisecond
-	}
-	if strings.EqualFold(c.Type, "host") && isSameSubnetIP(addr.IP) {
-		return 0
-	}
-	if strings.EqualFold(c.Type, "prflx") {
-		return 60 * time.Millisecond
-	}
-	if strings.EqualFold(c.Type, "host") {
-		return 100 * time.Millisecond
-	}
-	if strings.EqualFold(c.Type, "portmap") {
-		return 160 * time.Millisecond
-	}
-	if strings.EqualFold(c.Type, "srflx") {
-		return 220 * time.Millisecond
-	}
-	return 250 * time.Millisecond
+	// v0.15.1: mutual LAN 已在 connectQUIC 入口单独判定并严格直连。
+	// 走到公网/NAT race 时不再人为 stagger，所有可用 candidate 同时 Dial，
+	// 第一个成功完成 QUIC handshake 的路径直接胜出。
+	return 0
 }
 
 func isSameSubnetIP(remote net.IP) bool {
