@@ -1217,7 +1217,7 @@ func TestQUICCanConnectWithCreateCodeOnly(t *testing.T) {
 	hostCh := make(chan result, 1)
 	joinCh := make(chan result, 1)
 	go func() {
-		conn, err := host.acceptQUIC()
+		conn, err := host.connectQUIC()
 		hostCh <- result{conn: conn, err: err}
 	}()
 	go func() {
@@ -1290,30 +1290,30 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 	select {
 	case r := <-hostCh:
 		if r.err != nil {
-			t.Fatalf("creator accept failed: %v", r.err)
+			t.Fatalf("creator connect failed: %v", r.err)
 		}
 		hc = r.conn
 	case <-time.After(10 * time.Second):
-		t.Fatal("creator accept timed out")
+		t.Fatal("creator connect timed out")
 	}
 	select {
 	case r := <-joinCh:
 		if r.err != nil {
-			t.Fatalf("join dial failed: %v", r.err)
+			t.Fatalf("join wait failed: %v", r.err)
 		}
 		jc = r.conn
 	case <-time.After(10 * time.Second):
-		t.Fatal("join dial timed out")
+		t.Fatal("join wait timed out")
 	}
 	defer hc.Close()
 	defer jc.Close()
 
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- authenticateListener(hc, token, roleHost) }()
-	if err := authenticateDialer(jc, token, roleJoin); err != nil {
+	hostAuth := make(chan error, 1)
+	go func() { hostAuth <- authenticatePeerConn(hc, token, roleHost) }()
+	if err := authenticatePeerConn(jc, token, roleJoin); err != nil {
 		t.Fatalf("join auth failed: %v", err)
 	}
-	if err := <-serverErr; err != nil {
+	if err := <-hostAuth; err != nil {
 		t.Fatalf("creator auth failed: %v", err)
 	}
 }
