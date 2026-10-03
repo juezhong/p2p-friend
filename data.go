@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	frameEntryReady = byte(11)
-	dataHeaderSize  = 20
+	frameEntryReady          = byte(11)
+	dataHeaderSize           = 20
+	resilientDataHeaderSize  = 28
 
 	// v14 继续使用 1 MiB application chunk。QUIC 仍会按路径 MTU 分包；这里的较大 chunk
 	// 只是减少应用层 Write / allocation / copy 次数。
@@ -286,8 +287,10 @@ type inboundDataChunk struct {
 }
 
 type inboundDataState struct {
-	file *os.File
-	size int64
+	file   *os.File
+	size   int64
+	fileID uint64
+	lastAck int64
 
 	chunks chan inboundDataChunk
 	budget chan struct{}
@@ -309,7 +312,7 @@ var sessionData sync.Map
 var inboundData sync.Map
 var outboundReady sync.Map
 
-const pooledDataBufferSize = dataHeaderSize + maxDataChunkSize
+const pooledDataBufferSize = resilientDataHeaderSize + maxDataChunkSize
 
 var dataBufferPool = sync.Pool{
 	New: func() any {
@@ -391,6 +394,7 @@ func startInboundData(s *peerSession, id uint64, t *inboundTransfer, size int64,
 	st := &inboundDataState{
 		file:       f,
 		size:       size,
+		fileID:     t.currentFileID,
 		chunks:     make(chan inboundDataChunk, window),
 		budget:     make(chan struct{}, window),
 		stop:       make(chan struct{}),
@@ -546,6 +550,14 @@ func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inbou
 					_, _ = h.Write(payload[:n])
 					next += int64(n)
 					t.progress.addBytes(int64(n))
+					if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() &&
+						(next-st.lastAck >= resilientAckStep || next == st.size) {
+						st.lastAck = next
+						if err := s.sendDataAck(id, st.fileID, next); err != nil {
+							fail(fmt.Errorf("send data ack: %w", err))
+							return
+						}
+					}
 				}
 				st.releaseChunk(cur)
 				if err != nil {
@@ -710,31 +722,103 @@ func (s *peerSession) handleTransferDataOwned(id uint64, offset int64, buf []byt
 	return nil
 }
 
+func (s *peerSession) handleTransferDataOwnedV16(id, fileID uint64, offset int64, buf []byte, payloadLen int) error {
+	t := s.getInbound(id)
+	if t == nil {
+		releaseDataBuffer(buf)
+		return nil
+	}
+
+	t.mu.Lock()
+	if t.cancelled || t.currentFile == nil || t.currentFileID != fileID {
+		t.mu.Unlock()
+		releaseDataBuffer(buf)
+		// 重建/重传可能让旧文件的重复 chunk 晚到。fileID 不匹配时直接丢弃，
+		// 绝不能让它污染目录传输中的下一个文件。
+		return nil
+	}
+	size := t.currentRemaining
+	st := getInboundData(t)
+	t.mu.Unlock()
+	if st == nil {
+		releaseDataBuffer(buf)
+		return nil
+	}
+	if offset < 0 || payloadLen < 0 || payloadLen > maxDataChunkSize ||
+		offset+int64(payloadLen) > size {
+		releaseDataBuffer(buf)
+		s.cancelInbound(id, "received data outside declared file range", true)
+		return nil
+	}
+	if !st.enqueue(inboundDataChunk{buf: buf, offset: offset, payloadLen: payloadLen}) {
+		releaseDataBuffer(buf)
+	}
+	return nil
+}
+
 func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
-	header := make([]byte, dataHeaderSize)
+	v16 := false
+	if rc, ok := s.conn.(*rtcConn); ok {
+		v16 = rc.ResilientDataV16()
+	}
+	headerSize := dataHeaderSize
+	if v16 {
+		headerSize = resilientDataHeaderSize
+	}
+	header := make([]byte, headerSize)
 	for {
 		if _, err := io.ReadFull(lane, header); err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+				if st := resilientStripeStateFor(rc); st != nil {
+					st.failLane(lane, err)
+				}
+			} else if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				s.reportTransportError("数据流", err)
 			}
 			return
 		}
 		id := binary.BigEndian.Uint64(header[0:8])
-		offset := int64(binary.BigEndian.Uint64(header[8:16]))
-		want := int(binary.BigEndian.Uint32(header[16:20]))
+		fileID := uint64(0)
+		offsetPos := 8
+		if v16 {
+			fileID = binary.BigEndian.Uint64(header[8:16])
+			offsetPos = 16
+		}
+		offset := int64(binary.BigEndian.Uint64(header[offsetPos : offsetPos+8]))
+		want := int(binary.BigEndian.Uint32(header[offsetPos+8 : offsetPos+12]))
 		if want < 0 || want > maxDataChunkSize {
 			consolePrintf("[数据流] 无效数据长度: %d\n", want)
+			if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+				if st := resilientStripeStateFor(rc); st != nil {
+					st.failLane(lane, errors.New("invalid data length"))
+				}
+			}
 			return
 		}
 
 		buf := acquireDataBuffer()
-		copy(buf[:dataHeaderSize], header)
-		if _, err := io.ReadFull(lane, buf[dataHeaderSize:dataHeaderSize+want]); err != nil {
+		copy(buf[:headerSize], header)
+		if _, err := io.ReadFull(lane, buf[headerSize:headerSize+want]); err != nil {
 			releaseDataBuffer(buf)
-			s.reportTransportError("数据流", err)
+			if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+				if st := resilientStripeStateFor(rc); st != nil {
+					st.failLane(lane, err)
+				}
+			} else {
+				s.reportTransportError("数据流", err)
+			}
 			return
 		}
-		if err := s.handleTransferDataOwned(id, offset, buf, want); err != nil {
+		var err error
+		if v16 {
+			// 统一把 payload 对齐到旧的 pooled buffer dataHeaderSize 位置，
+			// 这样接收重排/写盘路径无需复制第二次。
+			copy(buf[dataHeaderSize:dataHeaderSize+want], buf[headerSize:headerSize+want])
+			err = s.handleTransferDataOwnedV16(id, fileID, offset, buf, want)
+		} else {
+			err = s.handleTransferDataOwned(id, offset, buf, want)
+		}
+		if err != nil {
 			consolePrintf("[数据流] 数据处理失败: %v\n", err)
 		}
 	}
