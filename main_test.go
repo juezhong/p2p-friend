@@ -1279,3 +1279,104 @@ func TestPeerReflexiveCandidateDeduplication(t *testing.T) {
 		t.Fatalf("unexpected candidates: %#v", got)
 	}
 }
+
+
+func TestBidirectionalQUICRaceKeepsWinnerAlive(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	host.remoteFingerprint = append([]byte(nil), join.localFingerprint...)
+	join.remoteFingerprint = append([]byte(nil), host.localFingerprint...)
+	host.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, join), Type: "host"}})
+	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
+
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	hostCh := make(chan result, 1)
+	joinCh := make(chan result, 1)
+	go func() {
+		conn, err := host.connectQUIC()
+		hostCh <- result{conn: conn, err: err}
+	}()
+	go func() {
+		conn, err := join.connectQUIC()
+		joinCh <- result{conn: conn, err: err}
+	}()
+
+	var hc, jc net.Conn
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatalf("host connectQUIC failed: %v", r.err)
+		}
+		hc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("host connectQUIC timed out")
+	}
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatalf("join connectQUIC failed: %v", r.err)
+		}
+		jc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("join connectQUIC timed out")
+	}
+	defer hc.Close()
+	defer jc.Close()
+
+	// Give late race losers enough time to be discarded. A loser cleanup must not
+	// close the shared transport used by the selected winner.
+	time.Sleep(pathPreferenceWindow + 200*time.Millisecond)
+
+	hostAuth := make(chan error, 1)
+	go func() { hostAuth <- authenticatePeerConn(hc, host.token, roleHost) }()
+	if err := authenticatePeerConn(jc, join.token, roleJoin); err != nil {
+		t.Fatalf("join auth failed after path race settled: %v", err)
+	}
+	if err := <-hostAuth; err != nil {
+		t.Fatalf("host auth failed after path race settled: %v", err)
+	}
+
+	if _, err := jc.Write([]byte("ping")); err != nil {
+		t.Fatalf("winner write failed after loser cleanup: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(hc, buf); err != nil {
+		t.Fatalf("winner read failed after loser cleanup: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("winner payload=%q want ping", string(buf))
+	}
+}
+
+func TestCandidateDialDelayPrefersLANBeforeFallbacks(t *testing.T) {
+	// Loopback is deliberately not considered a usable candidate, so use a
+	// synthetic private address only to verify fallback ordering.
+	srflx := candidateDialDelay(
+		signalCandidate{Addr: "198.51.100.10:50000", Type: "srflx"},
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 50000},
+	)
+	portmap := candidateDialDelay(
+		signalCandidate{Addr: "198.51.100.11:50001", Type: "portmap"},
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.11"), Port: 50001},
+	)
+	prflx := candidateDialDelay(
+		signalCandidate{Addr: "198.51.100.12:50002", Type: "prflx"},
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.12"), Port: 50002},
+	)
+	if !(prflx < portmap && portmap < srflx) {
+		t.Fatalf("unexpected fallback delays: prflx=%v portmap=%v srflx=%v", prflx, portmap, srflx)
+	}
+}
