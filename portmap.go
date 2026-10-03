@@ -19,33 +19,106 @@ const (
 	pcpPort                = 5351
 )
 
-// discoverPortMapping 尝试 PCP -> NAT-PMP -> UPnP IGD。
-// 这些映射都只是创建公网到当前 QUIC UDP 端口的直接路径，不转发任何业务流量。
-func discoverPortMapping(ep *udpEndpoint) (signalCandidate, func(), string, error) {
+type portMapResult struct {
+	addr    *net.UDPAddr
+	cleanup func()
+	method  string
+	err     error
+}
+
+// discoverPortMappingContext 并行尝试 PCP / NAT-PMP / UPnP，返回最先成功的一条。
+// 未获胜的探测在 ctx 取消后会尽量停止；若已经创建映射，会立即清理。
+func discoverPortMappingContext(ctx context.Context, ep *udpEndpoint) (signalCandidate, func(), string, error) {
 	if ep == nil || ep.family != 4 || ep.conn == nil {
 		return signalCandidate{}, nil, "", errors.New("IPv4 UDP endpoint required")
 	}
 	localPort := ep.conn.LocalAddr().(*net.UDPAddr).Port
-	gw, err := gateway.DiscoverGateway()
-	if err == nil {
-		localIP, localErr := gateway.DiscoverInterface()
-		if localErr == nil && localIP.To4() != nil {
-			if addr, cleanup, err := tryPCP(gw, localIP, localPort); err == nil {
-				return signalCandidate{Addr: addr.String(), Type: "portmap"}, cleanup, "PCP", nil
+	gw, gwErr := gateway.DiscoverGateway()
+	localIP, ipErr := gateway.DiscoverInterface()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan portMapResult, 3)
+	workers := 0
+
+	start := func(method string, fn func(context.Context) (*net.UDPAddr, func(), error)) {
+		workers++
+		go func() {
+			addr, cleanup, err := fn(ctx)
+			// 可能另一种端口映射协议已经先成功并取消 ctx。此时即使本协议刚好
+			// 也创建成功，也不能把结果丢进无人读取的缓冲区而留下多余路由器映射。
+			if ctx.Err() != nil {
+				if cleanup != nil {
+					cleanup()
+				}
+				return
 			}
-			if addr, cleanup, err := tryNATPMP(gw, localIP, localPort); err == nil {
-				return signalCandidate{Addr: addr.String(), Type: "portmap"}, cleanup, "NAT-PMP", nil
+			result := portMapResult{addr: addr, cleanup: cleanup, method: method, err: err}
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				if cleanup != nil {
+					cleanup()
+				}
 			}
+		}()
+	}
+
+	if gwErr == nil && ipErr == nil && localIP.To4() != nil {
+		start("PCP", func(ctx context.Context) (*net.UDPAddr, func(), error) {
+			return tryPCPContext(ctx, gw, localIP, localPort)
+		})
+		start("NAT-PMP", func(ctx context.Context) (*net.UDPAddr, func(), error) {
+			return tryNATPMPContext(ctx, gw, localIP, localPort)
+		})
+	}
+	start("UPnP", func(ctx context.Context) (*net.UDPAddr, func(), error) {
+		return tryUPnPContext(ctx, localPort)
+	})
+
+	var lastErr error
+	for completed := 0; completed < workers; {
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return signalCandidate{}, nil, "", lastErr
+			}
+			return signalCandidate{}, nil, "", ctx.Err()
+		case result := <-results:
+			completed++
+			if result.err != nil || result.addr == nil {
+				if result.err != nil {
+					lastErr = result.err
+				}
+				continue
+			}
+			cancel()
+			return signalCandidate{Addr: result.addr.String(), Type: "portmap"}, result.cleanup, result.method, nil
 		}
 	}
-	if addr, cleanup, err := tryUPnP(localPort); err == nil {
-		return signalCandidate{Addr: addr.String(), Type: "portmap"}, cleanup, "UPnP", nil
+	if lastErr == nil {
+		lastErr = errors.New("no explicit UDP port mapping available")
 	}
-	return signalCandidate{}, nil, "", errors.New("no explicit UDP port mapping available")
+	return signalCandidate{}, nil, "", lastErr
 }
 
-func tryNATPMP(gw, _ net.IP, localPort int) (*net.UDPAddr, func(), error) {
-	client := natpmp.NewClientWithTimeout(gw, 1100*time.Millisecond)
+func discoverPortMapping(ep *udpEndpoint) (signalCandidate, func(), string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
+	defer cancel()
+	return discoverPortMappingContext(ctx, ep)
+}
+
+func tryNATPMPContext(ctx context.Context, gw, _ net.IP, localPort int) (*net.UDPAddr, func(), error) {
+	timeout := 600 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return nil, nil, context.DeadlineExceeded
+	}
+	client := natpmp.NewClientWithTimeout(gw, timeout)
 	ext, err := client.GetExternalAddress()
 	if err != nil {
 		return nil, nil, err
@@ -70,9 +143,13 @@ func tryNATPMP(gw, _ net.IP, localPort int) (*net.UDPAddr, func(), error) {
 	return &net.UDPAddr{IP: ip, Port: mappedPort}, cleanup, nil
 }
 
-func tryUPnP(localPort int) (*net.UDPAddr, func(), error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
+func tryNATPMP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
 	defer cancel()
+	return tryNATPMPContext(ctx, gw, localIP, localPort)
+}
+
+func tryUPnPContext(ctx context.Context, localPort int) (*net.UDPAddr, func(), error) {
 
 	// IGD v2 支持 AddAnyPortMapping，可接受路由器重新选择外部端口。
 	if clients, _, err := internetgateway2.NewWANIPConnection2ClientsCtx(ctx); err == nil {
@@ -164,6 +241,12 @@ func tryUPnP(localPort int) (*net.UDPAddr, func(), error) {
 	return nil, nil, errors.New("UPnP mapping unavailable")
 }
 
+func tryUPnP(localPort int) (*net.UDPAddr, func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
+	defer cancel()
+	return tryUPnPContext(ctx, localPort)
+}
+
 func localIPv4String() string {
 	if ip, err := gateway.DiscoverInterface(); err == nil {
 		if v4 := ip.To4(); v4 != nil {
@@ -175,7 +258,7 @@ func localIPv4String() string {
 
 // PCP MAP 按 RFC 6887 使用独立控制 socket 与默认网关通信；真正映射的内部端口
 // 仍是 p2p-friend 的 QUIC UDP 端口。
-func tryPCP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
+func tryPCPContext(ctx context.Context, gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
 	gw4 := gw.To4()
 	local4 := localIP.To4()
 	if gw4 == nil || local4 == nil {
@@ -195,7 +278,11 @@ func tryPCP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
 	gwAddr := &net.UDPAddr{IP: gw4, Port: pcpPort}
 	buf := make([]byte, 1100)
 	for attempt := 0; attempt < 2; attempt++ {
-		_ = conn.SetDeadline(time.Now().Add(650 * time.Millisecond))
+		deadline := time.Now().Add(500 * time.Millisecond)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		_ = conn.SetDeadline(deadline)
 		if _, err := conn.WriteToUDP(req, gwAddr); err != nil {
 			continue
 		}
@@ -219,6 +306,12 @@ func tryPCP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
 		return addr, cleanup, nil
 	}
 	return nil, nil, errors.New("PCP mapping unavailable")
+}
+
+func tryPCP(gw, localIP net.IP, localPort int) (*net.UDPAddr, func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
+	defer cancel()
+	return tryPCPContext(ctx, gw, localIP, localPort)
 }
 
 func buildPCPMapRequest(localIP net.IP, internalPort, suggestedExternalPort uint16, lifetime uint32, nonce [12]byte) []byte {
