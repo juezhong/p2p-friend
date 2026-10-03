@@ -874,11 +874,11 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	go func() { hostStripeCh <- setupDataStripes(hostConn, host.token) }()
 	joinStripes := setupDataStripes(joinConn, join.token)
 	hostStripes := <-hostStripeCh
-	if joinStripes != maxDataConnections-primaryDataStreams {
-		t.Fatalf("join data stripes=%d want=%d", joinStripes, maxDataConnections-primaryDataStreams)
+	if joinStripes != resilientDataLanes {
+		t.Fatalf("join data stripes=%d want=%d", joinStripes, resilientDataLanes)
 	}
-	if hostStripes != maxDataConnections-primaryDataStreams {
-		t.Fatalf("host data stripes=%d want=%d", hostStripes, maxDataConnections-primaryDataStreams)
+	if hostStripes != resilientDataLanes {
+		t.Fatalf("host data stripes=%d want=%d", hostStripes, resilientDataLanes)
 	}
 	if jc, ok := joinConn.(*rtcConn); !ok || jc.DataConnectionCount() != maxDataConnections {
 		t.Fatalf("join data connections=%v", joinConn)
@@ -918,11 +918,14 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	go hs.readLoop()
 	go js.readLoop()
 
-	if st := dataState(js); st == nil || len(st.lanes) != parallelLanes {
-		t.Fatalf("join QUIC data lanes = %#v", st)
+	if dataState(js) != nil || dataState(hs) != nil {
+		t.Fatal("v0.16 must not attach legacy primary data lanes")
 	}
-	if st := dataState(hs); st == nil || len(st.lanes) != parallelLanes {
-		t.Fatalf("host QUIC data lanes = %#v", st)
+	if st := resilientStripeStateFor(joinConn.(*rtcConn)); st == nil || st.count() != resilientDataLanes {
+		t.Fatalf("join resilient data lanes=%v", st)
+	}
+	if st := resilientStripeStateFor(hostConn.(*rtcConn)); st == nil || st.count() != resilientDataLanes {
+		t.Fatalf("host resilient data lanes=%v", st)
 	}
 	if err := js.put("source.bin", "received.bin"); err != nil {
 		t.Fatalf("QUIC put: %v", err)
