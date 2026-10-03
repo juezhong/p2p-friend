@@ -25,8 +25,13 @@ const (
 	parallelLanes       = maxDataConnections
 
 	// 每条 lane 最多预取 16 个 1 MiB chunk，4 lane 共约 64 MiB 用户态发送缓存。
-	// 接收端由同一发送窗口天然形成背压，避免缓存随文件大小无限增长。
 	sendQueueDepthPerLane = 16
+
+	// 接收端允许更大的有界乱序窗口，避免多 UDP flow 中某一条暂时变慢时
+	// 过早把其它 flow 全部反压停住。仍然有硬上限，不随超大文件无限增长。
+	minReceiveWindowChunks = 64
+	midReceiveWindowChunks = 128
+	maxReceiveWindowChunks = 256
 )
 
 type transferTuningProfile struct {
@@ -311,12 +316,24 @@ func getOutboundReady(ot *outboundTransfer) chan string {
 
 func clearOutboundReady(ot *outboundTransfer) { outboundReady.Delete(ot) }
 
+func receiveWindowChunks(size int64) int {
+	switch {
+	case size >= 2*1024*1024*1024:
+		return maxReceiveWindowChunks
+	case size >= 512*1024*1024:
+		return midReceiveWindowChunks
+	default:
+		return minReceiveWindowChunks
+	}
+}
+
 func startInboundData(s *peerSession, id uint64, t *inboundTransfer, size int64, f *os.File) *inboundDataState {
+	window := receiveWindowChunks(size)
 	st := &inboundDataState{
 		file:       f,
 		size:       size,
-		chunks:     make(chan inboundDataChunk, parallelLanes*sendQueueDepthPerLane),
-		budget:     make(chan struct{}, parallelLanes*sendQueueDepthPerLane),
+		chunks:     make(chan inboundDataChunk, window),
+		budget:     make(chan struct{}, window),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 		writerDone: make(chan struct{}),
