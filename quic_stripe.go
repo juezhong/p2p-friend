@@ -30,6 +30,9 @@ func setupDataStripes(conn net.Conn, token []byte) int {
 	if !ok || len(token) != 32 {
 		return 0
 	}
+	if rc.peer.supports(capResilientDataV16) {
+		return startResilientDataStripes(rc, token)
+	}
 	if !rc.peer.supports(capMultiUDPStripe) {
 		return 0
 	}
