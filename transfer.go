@@ -186,7 +186,7 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 			if size-off < want {
 				want = size - off
 			}
-			n, rerr := f.ReadAt(buf[:want], off)
+			n, rerr := f.Read(buf[:want])
 			if rerr != nil && !errors.Is(rerr, io.EOF) {
 				return nil, rerr
 			}
@@ -267,7 +267,7 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		if size-off < want {
 			want = size - off
 		}
-		n, rerr := f.ReadAt(buf[dataHeaderSize:dataHeaderSize+int(want)], off)
+		n, rerr := f.Read(buf[dataHeaderSize:dataHeaderSize+int(want)])
 		if rerr != nil && !errors.Is(rerr, io.EOF) {
 			releaseDataBuffer(buf)
 			return nil, rerr
