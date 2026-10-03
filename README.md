@@ -18,7 +18,7 @@
 - IPv6 不做地址转换映射；双方通过安全 UDP punch 尽量打开 stateful firewall
 - QUIC TLS 1.3、可靠重传、拥塞控制和多 stream
 - 1 条 control stream + 4 条 data stream
-- 自适应 data lane / chunk / pacing
+- v13 高吞吐 data pipeline：1 MiB pooled chunk、4 lane 持久 worker、有界内存队列
 - 会话级单传输仲裁：同一时刻只运行一个文件或目录传输任务
 - 文件和目录递归传输
 - 双向 `put` / `get`
@@ -110,28 +110,47 @@ p2p[IPv4-NAT-PUNCH remote:/path]>
 
 ## 传输模型
 
-单个大文件按 offset 切块并行发送：
+v0.13 将大文件路径改为持续流水线。发送端不再按“读一批、发一批、等待整批结束”的方式停顿，而是让磁盘读取、SHA-256、QUIC 加密/发送持续重叠：
 
 ```text
-file
- ├─ chunk -> data stream 0
- ├─ chunk -> data stream 1
- ├─ chunk -> data stream 2
- └─ chunk -> data stream 3
-
-receiver -> WriteAt(offset) -> .part
+顺序文件读取 + SHA-256
+          ↓
+   pooled 1 MiB chunks
+          ↓
+   有界发送队列（约 64 MiB）
+          ↓
+ ┌────────┼────────┐
+ ↓        ↓        ↓
+lane 0   lane 1   lane 2/3
+          ↓
+      QUIC / UDP
 ```
 
-发送器使用吞吐量窗口做自适应，而不是用某一次 `Write` 花了多少毫秒来判断“网络拥塞”：
+接收端的多条 QUIC data stream 只负责持续读取网络数据，不再直接抢同一个文件锁做乱序 `WriteAt`。数据进入一个有硬上限的 reorder window，只有从 offset 0 开始连续的数据才交给单一顺序 writer：
 
-- 1~4 条 active data lane
-- 64~256 KiB application chunk
-- Linux / macOS 正常档位不额外 pacing
-- Windows 高并发档位只保留极轻的 burst pacing，用来降低 Winsock send queue 峰值
+```text
+QUIC data lanes
+       ↓
+pooled 1 MiB chunks
+       ↓
+有界 reorder window（约 64 MiB）
+       ↓
+连续 offset 顺序输出
+       ↓
+SHA-256 + 顺序 file.Write
+       ↓
+OS page cache / dirty pages
+       ↓
+磁盘后台 writeback
+```
 
-算法会周期性探测更高并发档位，并比较实际 bytes/sec。吞吐没有明显恶化就保留高档；探测导致吞吐下降时回退并进入短暂冷却。真正的丢包、RTT、拥塞窗口与公平性仍交给 QUIC congestion control。
+这样用户态缓存不会随着 1 GiB / 100 GiB / 1 TiB 文件无限增长；内存窗口满后会停止继续消费 QUIC stream，由 QUIC flow control 自然向发送端施加 backpressure。真正的大容量写缓存继续交给 Linux / Windows / macOS 的 page cache。
 
-这种测量会自然包含远端处理能力：接收端磁盘写入或 CPU 较慢时，QUIC stream / flow-control 会形成 backpressure，发送端最终看到的有效吞吐也会下降。因此它不是只按本机 CPU 调节，也不会再因为“慢链路单批写入超过 80/200 ms”而错误地降到 1 lane。
+v13 每个 application data chunk 最大 1 MiB。QUIC 仍会按路径 MTU 拆成 UDP packet；1 MiB 只是减少应用层 Write、allocation 和 memcpy 次数，不代表发送 1 MiB UDP 数据报。
+
+发送和接收的 SHA-256 都已经合并进数据流水线：发送端文件只顺序读取一次，接收端数据只顺序写一次，不再在传输前/后为了 checksum 额外完整扫描大文件。
+
+QUIC connection 仍保留 4 条 data stream，共享同一个 UDP socket 和 congestion controller；多 stream 用于保持应用层数据管线连续，不把它们当成 4 条独立网络连接。
 
 ### 单传输模式
 
@@ -157,11 +176,11 @@ receiver -> WriteAt(offset) -> .part
 
 每个文件都执行端到端校验：
 
-1. 发送端传输前计算 SHA-256。
+1. 发送端顺序读取文件时同步计算 SHA-256，并把同一份数据送入 QUIC pipeline。
 2. 数据通过多条 QUIC stream 发送。
-3. 接收端按 offset 写入 `.part` 临时文件。
-4. 所有数据落盘后重新读取临时文件计算 SHA-256。
-5. 两端校验完全一致后才重命名最终文件并报告完成。
+3. 接收端在有界内存中按 offset 重排，只把连续数据顺序写入 `.part`。
+4. 接收端顺序写入时同步计算 SHA-256，不再重新读取整个临时文件。
+5. 两端 SHA-256 完全一致后才重命名最终文件并报告完成。
 
 ## status
 
@@ -185,7 +204,7 @@ status
 - 对端 candidate 类型（HOST / STUN / prflx / portmap）
 - control / data stream 数量
 - 当前是否存在文件传输任务
-- 当前发送自适应参数（存在发送任务时）
+- 当前发送流水线参数（存在发送任务时）
 - 本地 / 远端目录与覆盖策略
 
 连通性检查、NAT 打洞、QUIC 握手和文件传输复用选中的 UDP socket，不额外建立 TCP 文件通道。
@@ -239,7 +258,7 @@ get 第 2 个路径参数    -> 本地路径
 
 ## 从源码构建
 
-要求 Go 1.23 或兼容版本。
+要求 Go 1.26 或兼容版本。
 
 ```bash
 go mod download
