@@ -16,7 +16,7 @@ var appVersion = "dev"
 const (
 	// protocolMagic 是 QUIC 建连后的应用层会话认证标识；识别码版本由
 	// quic_types.go 的 signalVersion 单独管理。
-	protocolMagic = "P2PF13"
+	protocolMagic = "P2PF14"
 
 	roleHost = byte(1)
 	roleJoin = byte(2)
