@@ -84,7 +84,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	}
 	p := &progress{
 		Start: time.Now(), LastPrint: time.Now(), Total: total,
-		Prefix: prefix, Silent: !foreground,
+		Prefix: prefix, Silent: !foreground, Multi: isDir,
 	}
 	defer p.closeLine()
 	defer s.clearCurrentTuning()
@@ -109,9 +109,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 			return err
 		}
 
-		p.Current = e.RelPath
-		p.CurrentDone = 0
-		p.CurrentSize = e.Size
+		p.beginFile(e.RelPath, e.Size)
 		sum, err := s.sendFileStriped(ctx, id, e.FullPath, e.Size, p)
 		if err != nil {
 			if cause := context.Cause(ctx); cause != nil {
@@ -405,7 +403,7 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 		targetRoot: root,
 		progress: &progress{
 			Start: time.Now(), LastPrint: time.Now(), Total: meta.Total,
-			Prefix: recvPrefix, Silent: !activeUI,
+			Prefix: recvPrefix, Silent: !activeUI, Multi: meta.IsDir,
 		},
 		getReqID: meta.RequestID,
 	}
@@ -556,9 +554,7 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	t.currentRemaining = e.Size
 	startInboundData(s, id, t, e.Size, tmp)
 	t.currentMode = os.FileMode(e.Mode)
-	t.progress.Current = e.Path
-	t.progress.CurrentDone = 0
-	t.progress.CurrentSize = e.Size
+	t.progress.beginFile(e.Path, e.Size)
 	if existed {
 		t.overwritten = append(t.overwritten, dst)
 	}
