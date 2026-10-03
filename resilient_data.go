@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,8 +22,8 @@ const (
 	resilientRepairBackoff   = 500 * time.Millisecond
 	resilientInitialWait     = 4 * time.Second
 	resilientAckStep         = 2 * 1024 * 1024
-	resilientAckTimeout      = 1500 * time.Millisecond
-	resilientWindowBytes     = 8 * 1024 * 1024
+	resilientAckTimeout      = 5 * time.Second
+	resilientWindowBytes     = 4 * 1024 * 1024
 	resilientFailureThreshold = 3
 )
 
@@ -521,4 +524,244 @@ func (t *resilientTransferTuner) observe(bytes int64, elapsed time.Duration, fai
 		return t.current(), true
 	}
 	return old, false
+}
+
+
+type resilientSendChunk struct {
+	frame []byte
+	size  int
+}
+
+func buildResilientChunk(id, fileID uint64, offset int64, payload []byte) resilientSendChunk {
+	frame := make([]byte, resilientDataHeaderSize+len(payload))
+	binary.BigEndian.PutUint64(frame[0:8], id)
+	binary.BigEndian.PutUint64(frame[8:16], fileID)
+	binary.BigEndian.PutUint64(frame[16:24], uint64(offset))
+	binary.BigEndian.PutUint32(frame[24:28], uint32(len(payload)))
+	copy(frame[resilientDataHeaderSize:], payload)
+	return resilientSendChunk{frame: frame, size: len(payload)}
+}
+
+func (s *peerSession) sendResilientBatch(
+	ctx context.Context,
+	manager *resilientStripeState,
+	chunks []resilientSendChunk,
+	workers int,
+	pace time.Duration,
+) error {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(chunks) {
+		workers = len(chunks)
+	}
+	if workers < 1 {
+		return nil
+	}
+	jobs := make(chan int, workers)
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for idx := range jobs {
+				if err := manager.writeChunk(ctx, worker, chunks[idx].frame); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				if pace > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(pace):
+					}
+				}
+			}
+		}(w)
+	}
+	for i := range chunks {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return context.Cause(ctx)
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (s *peerSession) waitResilientAck(
+	ctx context.Context,
+	ack *transferAckState,
+	want int64,
+	progressFrom *int64,
+	p *progress,
+) error {
+	timer := time.NewTimer(resilientAckTimeout)
+	defer timer.Stop()
+	for {
+		got := ack.acked.Load()
+		if got > *progressFrom {
+			p.addBytes(got - *progressFrom)
+			*progressFrom = got
+		}
+		if got >= want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-s.closed:
+			if err := s.terminalTransportError(); err != nil {
+				return err
+			}
+			return errors.New("control connection closed")
+		case <-ack.notify:
+		case <-timer.C:
+			return context.DeadlineExceeded
+		}
+	}
+}
+
+// sendFileResilient 实现 v0.16 的可靠数据面。
+// 主 QUIC 只负责 ACK / RPC / session control；文件块仅发送到可重建 data QUIC。
+// 每个窗口只有收到接收端“已顺序写盘”的累计 ACK 才会推进。若某条 data QUIC
+// 在 Write 成功后才丢包/断开，ACK 会停住，整个未确认窗口会自动重传到当前健康链路。
+func (s *peerSession) sendFileResilient(
+	ctx context.Context,
+	id, fileID uint64,
+	path string,
+	size int64,
+	p *progress,
+) ([]byte, error) {
+	rc, ok := s.conn.(*rtcConn)
+	if !ok || !rc.ResilientDataV16() {
+		return nil, errors.New("resilient data plane unavailable")
+	}
+	manager := resilientStripeStateFor(rc)
+	if manager == nil {
+		return nil, errors.New("resilient data lane manager unavailable")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if size == 0 {
+		return h.Sum(nil), nil
+	}
+
+	ack := s.registerTransferAck(id, fileID)
+	defer s.unregisterTransferAck(id, ack)
+
+	tuner := newResilientTransferTuner(runtime.GOOS, resilientDataLanes)
+	profile := tuner.current()
+	s.setCurrentTuning(profile)
+
+	var (
+		windowStart int64
+		progressAck int64
+		consecutiveFailures int
+	)
+	for windowStart < size {
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, cause
+		}
+		select {
+		case <-s.closed:
+			if err := s.terminalTransportError(); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("control connection closed")
+		default:
+		}
+
+		profile = tuner.current()
+		s.setCurrentTuning(profile)
+		windowEnd := windowStart + resilientWindowBytes
+		if windowEnd > size {
+			windowEnd = size
+		}
+
+		chunks := make([]resilientSendChunk, 0, int((windowEnd-windowStart)/int64(profile.chunkSize))+1)
+		for off := windowStart; off < windowEnd; {
+			want := int64(profile.chunkSize)
+			if want <= 0 || want > maxDataChunkSize {
+				want = maxDataChunkSize
+			}
+			if windowEnd-off < want {
+				want = windowEnd - off
+			}
+			payload := make([]byte, int(want))
+			n, rerr := f.ReadAt(payload, off)
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return nil, rerr
+			}
+			if n != len(payload) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			_, _ = h.Write(payload)
+			chunks = append(chunks, buildResilientChunk(id, fileID, off, payload))
+			off += int64(n)
+		}
+
+		windowStarted := time.Now()
+		for {
+			attemptCtx, cancel := context.WithTimeout(ctx, resilientAckTimeout)
+			sendErr := s.sendResilientBatch(attemptCtx, manager, chunks, profile.lanes, profile.pace)
+			cancel()
+			if sendErr == nil {
+				sendErr = s.waitResilientAck(ctx, ack, windowEnd, &progressAck, p)
+			}
+			if sendErr == nil {
+				consecutiveFailures = 0
+				if next, changed := tuner.observe(windowEnd-windowStart, time.Since(windowStarted), false); changed {
+					s.setCurrentTuning(next)
+					consolePrintf("[传输] 自适应升档: %d lane, chunk=%s, pacing=%s\n",
+						next.lanes, humanBytes(int64(next.chunkSize)), next.pace)
+				}
+				break
+			}
+
+			consecutiveFailures++
+			if next, changed := tuner.observe(0, 0, true); changed {
+				profile = next
+				s.setCurrentTuning(next)
+				consolePrintf("[传输] 连续失败达到阈值，自动降档: %d lane, chunk=%s, pacing=%s\n",
+					next.lanes, humanBytes(int64(next.chunkSize)), next.pace)
+			}
+			if consecutiveFailures >= 20 {
+				return nil, fmt.Errorf("data plane failed after repeated rebuild/retransmit attempts: %w", sendErr)
+			}
+			consolePrintf("[传输] 未确认窗口 %s-%s，重建数据链路并重传（%d/%d）\n",
+				humanBytes(windowStart), humanBytes(windowEnd), consecutiveFailures, 20)
+			select {
+			case <-ctx.Done():
+				return nil, context.Cause(ctx)
+			case <-s.closed:
+				if err := s.terminalTransportError(); err != nil {
+					return nil, err
+				}
+				return nil, errors.New("control connection closed")
+			case <-time.After(150 * time.Millisecond):
+			}
+		}
+		windowStart = windowEnd
+	}
+	return h.Sum(nil), nil
 }
