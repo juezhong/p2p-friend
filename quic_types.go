@@ -126,10 +126,17 @@ func (c *rtcConn) LinkMode() string {
 	return classifyQUICLink(c.qc, c.peer.remoteCandidates())
 }
 
+// closeQUICOnly 只关闭这一条 QUIC path，不关闭共享 rtcPeer。
+// 连接竞速淘汰 loser 时必须使用它，否则会把 winner 复用的 UDP socket /
+// quic.Transport / listener / port mapping 一起关闭。
+func (c *rtcConn) closeQUICOnly(reason string) error {
+	return c.qc.CloseWithError(0, reason)
+}
+
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
-		err = c.qc.CloseWithError(0, "normal shutdown")
+		err = c.closeQUICOnly("normal shutdown")
 		_ = c.peer.Close()
 	})
 	return err
