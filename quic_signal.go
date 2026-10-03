@@ -181,13 +181,18 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 
 func (p *rtcPeer) waitConn() (net.Conn, error) { return p.connectQUIC() }
 
-const candidateGatherBudget = 1500 * time.Millisecond
+const (
+	candidateGatherBudget = 1200 * time.Millisecond
+	candidateGatherGrace  = 180 * time.Millisecond
+	stunSecondProbeGrace  = 220 * time.Millisecond
+)
 
 type candidateGatherResult struct {
-	mapped  []*net.UDPAddr
-	cand    signalCandidate
-	cleanup func()
-	method  string
+	mapped        []*net.UDPAddr
+	stunResponses int
+	cand          signalCandidate
+	cleanup       func()
+	method        string
 }
 
 // gatherCandidates 先立即收集本机 host candidate，再把 Multi-STUN 与端口映射并行执行。
@@ -239,7 +244,8 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 
 		results := make(chan candidateGatherResult, 2)
 		go func() {
-			results <- candidateGatherResult{mapped: stunMappedAddressesContext(ctx, ipv4Endpoint.conn)}
+			obs := stunMappingObservationsContext(ctx, ipv4Endpoint.conn)
+			results <- candidateGatherResult{mapped: obs.mapped, stunResponses: obs.responses}
 		}()
 		go func() {
 			cand, cleanup, method, err := discoverPortMappingContext(ctx, ipv4Endpoint)
@@ -256,11 +262,35 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 			}
 		}()
 
+		var softTimer *time.Timer
+		var softC <-chan time.Time
+		resetSoft := func(d time.Duration) {
+			if softTimer == nil {
+				softTimer = time.NewTimer(d)
+			} else {
+				if !softTimer.Stop() {
+					select {
+					case <-softTimer.C:
+					default:
+					}
+				}
+				softTimer.Reset(d)
+			}
+			softC = softTimer.C
+		}
+		defer func() {
+			if softTimer != nil {
+				softTimer.Stop()
+			}
+		}()
+
 		for received := 0; received < 2; {
 			select {
 			case result := <-results:
 				received++
+				useful := false
 				if len(result.mapped) > 0 {
+					useful = true
 					unique := map[string]struct{}{}
 					for _, a := range result.mapped {
 						s := a.String()
@@ -268,17 +298,35 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 						observations = append(observations, s)
 						set["srflx|"+s] = signalCandidate{Addr: s, Type: "srflx"}
 					}
-					if len(unique) == 1 {
+					switch {
+					case result.stunResponses >= 2 && len(unique) == 1:
 						behavior = "stable"
-					} else {
+					case result.stunResponses >= 2 && len(unique) > 1:
 						behavior = "endpoint-dependent"
+					default:
+						behavior = "single-observation"
 					}
 				}
 				if result.cand.Addr != "" {
+					useful = true
 					set["portmap|"+result.cand.Addr] = result.cand
 					mappings = append(mappings, result.method+" "+result.cand.Addr)
 					p.addCleanup(result.cleanup)
 				}
+				if received >= 2 {
+					break
+				}
+				if useful {
+					grace := candidateGatherGrace
+					if behavior == "endpoint-dependent" && result.cand.Addr == "" {
+						// STUN 已表明映射依赖目标时，显式 port mapping 的价值更高，
+						// 多给一点机会，但仍受 1.2s hard deadline 限制。
+						grace = 420 * time.Millisecond
+					}
+					resetSoft(grace)
+				}
+			case <-softC:
+				received = 2
 			case <-ctx.Done():
 				received = 2
 			}
@@ -337,9 +385,15 @@ func candidateRank(c signalCandidate) int {
 	return 6
 }
 
-// stunMappedAddressesContext 会先并行发出多个 STUN Binding Request，再在同一 UDP
-// socket 上用 transaction ID 分流响应。总耗时由 ctx 控制，不再按 server 串行叠加超时。
-func stunMappedAddressesContext(ctx context.Context, conn *net.UDPConn) []*net.UDPAddr {
+type stunMappingObservation struct {
+	mapped    []*net.UDPAddr
+	responses int
+}
+
+// stunMappingObservationsContext 会先并行发出多个 STUN Binding Request，再在同一 UDP
+// socket 上用 transaction ID 分流响应。两个有效响应已经足够比较 mapping behavior；
+// 若只有一个响应，则只再等一个很短的 grace，不为了第三个 STUN 把邀请码拖到 hard deadline。
+func stunMappingObservationsContext(ctx context.Context, conn *net.UDPConn) stunMappingObservation {
 	servers := []string{
 		"stun.cloudflare.com:3478",
 		"stun.l.google.com:19302",
@@ -362,17 +416,19 @@ func stunMappedAddressesContext(ctx context.Context, conn *net.UDPConn) []*net.U
 		pending[id] = struct{}{}
 	}
 	if len(pending) == 0 {
-		return nil
+		return stunMappingObservation{}
 	}
 
-	deadline, ok := ctx.Deadline()
+	hardDeadline, ok := ctx.Deadline()
 	if !ok {
-		deadline = time.Now().Add(candidateGatherBudget)
+		hardDeadline = time.Now().Add(candidateGatherBudget)
 	}
-	_ = conn.SetReadDeadline(deadline)
+	readDeadline := hardDeadline
+	_ = conn.SetReadDeadline(readDeadline)
 	defer conn.SetReadDeadline(time.Time{})
 
 	var out []*net.UDPAddr
+	responses := 0
 	seen := map[string]struct{}{}
 	buf := make([]byte, 2048)
 	for len(pending) > 0 {
@@ -395,13 +451,27 @@ func stunMappedAddressesContext(ctx context.Context, conn *net.UDPConn) []*net.U
 		if err := xor.GetFrom(res); err != nil {
 			continue
 		}
+		responses++
 		mapped := &net.UDPAddr{IP: xor.IP, Port: xor.Port}
 		if _, ok := seen[mapped.String()]; !ok {
 			seen[mapped.String()] = struct{}{}
 			out = append(out, mapped)
 		}
+		if responses >= 2 {
+			break
+		}
+		// 第一个有效结果已经提供可用 srflx；只短等第二个结果用于 behavior 对比。
+		shortDeadline := time.Now().Add(stunSecondProbeGrace)
+		if shortDeadline.Before(hardDeadline) {
+			readDeadline = shortDeadline
+			_ = conn.SetReadDeadline(readDeadline)
+		}
 	}
-	return out
+	return stunMappingObservation{mapped: out, responses: responses}
+}
+
+func stunMappedAddressesContext(ctx context.Context, conn *net.UDPConn) []*net.UDPAddr {
+	return stunMappingObservationsContext(ctx, conn).mapped
 }
 
 func resolveUDP4Context(ctx context.Context, server string) (*net.UDPAddr, error) {
