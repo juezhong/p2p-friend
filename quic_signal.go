@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -106,11 +107,12 @@ func createConnectionCode() (*rtcPeer, string, error) {
 		return nil, "", errors.New("没有可用 UDP candidate")
 	}
 	code, err := encodeSignal(signalCode{
-		Version:     signalVersion,
+		Version:     signalEnvelopeVersion,
 		Kind:        "connect",
 		Token:       base64.RawURLEncoding.EncodeToString(p.token),
 		Candidates:  cands,
-		Fingerprint: hex.EncodeToString(p.localFingerprint),
+		Capabilities: signalCapabilitiesCurrent,
+		Fingerprint:  hex.EncodeToString(p.localFingerprint),
 	})
 	if err != nil {
 		_ = p.Close()
@@ -141,6 +143,7 @@ func createJoinConfirmation(rawCode string) (*rtcPeer, string, []byte, error) {
 	p.remoteFingerprint = append([]byte(nil), fp...)
 	p.fingerprint = append([]byte(nil), fp...)
 	p.setRemoteCandidates(code.Candidates)
+	p.setRemoteCapabilities(code.Capabilities)
 
 	cands := gatherCandidates(p)
 	p.setLocalCandidates(cands)
@@ -148,12 +151,14 @@ func createJoinConfirmation(rawCode string) (*rtcPeer, string, []byte, error) {
 		_ = p.Close()
 		return nil, "", nil, errors.New("没有可用 UDP candidate")
 	}
+	binding := makeSignalBinding(token)
 	confirm, err := encodeSignal(signalCode{
-		Version:     signalVersion,
-		Kind:        "confirm",
-		Token:       code.Token,
-		Candidates:  cands,
-		Fingerprint: hex.EncodeToString(p.localFingerprint),
+		Version:        signalEnvelopeVersion,
+		Capabilities:   signalCapabilitiesCurrent,
+		Kind:           "confirm",
+		SessionBinding: base64.RawURLEncoding.EncodeToString(binding),
+		Candidates:     cands,
+		Fingerprint:    hex.EncodeToString(p.localFingerprint),
 	})
 	if err != nil {
 		_ = p.Close()
@@ -167,8 +172,8 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 	if err != nil {
 		return err
 	}
-	token, err := base64.RawURLEncoding.DecodeString(code.Token)
-	if err != nil || !equalBytes(token, p.token) {
+	binding, err := base64.RawURLEncoding.DecodeString(code.SessionBinding)
+	if err != nil || !equalBytes(binding, makeSignalBinding(p.token)) {
 		return errors.New("确认码与当前连接不匹配")
 	}
 	fp, err := hex.DecodeString(code.Fingerprint)
@@ -177,6 +182,7 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 	}
 	p.remoteFingerprint = append([]byte(nil), fp...)
 	p.setRemoteCandidates(code.Candidates)
+	p.setRemoteCapabilities(code.Capabilities)
 	return nil
 }
 
@@ -564,6 +570,16 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 		}
 		key := net.JoinHostPort(ip.String(), fmt.Sprint(addr.Port))
 		normalized := signalCandidate{Addr: key, Type: typ}
+		if typ == "host" && cand.PrefixKnown {
+			maxBits := uint8(128)
+			if ip.To4() != nil {
+				maxBits = 32
+			}
+			if cand.PrefixBits <= maxBits {
+				normalized.PrefixKnown = true
+				normalized.PrefixBits = cand.PrefixBits
+			}
+		}
 		if prev, ok := byAddr[key]; ok && candidateRank(prev) <= candidateRank(normalized) {
 			continue
 		}
@@ -583,18 +599,27 @@ func normalizeSignalCandidates(in []signalCandidate) ([]signalCandidate, error) 
 	return out, nil
 }
 
-// v12 的 INVITE 和 REPLY 都携带本端临时证书指纹，使双方都能安全地充当 QUIC server。
+// v0.15 起识别码使用稳定 binary envelope。产品版本号不再进入识别码。
+// envelope version 只描述这个长期格式本身；兼容功能通过 capability bitmap 协商。
+//
+// Layout:
+//   version(1) | kind(1) | capabilities(uvarint) | candidate-count(1)
+//   INVITE: token(32)
+//   REPLY:  session-binding(16)
+//   fingerprint(32)
+//   candidates...
+//
+// candidate:
+//   flags(1) | port(2) | [prefix-bits(1)] | raw-ip(4/16)
+//
+// 这比 protobuf 对当前固定小字段更紧凑，同时保留 capability 扩展点。
 func encodeSignal(c signalCode) (string, error) {
 	prefix, err := signalPrefixForKind(c.Kind)
 	if err != nil {
 		return "", err
 	}
-	if c.Version != signalVersion {
-		return "", fmt.Errorf("unsupported signal version %d", c.Version)
-	}
-	token, err := base64.RawURLEncoding.DecodeString(c.Token)
-	if err != nil || len(token) != 32 {
-		return "", errors.New("识别码 token 必须是 256-bit")
+	if c.Version != signalEnvelopeVersion {
+		return "", fmt.Errorf("unsupported signal envelope %d", c.Version)
 	}
 	fingerprint, err := hex.DecodeString(c.Fingerprint)
 	if err != nil || len(fingerprint) != 32 {
@@ -605,12 +630,37 @@ func encodeSignal(c signalCode) (string, error) {
 		return "", err
 	}
 
+	kind := byte(0)
+	switch c.Kind {
+	case "connect":
+		kind = 1
+	case "confirm":
+		kind = 2
+	}
+	var identity []byte
+	if kind == 1 {
+		identity, err = base64.RawURLEncoding.DecodeString(c.Token)
+		if err != nil || len(identity) != 32 {
+			return "", errors.New("邀请码 token 必须是 256-bit")
+		}
+	} else {
+		identity, err = base64.RawURLEncoding.DecodeString(c.SessionBinding)
+		if err != nil || len(identity) != 16 {
+			return "", errors.New("回传码 session binding 无效")
+		}
+	}
+
 	var buf bytes.Buffer
-	buf.Grow(2 + len(token) + len(fingerprint) + len(cands)*20)
-	buf.WriteByte(byte(signalVersion))
+	buf.Grow(4 + len(identity) + len(fingerprint) + len(cands)*20)
+	buf.WriteByte(byte(signalEnvelopeVersion))
+	buf.WriteByte(kind)
+	var varint [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(varint[:], c.Capabilities)
+	buf.Write(varint[:n])
 	buf.WriteByte(byte(len(cands)))
-	buf.Write(token)
+	buf.Write(identity)
 	buf.Write(fingerprint)
+
 	for _, cand := range cands {
 		addr, err := net.ResolveUDPAddr("udp", cand.Addr)
 		if err != nil {
@@ -628,10 +678,16 @@ func encodeSignal(c signalCode) (string, error) {
 		case "portmap":
 			flags |= 0x04
 		}
+		if cand.Type == "host" && cand.PrefixKnown {
+			flags |= 0x08
+		}
 		buf.WriteByte(flags)
 		var port [2]byte
 		binary.BigEndian.PutUint16(port[:], uint16(addr.Port))
 		buf.Write(port[:])
+		if flags&0x08 != 0 {
+			buf.WriteByte(cand.PrefixBits)
+		}
 		buf.Write(ip)
 	}
 	return prefix + base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
@@ -654,7 +710,6 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 			return c, fmt.Errorf("识别码格式错误：当前需要 %s...", expectedPrefix)
 		}
 	}
-
 	rawText := strings.TrimPrefix(s, expectedPrefix)
 	if len(rawText) > base64.RawURLEncoding.EncodedLen(maxSignalPayload) {
 		return c, errors.New("识别码过长")
@@ -663,19 +718,43 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	if err != nil {
 		return c, errors.New("识别码 Base64 数据无效")
 	}
-	if len(raw) < 2+32+32 {
+	if len(raw) < 4 {
 		return c, errors.New("识别码数据过短")
 	}
-	if int(raw[0]) != signalVersion {
-		return c, fmt.Errorf("识别码协议版本不匹配：收到 v%d，需要 v%d", raw[0], signalVersion)
+	if int(raw[0]) != signalEnvelopeVersion {
+		return c, fmt.Errorf("识别码 envelope 不兼容：收到 %d，需要 %d", raw[0], signalEnvelopeVersion)
 	}
-	count := int(raw[1])
+	wantKind := byte(1)
+	if expectedKind == "confirm" {
+		wantKind = 2
+	}
+	if raw[1] != wantKind {
+		return c, errors.New("识别码 kind 与前缀不一致")
+	}
+	pos := 2
+	caps, n := binary.Uvarint(raw[pos:])
+	if n <= 0 {
+		return c, errors.New("识别码 capability 数据无效")
+	}
+	pos += n
+	if len(raw) <= pos {
+		return c, errors.New("识别码 candidate 数量缺失")
+	}
+	count := int(raw[pos])
+	pos++
 	if count <= 0 || count > maxSignalCandidates {
 		return c, errors.New("识别码 candidate 数量无效")
 	}
-	pos := 2
-	token := append([]byte(nil), raw[pos:pos+32]...)
-	pos += 32
+
+	identityLen := 32
+	if expectedKind == "confirm" {
+		identityLen = 16
+	}
+	if len(raw) < pos+identityLen+32 {
+		return c, errors.New("识别码身份数据不完整")
+	}
+	identity := append([]byte(nil), raw[pos:pos+identityLen]...)
+	pos += identityLen
 	fingerprint := append([]byte(nil), raw[pos:pos+32]...)
 	pos += 32
 
@@ -686,7 +765,7 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		}
 		flags := raw[pos]
 		pos++
-		if flags&^byte(0x07) != 0 || flags&0x06 == 0x06 {
+		if flags&^byte(0x0f) != 0 || flags&0x06 == 0x06 {
 			return c, errors.New("识别码 candidate flags 无效")
 		}
 		port := int(binary.BigEndian.Uint16(raw[pos : pos+2]))
@@ -694,9 +773,23 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		if port == 0 {
 			return c, errors.New("识别码 candidate 端口无效")
 		}
+		prefixKnown := flags&0x08 != 0
+		var prefixBits uint8
+		if prefixKnown {
+			if len(raw) <= pos {
+				return c, errors.New("识别码 candidate prefix 不完整")
+			}
+			prefixBits = raw[pos]
+			pos++
+		}
 		ipLen := 4
+		maxPrefix := uint8(32)
 		if flags&0x01 != 0 {
 			ipLen = 16
+			maxPrefix = 128
+		}
+		if prefixKnown && prefixBits > maxPrefix {
+			return c, errors.New("识别码 candidate prefix 无效")
 		}
 		if len(raw) < pos+ipLen {
 			return c, errors.New("识别码 candidate IP 数据不完整")
@@ -713,9 +806,14 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 		case 0x04:
 			typ = "portmap"
 		}
+		if typ != "host" && prefixKnown {
+			return c, errors.New("只有 HOST candidate 可以携带 prefix")
+		}
 		cands = append(cands, signalCandidate{
-			Addr: net.JoinHostPort(ip.String(), fmt.Sprint(port)),
-			Type: typ,
+			Addr:        net.JoinHostPort(ip.String(), fmt.Sprint(port)),
+			Type:        typ,
+			PrefixBits:  prefixBits,
+			PrefixKnown: prefixKnown,
 		})
 	}
 	if pos != len(raw) {
@@ -723,13 +821,25 @@ func decodeSignal(s, expectedKind string) (signalCode, error) {
 	}
 
 	c = signalCode{
-		Version:     signalVersion,
-		Kind:        expectedKind,
-		Token:       base64.RawURLEncoding.EncodeToString(token),
-		Candidates:  cands,
-		Fingerprint: hex.EncodeToString(fingerprint),
+		Version:      signalEnvelopeVersion,
+		Capabilities: caps,
+		Kind:         expectedKind,
+		Candidates:   cands,
+		Fingerprint:  hex.EncodeToString(fingerprint),
+	}
+	if expectedKind == "connect" {
+		c.Token = base64.RawURLEncoding.EncodeToString(identity)
+	} else {
+		c.SessionBinding = base64.RawURLEncoding.EncodeToString(identity)
 	}
 	return c, nil
+}
+
+func makeSignalBinding(token []byte) []byte {
+	mac := hmac.New(sha256.New, token)
+	_, _ = mac.Write([]byte("p2p-friend/reply-binding"))
+	sum := mac.Sum(nil)
+	return append([]byte(nil), sum[:16]...)
 }
 
 func readSignalLine(in *bufio.Reader) (string, error) {
