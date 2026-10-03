@@ -25,6 +25,7 @@ const (
 	resilientAckTimeout      = 5 * time.Second
 	resilientWindowBytes     = 4 * 1024 * 1024
 	resilientFailureThreshold = 3
+	resilientLaneWriteTimeout = 30 * time.Second
 )
 
 type managedDataLane struct {
@@ -189,7 +190,9 @@ func (st *resilientStripeState) failLane(target io.ReadWriteCloser, reason error
 		return
 	}
 	_ = failed.lane.Close()
-	_ = failed.qc.CloseWithError(0, "data lane failed")
+	if failed.qc != nil {
+		_ = failed.qc.CloseWithError(0, "data lane failed")
+	}
 	if failed.owner != nil {
 		_ = failed.owner.Close()
 	}
@@ -225,7 +228,13 @@ func (st *resilientStripeState) writeChunk(ctx context.Context, preferred int, f
 		for step := 0; step < len(lanes); step++ {
 			lane := lanes[(preferred+step)%len(lanes)]
 			lane.mu.Lock()
+			if d, ok := lane.lane.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				_ = d.SetWriteDeadline(time.Now().Add(resilientLaneWriteTimeout))
+			}
 			n, werr := lane.lane.Write(frame)
+			if d, ok := lane.lane.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				_ = d.SetWriteDeadline(time.Time{})
+			}
 			lane.mu.Unlock()
 			if werr == nil && n == len(frame) {
 				return nil
