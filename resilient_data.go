@@ -584,7 +584,11 @@ func newResilientFlowTuner(goos, linkMode string) *resilientFlowTuner {
 	if goos == "windows" && !strings.HasSuffix(linkMode, "-LAN") {
 		initial = 8 * 1024 * 1024
 	}
-	return &resilientFlowTuner{current: initial, min: resilientDefaultWindowBytes, max: maxWindow}
+	return &resilientFlowTuner{
+		current: int64(initial),
+		min:     int64(resilientDefaultWindowBytes),
+		max:     int64(maxWindow),
+	}
 }
 
 func (t *resilientFlowTuner) observe(bytes int64, elapsed time.Duration, failed bool) (int64, bool) {
