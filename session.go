@@ -110,6 +110,13 @@ func (s *peerSession) handleReadError(err error) {
 	if err == nil {
 		return
 	}
+	if !s.closing.Load() && !s.remoteBye.Load() {
+		s.transportErrMu.Lock()
+		if s.transportErr == nil {
+			s.transportErr = err
+		}
+		s.transportErrMu.Unlock()
+	}
 	if !s.closing.Load() && !s.remoteBye.Load() && isRemoteGracefulClose(err) {
 		s.remoteBye.Store(true)
 		s.closing.Store(true)
@@ -287,6 +294,12 @@ func (s *peerSession) remoteCd(path string) error {
 	return nil
 }
 
+func (s *peerSession) terminalTransportError() error {
+	s.transportErrMu.Lock()
+	defer s.transportErrMu.Unlock()
+	return s.transportErr
+}
+
 func (s *peerSession) get(remotePath, localDest string) error {
 	if strings.TrimSpace(remotePath) == "" {
 		return errors.New("get 需要远端路径")
@@ -320,6 +333,9 @@ func (s *peerSession) get(remotePath, localDest string) error {
 	case err := <-pg.done:
 		return err
 	case <-s.closed:
+		if cerr := s.terminalTransportError(); cerr != nil {
+			return fmt.Errorf("connection closed during get: %w", cerr)
+		}
 		return errors.New("connection closed during get")
 	}
 }
