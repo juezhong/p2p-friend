@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -195,10 +196,11 @@ func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 // 学到的 prflx endpoint 会立即进入下一轮，而不是像旧实现一样固定初始 targets。
 func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 	type target struct {
-		ep   *udpEndpoint
-		addr *net.UDPAddr
-		rank int
-		key  string
+		ep    *udpEndpoint
+		addr  *net.UDPAddr
+		rank  int
+		delay time.Duration
+		key   string
 	}
 
 	for {
@@ -207,7 +209,6 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 		}
 		var targets []target
 		seen := map[string]struct{}{}
-		preferGlobalIPv6 := false
 		for _, ep := range p.endpoints {
 			for _, raw := range p.remoteCandidates() {
 				addr, family, err := parseCandidate(raw)
@@ -220,10 +221,11 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 				}
 				seen[key] = struct{}{}
 				rank := candidateRank(raw)
-				if rank == 0 {
-					preferGlobalIPv6 = true
-				}
-				targets = append(targets, target{ep: ep, addr: addr, rank: rank, key: key})
+				targets = append(targets, target{
+					ep: ep, addr: addr, rank: rank,
+					delay: candidateDialDelay(raw, addr),
+					key: key,
+				})
 			}
 		}
 		if len(targets) == 0 {
@@ -243,14 +245,14 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				if preferGlobalIPv6 && t.rank != 0 {
+				if t.delay > 0 {
 					select {
 					case <-roundCtx.Done():
 						return
-					case <-time.After(250 * time.Millisecond):
+					case <-time.After(t.delay):
 					}
 				}
-				dialCtx, stop := context.WithTimeout(roundCtx, 4*time.Second)
+				dialCtx, stop := context.WithTimeout(roundCtx, 2*time.Second)
 				defer stop()
 				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
 				if err != nil {
@@ -304,6 +306,63 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 
 func connectionTimeoutError() error {
 	return errors.New("P2P UDP/QUIC 连接超时；当前网络的 NAT/防火墙没有形成可用直连路径")
+}
+
+// candidateDialDelay 给真正的 LAN 路径一个短 head start，同时保留公网直连、
+// portmap、STUN 和运行时 prflx 作为自动 fallback。这里不是永久屏蔽后续路径，
+// 只是避免同一局域网中公网 hairpin/NAT 路径抢先赢得 QUIC race。
+func candidateDialDelay(c signalCandidate, addr *net.UDPAddr) time.Duration {
+	if addr == nil || addr.IP == nil {
+		return 250 * time.Millisecond
+	}
+	if strings.EqualFold(c.Type, "host") && isSameSubnetIP(addr.IP) {
+		return 0
+	}
+	if strings.EqualFold(c.Type, "prflx") {
+		return 60 * time.Millisecond
+	}
+	if strings.EqualFold(c.Type, "host") {
+		return 100 * time.Millisecond
+	}
+	if strings.EqualFold(c.Type, "portmap") {
+		return 160 * time.Millisecond
+	}
+	if strings.EqualFold(c.Type, "srflx") {
+		return 220 * time.Millisecond
+	}
+	return 250 * time.Millisecond
+}
+
+func isSameSubnetIP(remote net.IP) bool {
+	if remote == nil {
+		return false
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, raw := range addrs {
+			ipNet, ok := raw.(*net.IPNet)
+			if !ok || ipNet.IP == nil || ipNet.Mask == nil {
+				continue
+			}
+			if (remote.To4() == nil) != (ipNet.IP.To4() == nil) {
+				continue
+			}
+			if ipNet.Contains(remote) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // punch packet:
