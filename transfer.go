@@ -89,11 +89,19 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	defer p.closeLine()
 	defer s.clearCurrentTuning()
 
+	var fileSeq uint64
 	for _, e := range entries {
 		if cause := context.Cause(ctx); cause != nil {
 			return s.finishCancelledOutbound(ot, cause)
 		}
-		start := entryStart{Path: e.RelPath, Mode: uint32(e.Mode.Perm()), Size: e.Size, Dir: e.IsDir}
+		fileID := uint64(0)
+		if !e.IsDir {
+			fileSeq++
+			if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+				fileID = fileSeq
+			}
+		}
+		start := entryStart{Path: e.RelPath, Mode: uint32(e.Mode.Perm()), Size: e.Size, Dir: e.IsDir, FileID: fileID}
 		if err := s.writeJSONFrame(frameEntryStart, id, start); err != nil {
 			return fmt.Errorf("send entry start %s: %w", e.RelPath, err)
 		}
@@ -110,7 +118,13 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 		}
 
 		p.beginFile(e.RelPath, e.Size)
-		sum, err := s.sendFileStriped(ctx, id, e.FullPath, e.Size, p)
+		var sum []byte
+		var err error
+		if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+			sum, err = s.sendFileResilient(ctx, id, fileID, e.FullPath, e.Size, p)
+		} else {
+			sum, err = s.sendFileStriped(ctx, id, e.FullPath, e.Size, p)
+		}
 		if err != nil {
 			if cause := context.Cause(ctx); cause != nil {
 				return s.finishCancelledOutbound(ot, cause)
@@ -553,6 +567,18 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	t.currentFile = tmp
 	t.currentTemp = tmp.Name()
 	t.currentRemaining = e.Size
+	t.currentFileID = e.FileID
+	if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() && e.FileID == 0 {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		t.currentFile = nil
+		t.currentTemp = ""
+		t.markCancelledLocked("v0.16 data file missing file id")
+		reason := t.cancelWhy
+		t.mu.Unlock()
+		go s.sendCancel(id, reason)
+		return nil
+	}
 	startInboundData(s, id, t, e.Size, tmp)
 	t.currentMode = os.FileMode(e.Mode)
 	t.progress.beginFile(e.Path, e.Size)
@@ -701,6 +727,7 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 	t.currentTemp = ""
 	t.currentPath = ""
 	t.currentRemaining = 0
+	t.currentFileID = 0
 	clearInboundData(t)
 	if !existed {
 		t.createdFiles = append(t.createdFiles, path)
