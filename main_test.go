@@ -1494,7 +1494,88 @@ func TestBidirectionalQUICRaceKeepsWinnerAlive(t *testing.T) {
 	}
 }
 
-func TestCandidateDialDelayDoesNotStaggerFallbacks(t *testing.T) {
+func TestHostConnectJoinWaitUseSameRaceWinner(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	host.remoteFingerprint = append([]byte(nil), join.localFingerprint...)
+	join.remoteFingerprint = append([]byte(nil), host.localFingerprint...)
+	host.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, join), Type: "host"}})
+	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
+	host.setRemoteCapabilities(signalCapabilitiesCurrent)
+	join.setRemoteCapabilities(signalCapabilitiesCurrent)
+
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	hostCh := make(chan result, 1)
+	joinCh := make(chan result, 1)
+
+	// 使用真实交互路径：创建方 connectQUIC，加入方 waitConn。
+	go func() {
+		conn, err := join.waitConn()
+		joinCh <- result{conn: conn, err: err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	go func() {
+		conn, err := host.connectQUIC()
+		hostCh <- result{conn: conn, err: err}
+	}()
+
+	var hc, jc net.Conn
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatalf("host connect failed: %v", r.err)
+		}
+		hc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("host connect timed out")
+	}
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatalf("join wait failed: %v", r.err)
+		}
+		jc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("join wait timed out")
+	}
+	defer hc.Close()
+	defer jc.Close()
+
+	hrc, hok := hc.(*rtcConn)
+	jrc, jok := jc.(*rtcConn)
+	if !hok || !jok {
+		t.Fatalf("unexpected conn types: %T %T", hc, jc)
+	}
+	if hrc.outbound == jrc.outbound {
+		t.Fatalf("both peers selected same QUIC direction: host=%v join=%v", hrc.outbound, jrc.outbound)
+	}
+
+	hostAuth := make(chan error, 1)
+	go func() { hostAuth <- authenticatePeerConn(hc, host.token, roleHost) }()
+	if err := authenticatePeerConn(jc, join.token, roleJoin); err != nil {
+		t.Fatalf("join auth failed after winner arbitration: %v", err)
+	}
+	if err := <-hostAuth; err != nil {
+		t.Fatalf("host auth failed after winner arbitration: %v", err)
+	}
+}
+
+
+func TestCandidateDialDelayGivesOnlyLANHostHeadStart(t *testing.T) {
+	// 公网/NAT candidate 不应该被误认为 LAN；它们只等待一个很短的 head start。
 	cases := []struct {
 		typ  string
 		addr string
@@ -1509,9 +1590,34 @@ func TestCandidateDialDelayDoesNotStaggerFallbacks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := candidateDialDelay(signalCandidate{Addr: tc.addr, Type: tc.typ}, addr); got != 0 {
-			t.Fatalf("%s delay=%v want=0", tc.typ, got)
+		if got := candidateDialDelay(signalCandidate{Addr: tc.addr, Type: tc.typ}, addr); got != lanCandidateHeadStart {
+			t.Fatalf("%s delay=%v want=%v", tc.typ, got, lanCandidateHeadStart)
 		}
+	}
+}
+
+func TestOverlappingPrivatePrefixesDoNotForceStrictLAN(t *testing.T) {
+	// 两个不同 NAT 后面的家庭网络非常常见地同时使用 192.168.1.0/24。
+	// prefix overlap 只能作为 LAN 优先提示，不能成为“严格 LAN”结论。
+	local := signalCandidate{
+		Addr: "192.168.1.21:50000", Type: "host",
+		PrefixKnown: true, PrefixBits: 24,
+	}
+	remote := signalCandidate{
+		Addr: "192.168.1.6:50001", Type: "host",
+		PrefixKnown: true, PrefixBits: 24,
+	}
+	if !candidatesShareLAN(local, remote) {
+		t.Fatal("fixture should have overlapping private prefixes")
+	}
+
+	// 非 LAN fallback 仍应在短 head start 后被允许参与。
+	public, err := net.ResolveUDPAddr("udp", "118.112.118.32:9779")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := candidateDialDelay(signalCandidate{Addr: public.String(), Type: "srflx"}, public); got != lanCandidateHeadStart {
+		t.Fatalf("public fallback delay=%v want=%v", got, lanCandidateHeadStart)
 	}
 }
 
