@@ -1289,7 +1289,7 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 	hostCh := make(chan result, 1)
 	joinCh := make(chan result, 1)
 	go func() {
-		conn, err := host.acceptQUIC()
+		conn, err := host.connectQUIC()
 		hostCh <- result{conn: conn, err: err}
 	}()
 	go func() {
