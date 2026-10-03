@@ -353,3 +353,14 @@ v0.15 是新的稳定协议基线，因此 v0.14.x 与 v0.15 之间不互通；�
 ### v0.15.1 公网/NAT 路径全并发
 
 当识别码确认不存在 mutual LAN 时，不再对 host / portmap / prflx / srflx 人为 stagger。所有公网/NAT candidate 立即并发发起 QUIC Dial，首个成功握手的路径胜出。strict LAN 策略保持不变，stable signal envelope 继续兼容 v0.15.0。
+
+
+### v0.15.2 加入方等待改为事件驱动
+
+加入方生成 `P2PF-REPLY` 后不再立即启动 LAN/QUIC 连接超时。此时只保持 listener 和必要的低频 authenticated punch 状态，等待创建方真正开始网络活动。
+
+mutual LAN 场景下，加入方只被动监听 LAN QUIC，可无限期等待创建方粘贴 REPLY；创建方真正开始 Dial 后才建立连接。
+
+非 LAN / NAT 场景下，加入方低频维持 NAT mapping，并监听经过 HMAC/nonce/role 校验的 punch。只有收到创建方的合法 punch 后，才切换到高频 punch + 主动 candidate race。
+
+因此“用户还没粘贴回传码”和“链路已经开始建立但失败”被彻底分成两个状态，不再依靠延长 timeout 猜测。
