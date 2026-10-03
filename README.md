@@ -370,3 +370,12 @@ v0.15 是新的稳定协议基线，因此 v0.14.x 与 v0.15 之间不互通；�
 - 私网 HOST prefix 重叠不再直接判定为“同一局域网”；例如两个不同 NAT 后都使用 `192.168.1.0/24` 时，会继续尝试公网 IPv6 / portmap / STUN / NAT punch fallback。
 - 疑似 LAN HOST 仍获得很短的建连优先级，真实同局域网场景不会失去快速直连。
 - data stripe 独立 UDP source port 失败时，为共享主 UDP socket fallback 预留明确时间预算，减少 `data-stripes=0` 的偶发退化。
+
+
+### v0.16.0 控制/数据平面分离
+
+v0.16.0 在双方协商到新 capability 后，主 QUIC 只承担 RPC、目录操作、传输控制、ACK 和会话保活，不再发送普通文件 payload。文件数据使用最多 4 条可独立关闭和重建的 data-only QUIC。
+
+发送端以有界未确认窗口发送文件块；接收端仅对已经按 offset 连续写盘的数据发送累计 ACK。某条 data QUIC 即使在 `Write()` 返回成功后才中断，发送端也会因为 ACK 缺口重传未确认窗口。每个文件使用独立 file ID，避免目录传输时迟到重复块污染后续文件。
+
+Windows 传输恢复自适应加速：从 2 lane / 128 KiB 起步，稳定时快速探测到 4 lane / 1 MiB；只有连续多次错误或吞吐退化才降档。数据链路故障只重建数据面，主 control session 保持可用。

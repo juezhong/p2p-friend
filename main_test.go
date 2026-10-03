@@ -821,6 +821,36 @@ func TestJoinWaitConnDoesNotExpireBeforeCreatorStarts(t *testing.T) {
 	}
 }
 
+
+func TestResilientWindowsTunerAcceleratesAndRequiresRepeatedFailures(t *testing.T) {
+	tuner := newResilientTransferTuner("windows", 4)
+	if p := tuner.current(); p.lanes != 2 || p.chunkSize != 128*1024 {
+		t.Fatalf("windows initial profile=%#v want 2 lanes / 128 KiB", p)
+	}
+
+	// 单次、两次失败都不应立即降速。
+	for i := 0; i < resilientFailureThreshold-1; i++ {
+		before := tuner.current()
+		after, changed := tuner.observe(0, 0, true)
+		if changed || after != before {
+			t.Fatalf("failure %d downshifted too early: before=%#v after=%#v", i+1, before, after)
+		}
+	}
+	after, changed := tuner.observe(0, 0, true)
+	if !changed || after.lanes >= 2 {
+		t.Fatalf("third consecutive failure did not downshift: %#v changed=%v", after, changed)
+	}
+
+	// 稳定窗口应主动向上探测，最终达到 4 lane / 1 MiB。
+	for i := 0; i < 8; i++ {
+		tuner.observe(4*1024*1024, 200*time.Millisecond, false)
+	}
+	p := tuner.current()
+	if p.lanes != 4 || p.chunkSize != maxDataChunkSize || p.pace != 0 {
+		t.Fatalf("windows tuner did not reach fast profile: %#v", p)
+	}
+}
+
 func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	host, err := newPeer(true)
 	if err != nil {
@@ -870,15 +900,22 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 		t.Fatalf("listener auth: %v", err)
 	}
 
+	if hc := hostConn.(*rtcConn); len(hc.lanes) != 0 {
+		t.Fatalf("v0.16 primary host QUIC unexpectedly has %d data streams", len(hc.lanes))
+	}
+	if jc := joinConn.(*rtcConn); len(jc.lanes) != 0 {
+		t.Fatalf("v0.16 primary join QUIC unexpectedly has %d data streams", len(jc.lanes))
+	}
+
 	hostStripeCh := make(chan int, 1)
 	go func() { hostStripeCh <- setupDataStripes(hostConn, host.token) }()
 	joinStripes := setupDataStripes(joinConn, join.token)
 	hostStripes := <-hostStripeCh
-	if joinStripes != maxDataConnections-primaryDataStreams {
-		t.Fatalf("join data stripes=%d want=%d", joinStripes, maxDataConnections-primaryDataStreams)
+	if joinStripes != resilientDataLanes {
+		t.Fatalf("join data stripes=%d want=%d", joinStripes, resilientDataLanes)
 	}
-	if hostStripes != maxDataConnections-primaryDataStreams {
-		t.Fatalf("host data stripes=%d want=%d", hostStripes, maxDataConnections-primaryDataStreams)
+	if hostStripes != resilientDataLanes {
+		t.Fatalf("host data stripes=%d want=%d", hostStripes, resilientDataLanes)
 	}
 	if jc, ok := joinConn.(*rtcConn); !ok || jc.DataConnectionCount() != maxDataConnections {
 		t.Fatalf("join data connections=%v", joinConn)
@@ -918,14 +955,36 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	go hs.readLoop()
 	go js.readLoop()
 
-	if st := dataState(js); st == nil || len(st.lanes) != parallelLanes {
-		t.Fatalf("join QUIC data lanes = %#v", st)
+	if dataState(js) != nil || dataState(hs) != nil {
+		t.Fatal("v0.16 must not attach legacy primary data lanes")
 	}
-	if st := dataState(hs); st == nil || len(st.lanes) != parallelLanes {
-		t.Fatalf("host QUIC data lanes = %#v", st)
+	if st := resilientStripeStateFor(joinConn.(*rtcConn)); st == nil || st.count() != resilientDataLanes {
+		t.Fatalf("join resilient data lanes=%v", st)
+	}
+	if st := resilientStripeStateFor(hostConn.(*rtcConn)); st == nil || st.count() != resilientDataLanes {
+		t.Fatalf("host resilient data lanes=%v", st)
+	}
+	if os.Getenv("P2PF_LONG_TRANSFER_TEST") == "1" {
+		// 真机长传期间主动杀掉一条 data-only QUIC。
+		// control-only 主连接必须继续存活，数据管理器需要重建 lane，
+		// 未确认窗口由 ACK 机制自动重传。
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			st := resilientStripeStateFor(joinConn.(*rtcConn))
+			if st == nil {
+				return
+			}
+			lanes := st.snapshot()
+			if len(lanes) > 0 && lanes[0].qc != nil {
+				_ = lanes[0].qc.CloseWithError(0x51, "test injected data-lane failure")
+			}
+		}()
 	}
 	if err := js.put("source.bin", "received.bin"); err != nil {
 		t.Fatalf("QUIC put: %v", err)
+	}
+	if _, err := js.remotePwd(); err != nil {
+		t.Fatalf("control session did not survive data-lane failure: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(hostDir, "received.bin"))
 	if err != nil {

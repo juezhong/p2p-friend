@@ -27,6 +27,7 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		closed:     make(chan struct{}),
 		pendingRPC: make(map[uint64]chan rpcResponse),
 		pendingGet: make(map[uint64]*pendingGet),
+		pendingAck: make(map[uint64]*transferAckState),
 		outbound:   make(map[uint64]*outboundTransfer),
 		inbound:    make(map[uint64]*inboundTransfer),
 		localCwd:   cwd,
@@ -35,7 +36,13 @@ func initPeerSession(conn net.Conn, roleName, cwd string) *peerSession {
 		linkMode:             connectionMode(conn),
 		transferCoordinator: coordinator,
 	}
-	attachDataLanes(s, conn)
+	if rc, ok := conn.(*rtcConn); ok && rc.ResilientDataV16() {
+		if st := resilientStripeStateFor(rc); st != nil {
+			st.setSession(s)
+		}
+	} else {
+		attachDataLanes(s, conn)
+	}
 	return s
 }
 
@@ -92,6 +99,11 @@ func (s *peerSession) readLoop() {
 		case frameTransferResult:
 			if err := s.handleTransferResult(f.ID, f.Payload); err != nil {
 				consolePrintf("[协议] 传输结果无效: %v\n", err)
+				return
+			}
+		case frameDataAck:
+			if err := s.handleDataAck(f.ID, f.Payload); err != nil {
+				consolePrintf("[协议] 数据确认无效: %v\n", err)
 				return
 			}
 		case frameBye:
@@ -536,8 +548,13 @@ func (s *peerSession) status() {
 				consolePrintf("  - %s\n", addr)
 			}
 		}
-		consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
-			maxInt(0, info.DataConnections-1), info.DataConnections)
+		if info.ControlOnlyPrimary {
+			consolePrintf("QUIC connections: control-only=1, data-only=%d, total=%d\n",
+				info.DataConnections, info.DataConnections+1)
+		} else {
+			consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
+				maxInt(0, info.DataConnections-1), info.DataConnections)
+		}
 		consolePrintf("Data streams: %d\n", info.Streams)
 		if len(info.DataPaths) > 0 {
 			consolePrintln("Data UDP flows:")
@@ -545,7 +562,11 @@ func (s *peerSession) status() {
 				consolePrintf("  - %s\n", path)
 			}
 		}
-		consolePrintln("端口关系: 主 QUIC 继续复用打洞 UDP socket；额外 data stripe 优先使用独立 UDP source port，失败时自动回退共享 socket。")
+		if info.ControlOnlyPrimary {
+			consolePrintln("端口关系: 主 QUIC 仅维持控制/RPC/ACK；文件数据只走可重建 data-only QUIC，单条失败不会关闭主会话。")
+		} else {
+			consolePrintln("端口关系: 主 QUIC 继续复用打洞 UDP socket；额外 data stripe 优先使用独立 UDP source port，失败时自动回退共享 socket。")
+		}
 	} else {
 		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
 	}

@@ -32,6 +32,7 @@ const (
 	frameCancel         = byte(8)
 	frameTransferResult = byte(9)
 	frameBye            = byte(10)
+	frameDataAck        = byte(12)
 
 	chunkSize       = 256 * 1024
 	maxFramePayload = 16 * 1024 * 1024
@@ -75,10 +76,11 @@ type transferStart struct {
 }
 
 type entryStart struct {
-	Path string `json:"path"`
-	Mode uint32 `json:"mode"`
-	Size int64  `json:"size"`
-	Dir  bool   `json:"dir"`
+	Path   string `json:"path"`
+	Mode   uint32 `json:"mode"`
+	Size   int64  `json:"size"`
+	Dir    bool   `json:"dir"`
+	FileID uint64 `json:"file_id,omitempty"`
 }
 
 type transferEnd struct {
@@ -142,6 +144,7 @@ type inboundTransfer struct {
 	currentHash      hash.Hash
 	currentRemaining int64
 	currentMode      os.FileMode
+	currentFileID    uint64
 
 	progress *progress
 	getReqID uint64
@@ -176,6 +179,9 @@ type peerSession struct {
 	pendingMu  sync.Mutex
 	pendingRPC map[uint64]chan rpcResponse
 	pendingGet map[uint64]*pendingGet
+
+	ackMu      sync.Mutex
+	pendingAck map[uint64]*transferAckState
 
 	transferMu sync.Mutex
 	outbound   map[uint64]*outboundTransfer

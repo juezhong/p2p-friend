@@ -770,7 +770,12 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 	defer cancel()
 
 	var control *quic.Stream
-	lanes := make([]io.ReadWriteCloser, 0, primaryDataStreams)
+	dataStreams := primaryDataStreams
+	if p.supports(capResilientDataV16) {
+		// v0.16: 主 QUIC 永远只承载 control stream，文件 payload 完全走可重建 data QUIC。
+		dataStreams = 0
+	}
+	lanes := make([]io.ReadWriteCloser, 0, dataStreams)
 	if opener {
 		st, err := qc.OpenStreamSync(ctx)
 		if err != nil {
@@ -780,7 +785,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			return nil, err
 		}
 		control = st
-		for i := 0; i < primaryDataStreams; i++ {
+		for i := 0; i < dataStreams; i++ {
 			lane, err := qc.OpenStreamSync(ctx)
 			if err != nil {
 				return nil, err
@@ -791,8 +796,8 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			lanes = append(lanes, &quicStreamConn{lane})
 		}
 	} else {
-		got := make(map[byte]*quic.Stream, primaryDataStreams+1)
-		for len(got) < primaryDataStreams+1 {
+		got := make(map[byte]*quic.Stream, dataStreams+1)
+		for len(got) < dataStreams+1 {
 			st, err := qc.AcceptStream(ctx)
 			if err != nil {
 				return nil, err
@@ -801,7 +806,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			if _, err := io.ReadFull(st, tag[:]); err != nil {
 				return nil, err
 			}
-			if tag[0] > byte(primaryDataStreams) {
+			if tag[0] > byte(dataStreams) {
 				_ = st.Close()
 				continue
 			}
@@ -815,7 +820,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 		if control == nil {
 			return nil, errors.New("QUIC control stream missing")
 		}
-		for i := 0; i < primaryDataStreams; i++ {
+		for i := 0; i < dataStreams; i++ {
 			st := got[byte(i+1)]
 			if st == nil {
 				return nil, fmt.Errorf("QUIC data stream %d missing", i)
