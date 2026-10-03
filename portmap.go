@@ -45,6 +45,14 @@ func discoverPortMappingContext(ctx context.Context, ep *udpEndpoint) (signalCan
 		workers++
 		go func() {
 			addr, cleanup, err := fn(ctx)
+			// 可能另一种端口映射协议已经先成功并取消 ctx。此时即使本协议刚好
+			// 也创建成功，也不能把结果丢进无人读取的缓冲区而留下多余路由器映射。
+			if ctx.Err() != nil {
+				if cleanup != nil {
+					cleanup()
+				}
+				return
+			}
 			result := portMapResult{addr: addr, cleanup: cleanup, method: method, err: err}
 			select {
 			case results <- result:
