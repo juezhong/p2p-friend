@@ -201,7 +201,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		return h.Sum(nil), nil
 	}
 
-	profile := fastTransferProfile(len(ds.lanes))
+	active := ds.healthyLaneIndices()
+	profile := sustainedTransferProfile(runtime.GOOS, len(active))
 	s.setCurrentTuning(profile)
 	defer s.clearCurrentTuning()
 
@@ -223,7 +224,7 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					releaseDataBuffer(job.chunk.buf)
 					continue
 				}
-				err := s.writePreparedDataChunkOnLane(lane, id, job.chunk)
+				err := s.writePreparedDataChunkResilient(active, lane, id, job.chunk)
 				releaseDataBuffer(job.chunk.buf)
 				if err != nil {
 					select {
@@ -234,6 +235,13 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					continue
 				}
 				p.addBytes(int64(job.chunk.payloadLen))
+				if profile.pace > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(profile.pace):
+					}
+				}
 			}
 		}(lane)
 	}
@@ -253,7 +261,10 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 			return nil, cause
 		}
 		buf := acquireDataBuffer()
-		want := int64(maxDataChunkSize)
+		want := int64(profile.chunkSize)
+		if want <= 0 || want > maxDataChunkSize {
+			want = maxDataChunkSize
+		}
 		if size-off < want {
 			want = size - off
 		}
