@@ -441,6 +441,7 @@ func isSameSubnetIP(remote net.IP) bool {
 	if err != nil {
 		return false
 	}
+	var localNets []*net.IPNet
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -454,12 +455,25 @@ func isSameSubnetIP(remote net.IP) bool {
 			if !ok || ipNet.IP == nil || ipNet.Mask == nil {
 				continue
 			}
-			if (remote.To4() == nil) != (ipNet.IP.To4() == nil) {
-				continue
-			}
-			if ipNet.Contains(remote) {
-				return true
-			}
+			localNets = append(localNets, ipNet)
+		}
+	}
+	return ipInSameSubnet(remote, localNets)
+}
+
+func ipInSameSubnet(remote net.IP, localNets []*net.IPNet) bool {
+	if remote == nil {
+		return false
+	}
+	for _, ipNet := range localNets {
+		if ipNet == nil || ipNet.IP == nil || ipNet.Mask == nil {
+			continue
+		}
+		if (remote.To4() == nil) != (ipNet.IP.To4() == nil) {
+			continue
+		}
+		if ipNet.Contains(remote) {
+			return true
 		}
 	}
 	return false
