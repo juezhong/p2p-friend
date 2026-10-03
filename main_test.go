@@ -1550,3 +1550,52 @@ func TestReceiveWindowScalesButStaysBounded(t *testing.T) {
 		t.Fatalf("receive reorder window exceeds 256 MiB: %d", maxReceiveWindowChunks*maxDataChunkSize)
 	}
 }
+
+
+func TestIPInSameSubnet(t *testing.T) {
+	_, v4net, err := net.ParseCIDR("192.168.1.6/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4net.IP = net.ParseIP("192.168.1.6")
+	_, v6net, err := net.ParseCIDR("240e:399:e80:3340::1/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v6net.IP = net.ParseIP("240e:399:e80:3340::1")
+
+	nets := []*net.IPNet{v4net, v6net}
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"192.168.1.100", true},
+		{"192.168.2.100", false},
+		{"118.112.118.32", false},
+		{"240e:399:e80:3340:c218:50ff:fece:85dd", true},
+		{"240e:399:e80:3341::2", false},
+	}
+	for _, tc := range cases {
+		if got := ipInSameSubnet(net.ParseIP(tc.ip), nets); got != tc.want {
+			t.Fatalf("ipInSameSubnet(%s)=%v want=%v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+func TestSameSubnetHostCandidateDetection(t *testing.T) {
+	_, localNet, err := net.ParseCIDR("192.168.1.6/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localNet.IP = net.ParseIP("192.168.1.6")
+	addr := &net.UDPAddr{IP: net.ParseIP("192.168.1.100"), Port: 54731}
+	if !strings.EqualFold(signalCandidate{Addr: addr.String(), Type: "host"}.Type, "host") {
+		t.Fatal("host candidate type setup failed")
+	}
+	if !ipInSameSubnet(addr.IP, []*net.IPNet{localNet}) {
+		t.Fatal("same-subnet HOST candidate was not recognized")
+	}
+	if ipInSameSubnet(net.ParseIP("118.112.118.32"), []*net.IPNet{localNet}) {
+		t.Fatal("public srflx address incorrectly recognized as LAN")
+	}
+}

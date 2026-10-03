@@ -280,14 +280,19 @@ func classifyQUICLink(qc *quic.Conn, candidates []signalCandidate) string {
 		return "QUIC"
 	}
 	ip := addr.IP
-	if ip.To4() == nil {
-		if ip.IsPrivate() {
+	// 是否属于本机接口同一子网比 IsPrivate 更准确：全局 IPv6 同一 /64
+	// 也是 LAN，而 RFC1918 地址跨路由器时不一定是同一局域网。
+	if isSameSubnetIP(ip) {
+		if ip.To4() == nil {
 			return "IPv6-LAN"
 		}
+		return "IPv4-LAN"
+	}
+	if ip.To4() == nil {
 		return "IPv6-DIRECT"
 	}
 	if ip.IsPrivate() {
-		return "IPv4-LAN"
+		return "IPv4-PRIVATE-DIRECT"
 	}
 
 	remote := addr.String()
