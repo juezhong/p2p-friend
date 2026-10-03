@@ -112,6 +112,7 @@ type progress struct {
 	CurrentSize int64
 	Prefix      string
 	Silent      bool
+	Multi       bool
 	lineOpen    bool
 }
 
