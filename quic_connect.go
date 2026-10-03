@@ -30,7 +30,7 @@ type quicConnectResult struct {
 	outbound bool
 }
 
-// connectQUIC 是 v12 的默认建链入口。双方都先启动 QUIC listener，再同时对远端
+// connectQUIC 是 v14 的默认建链入口。双方都先启动 QUIC listener，再同时对远端
 // candidates 拨号。创建方优先保留 inbound，加入方优先保留 outbound，从而在两条
 // 方向同时成功时稳定选中同一条 connection；首选方向不可达时短暂等待后使用反向路径。
 func (p *rtcPeer) connectQUIC() (net.Conn, error) {
@@ -181,7 +181,7 @@ func (p *rtcPeer) startAcceptWorkers(ctx context.Context, results chan<- quicCon
 	return started
 }
 
-// dialQUIC 保留为主动连接入口；v12 默认使用 connectQUIC。
+// dialQUIC 保留为主动连接入口；v14 默认使用 connectQUIC。
 func (p *rtcPeer) dialQUIC() (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
@@ -505,7 +505,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 	defer cancel()
 
 	var control *quic.Stream
-	lanes := make([]io.ReadWriteCloser, 0, parallelLanes)
+	lanes := make([]io.ReadWriteCloser, 0, primaryDataStreams)
 	if opener {
 		st, err := qc.OpenStreamSync(ctx)
 		if err != nil {
@@ -515,7 +515,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			return nil, err
 		}
 		control = st
-		for i := 0; i < parallelLanes; i++ {
+		for i := 0; i < primaryDataStreams; i++ {
 			lane, err := qc.OpenStreamSync(ctx)
 			if err != nil {
 				return nil, err
@@ -526,8 +526,8 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			lanes = append(lanes, &quicStreamConn{lane})
 		}
 	} else {
-		got := make(map[byte]*quic.Stream, parallelLanes+1)
-		for len(got) < parallelLanes+1 {
+		got := make(map[byte]*quic.Stream, primaryDataStreams+1)
+		for len(got) < primaryDataStreams+1 {
 			st, err := qc.AcceptStream(ctx)
 			if err != nil {
 				return nil, err
@@ -536,7 +536,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 			if _, err := io.ReadFull(st, tag[:]); err != nil {
 				return nil, err
 			}
-			if tag[0] > byte(parallelLanes) {
+			if tag[0] > byte(primaryDataStreams) {
 				_ = st.Close()
 				continue
 			}
@@ -550,7 +550,7 @@ func establishStreams(qc *quic.Conn, p *rtcPeer, opener bool) (net.Conn, error) 
 		if control == nil {
 			return nil, errors.New("QUIC control stream missing")
 		}
-		for i := 0; i < parallelLanes; i++ {
+		for i := 0; i < primaryDataStreams; i++ {
 			st := got[byte(i+1)]
 			if st == nil {
 				return nil, fmt.Errorf("QUIC data stream %d missing", i)
