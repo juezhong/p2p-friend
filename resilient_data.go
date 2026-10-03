@@ -995,9 +995,9 @@ func (s *peerSession) sendFileResilientSliding(
 				if next, changed := tuner.observe(bytes, elapsed, false); changed {
 					profile = next
 				}
-				if window, changed := flow.observe(bytes, elapsed, false); changed {
-					consolePrintf("[传输] 自适应 flight window -> %s\n", humanBytes(window))
-				}
+				// 正常自适应调节属于内部传输策略，不刷用户终端。
+				// 当前 lanes/chunk/queue/flight 仍可通过 status 查看。
+				flow.observe(bytes, elapsed, false)
 				publish(profile)
 			}
 			sampleAck = acked
@@ -1067,9 +1067,9 @@ func (s *peerSession) sendFileResilientSliding(
 				if next, changed := tuner.observe(0, 0, true); changed {
 					profile = next
 				}
-				if _, changed := flow.observe(0, 0, true); changed {
-					consolePrintf("[传输] 连续数据面失败，flight window 降至 %s\n", humanBytes(flow.current))
-				}
+				// 连续失败触发的自动降档同样保持静默；真正的 lane 故障、
+				// 重建/重传失败仍由数据链路错误路径报告。
+				flow.observe(0, 0, true)
 				publish(profile)
 				if retries >= 20 {
 					return nil, fmt.Errorf("data plane failed after repeated retransmit attempts: %w", err)
