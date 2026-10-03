@@ -657,6 +657,8 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	join.fingerprint = append([]byte(nil), host.fingerprint...)
 	host.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, join), Type: "host"}})
 	join.setRemoteCandidates([]signalCandidate{{Addr: ipv4EndpointAddr(t, host), Type: "host"}})
+	host.setRemoteCapabilities(signalCapabilitiesCurrent)
+	join.setRemoteCapabilities(signalCapabilitiesCurrent)
 
 	type connResult struct {
 		conn net.Conn
