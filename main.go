@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -210,8 +211,20 @@ func runPeerShell(conn net.Conn, roleName, cwd string, in *bufio.Reader) error {
 	defer s.close(false)
 	go s.readLoop()
 
-	if remote, err := s.remotePwd(); err == nil {
-		s.setRemoteCwd(remote)
+	// 远端 cwd 只是 shell 展示信息，不应阻塞会话就绪。
+	// LAN 通常几十毫秒内就能拿到；WAN 超过短预算时先进入命令行，
+	// RPC 在后台完成后更新后续 prompt。
+	pwdReady := make(chan struct{}, 1)
+	go func() {
+		_, _ = s.remotePwd()
+		select {
+		case pwdReady <- struct{}{}:
+		default:
+		}
+	}()
+	select {
+	case <-pwdReady:
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	consolePrintln("")

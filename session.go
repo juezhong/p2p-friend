@@ -580,9 +580,18 @@ func (s *peerSession) status() {
 	}
 	tuning := s.currentTuning()
 	if tuning.lanes > 0 {
-		consolePrintf("发送流水线: lanes=%d, chunk=%s, queue≈%s, pacing=%s\n",
-			tuning.lanes, humanBytes(int64(tuning.chunkSize)),
-			humanBytes(int64(tuning.lanes*sendQueueDepthPerLane*tuning.chunkSize)), tuning.pace)
+		queueBytes := int64(tuning.queueDepth * tuning.chunkSize)
+		if queueBytes <= 0 {
+			queueBytes = int64(tuning.lanes * sendQueueDepthPerLane * tuning.chunkSize)
+		}
+		if tuning.flightBytes > 0 {
+			consolePrintf("发送流水线: lanes=%d, chunk=%s, queue≈%s, flight≈%s, pacing=%s\n",
+				tuning.lanes, humanBytes(int64(tuning.chunkSize)), humanBytes(queueBytes),
+				humanBytes(tuning.flightBytes), tuning.pace)
+		} else {
+			consolePrintf("发送流水线: lanes=%d, chunk=%s, queue≈%s, pacing=%s\n",
+				tuning.lanes, humanBytes(int64(tuning.chunkSize)), humanBytes(queueBytes), tuning.pace)
+		}
 	}
 
 	consolePrintf("本地目录: %s\n", s.getLocalCwd())

@@ -31,7 +31,10 @@ const (
 	// v0.16.1 对本地高速链路恢复 64 MiB 有界 flight window。
 	resilientDefaultWindowBytes = 8 * 1024 * 1024
 	resilientLANWindowBytes     = 64 * 1024 * 1024
-	resilientLaneWriteTimeout = 30 * time.Second
+	resilientLANMaxWindowBytes  = 256 * 1024 * 1024
+	resilientWANMaxWindowBytes  = 128 * 1024 * 1024
+	resilientAckSampleBytes     = 32 * 1024 * 1024
+	resilientLaneWriteTimeout   = 30 * time.Second
 )
 
 type managedDataLane struct {
@@ -276,26 +279,19 @@ func startResilientDataStripes(c *rtcConn, token []byte) int {
 	}
 	resilientStripes.Store(c, st)
 
-	c.peer.primaryAcceptWG.Wait()
-	if c.outbound {
-		for i := 1; i <= resilientDataLanes; i++ {
-			go st.repairLoop(i)
+	// data-only QUIC 是数据面优化，不允许阻塞 control session / shell 就绪。
+	// 主 QUIC 认证完成后立即返回；accept/dial 在后台并行建立，真正开始文件传输时
+	// waitForLanes() 会等待至少一条可用 lane，其余 lane 可继续热插入。
+	go func() {
+		c.peer.primaryAcceptWG.Wait()
+		if c.outbound {
+			for i := 1; i <= resilientDataLanes; i++ {
+				go st.repairLoop(i)
+			}
+		} else {
+			st.acceptLoop()
 		}
-	} else {
-		go st.acceptLoop()
-	}
-
-	deadline := time.NewTimer(resilientInitialWait)
-	defer deadline.Stop()
-	for st.count() < resilientDataLanes {
-		select {
-		case <-st.notify:
-		case <-deadline.C:
-			return st.count()
-		case <-ctx.Done():
-			return st.count()
-		}
-	}
+	}()
 	return st.count()
 }
 
@@ -514,12 +510,16 @@ func resilientSendQueueDepth(goos, linkMode string, lanes int) int {
 	if lanes < 1 {
 		lanes = 1
 	}
-	// 恢复 v0.15.3 Linux LAN 的 16 chunk/lane 预取深度。
-	// Windows 继续维持浅队列，避免 Winsock UDP send queue 被突发写满。
-	if goos == "linux" && strings.HasSuffix(linkMode, "-LAN") {
-		return lanes * 16
+	// 队列只负责让磁盘/hash/QUIC worker 解耦；真正的可靠飞行窗口由累计 ACK 限制。
+	// Linux/macOS 可更积极，Windows 仍保留较小上限避免 Winsock UDP 突发队列退化。
+	switch {
+	case goos == "linux" && strings.HasSuffix(linkMode, "-LAN"):
+		return lanes * 32
+	case goos != "windows":
+		return lanes * 8
+	default:
+		return lanes * 4
 	}
-	return lanes * 2
 }
 
 func (t *resilientTransferTuner) observe(bytes int64, elapsed time.Duration, failed bool) (transferTuningProfile, bool) {
@@ -562,9 +562,91 @@ func (t *resilientTransferTuner) observe(bytes int64, elapsed time.Duration, fai
 }
 
 
+
+type resilientFlowTuner struct {
+	current   int64
+	min       int64
+	max       int64
+	baseline  float64
+	bad       int
+	failures  int
+}
+
+func newResilientFlowTuner(goos, linkMode string) *resilientFlowTuner {
+	initial := resilientDefaultWindowBytes
+	maxWindow := resilientWANMaxWindowBytes
+	if strings.HasSuffix(linkMode, "-LAN") {
+		initial = resilientLANWindowBytes
+		maxWindow = resilientLANMaxWindowBytes
+	}
+	// Windows 也参与同一套自适应，但从更小的 WAN 窗口起步，
+	// 避免瞬间向 Winsock 填入过多 UDP 数据。
+	if goos == "windows" && !strings.HasSuffix(linkMode, "-LAN") {
+		initial = 8 * 1024 * 1024
+	}
+	return &resilientFlowTuner{
+		current: int64(initial),
+		min:     int64(resilientDefaultWindowBytes),
+		max:     int64(maxWindow),
+	}
+}
+
+func (t *resilientFlowTuner) observe(bytes int64, elapsed time.Duration, failed bool) (int64, bool) {
+	old := t.current
+	if failed {
+		t.failures++
+		if t.failures >= resilientFailureThreshold && t.current > t.min {
+			t.current /= 2
+			if t.current < t.min {
+				t.current = t.min
+			}
+			t.failures = 0
+			t.bad = 0
+		}
+		return t.current, t.current != old
+	}
+	t.failures = 0
+	if bytes <= 0 || elapsed <= 0 {
+		return t.current, false
+	}
+	rate := float64(bytes) / elapsed.Seconds()
+	if t.baseline == 0 {
+		t.baseline = rate
+		if t.current < t.max {
+			t.current *= 2
+			if t.current > t.max {
+				t.current = t.max
+			}
+		}
+		return t.current, t.current != old
+	}
+	if rate < t.baseline*0.80 {
+		t.bad++
+	} else {
+		t.bad = 0
+		// 只要扩窗后吞吐没有明显恶化，就继续向上探测，直到链路不再受应用窗口限制。
+		if t.current < t.max {
+			t.current *= 2
+			if t.current > t.max {
+				t.current = t.max
+			}
+		}
+	}
+	t.baseline = t.baseline*0.70 + rate*0.30
+	if t.bad >= resilientFailureThreshold && t.current > t.min {
+		t.current /= 2
+		if t.current < t.min {
+			t.current = t.min
+		}
+		t.bad = 0
+	}
+	return t.current, t.current != old
+}
+
 type resilientSendChunk struct {
-	frame []byte
-	size  int
+	frame  []byte
+	size   int
+	offset int64
 }
 
 func newResilientChunk(id, fileID uint64, offset int64, payloadLen int) resilientSendChunk {
@@ -573,7 +655,7 @@ func newResilientChunk(id, fileID uint64, offset int64, payloadLen int) resilien
 	binary.BigEndian.PutUint64(frame[8:16], fileID)
 	binary.BigEndian.PutUint64(frame[16:24], uint64(offset))
 	binary.BigEndian.PutUint32(frame[24:28], uint32(payloadLen))
-	return resilientSendChunk{frame: frame, size: payloadLen}
+	return resilientSendChunk{frame: frame, size: payloadLen, offset: offset}
 }
 
 func buildResilientChunk(id, fileID uint64, offset int64, payload []byte) resilientSendChunk {
@@ -782,6 +864,279 @@ func (s *peerSession) waitResilientAck(
 	}
 }
 
+
+func (s *peerSession) sendFileResilientSliding(
+	ctx context.Context,
+	manager *resilientStripeState,
+	id, fileID uint64,
+	path string,
+	size int64,
+	p *progress,
+) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if size == 0 {
+		return h.Sum(nil), nil
+	}
+
+	ack := s.registerTransferAck(id, fileID)
+	defer s.unregisterTransferAck(id, ack)
+
+	tuner := newResilientTransferTuner(runtime.GOOS, resilientDataLanes)
+	flow := newResilientFlowTuner(runtime.GOOS, s.linkMode)
+
+	var activeLanes atomic.Int64
+	var chunkBytes atomic.Int64
+	var paceNanos atomic.Int64
+
+	publish := func(profile transferTuningProfile) {
+		if profile.lanes < 1 {
+			profile.lanes = 1
+		}
+		if profile.chunkSize < 1 {
+			profile.chunkSize = 128 * 1024
+		}
+		profile.queueDepth = resilientSendQueueDepth(runtime.GOOS, s.linkMode, profile.lanes)
+		profile.flightBytes = flow.current
+		activeLanes.Store(int64(profile.lanes))
+		chunkBytes.Store(int64(profile.chunkSize))
+		paceNanos.Store(int64(profile.pace))
+		s.setCurrentTuning(profile)
+	}
+
+	profile := tuner.current()
+	publish(profile)
+
+	// channel 容量使用平台允许的最大 worker 深度；实际飞行数据仍严格受 ACK window 限制。
+	queueDepth := resilientSendQueueDepth(runtime.GOOS, s.linkMode, resilientDataLanes)
+	jobs := make(chan resilientSendChunk, queueDepth)
+	errCh := make(chan error, resilientDataLanes)
+	sendCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var workers sync.WaitGroup
+	for worker := 0; worker < resilientDataLanes; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			for chunk := range jobs {
+				for int64(worker) >= activeLanes.Load() {
+					select {
+					case <-sendCtx.Done():
+						return
+					case <-time.After(time.Millisecond):
+					}
+				}
+				if err := manager.writeChunk(sendCtx, worker, chunk.frame); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel(err)
+					return
+				}
+				if pace := time.Duration(paceNanos.Load()); pace > 0 {
+					select {
+					case <-sendCtx.Done():
+						return
+					case <-time.After(pace):
+					}
+				}
+			}
+		}(worker)
+	}
+	defer func() {
+		close(jobs)
+		workers.Wait()
+	}()
+
+	var (
+		nextOffset    int64
+		progressAck   int64
+		sampleAck     int64
+		sampleStarted = time.Now()
+		outstanding   []resilientSendChunk
+		head          int
+		retries       int
+	)
+
+	releaseAcked := func(acked int64) {
+		for head < len(outstanding) {
+			ch := &outstanding[head]
+			if ch.offset+int64(ch.size) > acked {
+				break
+			}
+			ch.frame = nil
+			head++
+		}
+		if head > 1024 && head*2 > len(outstanding) {
+			outstanding = append([]resilientSendChunk(nil), outstanding[head:]...)
+			head = 0
+		}
+	}
+
+	updateFromAck := func(acked int64) {
+		if acked > progressAck {
+			p.addBytes(acked - progressAck)
+			progressAck = acked
+		}
+		releaseAcked(acked)
+
+		if acked-sampleAck >= resilientAckSampleBytes || acked == size {
+			now := time.Now()
+			bytes := acked - sampleAck
+			elapsed := now.Sub(sampleStarted)
+			if bytes > 0 && elapsed > 0 {
+				if next, changed := tuner.observe(bytes, elapsed, false); changed {
+					profile = next
+				}
+				if window, changed := flow.observe(bytes, elapsed, false); changed {
+					consolePrintf("[传输] 自适应 flight window -> %s\n", humanBytes(window))
+				}
+				publish(profile)
+			}
+			sampleAck = acked
+			sampleStarted = now
+		}
+	}
+
+	retransmitOutstanding := func() error {
+		acked := ack.acked.Load()
+		releaseAcked(acked)
+		for i := head; i < len(outstanding); i++ {
+			ch := outstanding[i]
+			if ch.frame == nil || ch.offset+int64(ch.size) <= acked {
+				continue
+			}
+			select {
+			case jobs <- ch:
+			case <-sendCtx.Done():
+				return context.Cause(sendCtx)
+			}
+		}
+		return nil
+	}
+
+	waitForAckProgress := func(previous int64) error {
+		timer := time.NewTimer(resilientAckTimeout)
+		defer timer.Stop()
+		for {
+			got := ack.acked.Load()
+			if got > previous {
+				updateFromAck(got)
+				return nil
+			}
+			select {
+			case <-sendCtx.Done():
+				return context.Cause(sendCtx)
+			case <-s.closed:
+				if err := s.terminalTransportError(); err != nil {
+					return err
+				}
+				return errors.New("control connection closed")
+			case <-ack.notify:
+			case <-timer.C:
+				return context.DeadlineExceeded
+			}
+		}
+	}
+
+	for nextOffset < size {
+		if cause := context.Cause(sendCtx); cause != nil {
+			return nil, cause
+		}
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return nil, err
+			}
+		default:
+		}
+
+		acked := ack.acked.Load()
+		updateFromAck(acked)
+
+		if nextOffset-acked >= flow.current {
+			if err := waitForAckProgress(acked); err != nil {
+				retries++
+				if next, changed := tuner.observe(0, 0, true); changed {
+					profile = next
+				}
+				if _, changed := flow.observe(0, 0, true); changed {
+					consolePrintf("[传输] 连续数据面失败，flight window 降至 %s\n", humanBytes(flow.current))
+				}
+				publish(profile)
+				if retries >= 20 {
+					return nil, fmt.Errorf("data plane failed after repeated retransmit attempts: %w", err)
+				}
+				if rerr := retransmitOutstanding(); rerr != nil {
+					return nil, rerr
+				}
+				continue
+			}
+			retries = 0
+			continue
+		}
+
+		want := chunkBytes.Load()
+		if want <= 0 || want > maxDataChunkSize {
+			want = maxDataChunkSize
+		}
+		if size-nextOffset < want {
+			want = size - nextOffset
+		}
+
+		chunk := newResilientChunk(id, fileID, nextOffset, int(want))
+		payload := chunk.frame[resilientDataHeaderSize:]
+		n, rerr := f.ReadAt(payload, nextOffset)
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
+			return nil, rerr
+		}
+		if n != len(payload) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if _, err := h.Write(payload); err != nil {
+			return nil, err
+		}
+
+		outstanding = append(outstanding, chunk)
+		select {
+		case jobs <- chunk:
+			nextOffset += int64(n)
+		case <-sendCtx.Done():
+			return nil, context.Cause(sendCtx)
+		}
+	}
+
+	for ack.acked.Load() < size {
+		acked := ack.acked.Load()
+		updateFromAck(acked)
+		if err := waitForAckProgress(acked); err != nil {
+			retries++
+			if next, changed := tuner.observe(0, 0, true); changed {
+				profile = next
+			}
+			flow.observe(0, 0, true)
+			publish(profile)
+			if retries >= 20 {
+				return nil, fmt.Errorf("data plane failed waiting final ack: %w", err)
+			}
+			if rerr := retransmitOutstanding(); rerr != nil {
+				return nil, rerr
+			}
+			continue
+		}
+		retries = 0
+	}
+	updateFromAck(size)
+	return h.Sum(nil), nil
+}
+
 // sendFileResilient 实现 v0.16 的可靠数据面。
 // 主 QUIC 只负责 ACK / RPC / session control；文件块仅发送到可重建 data QUIC。
 // 每个窗口只有收到接收端“已顺序写盘”的累计 ACK 才会推进。若某条 data QUIC
@@ -801,100 +1156,5 @@ func (s *peerSession) sendFileResilient(
 	if manager == nil {
 		return nil, errors.New("resilient data lane manager unavailable")
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if size == 0 {
-		return h.Sum(nil), nil
-	}
-
-	ack := s.registerTransferAck(id, fileID)
-	defer s.unregisterTransferAck(id, ack)
-
-	tuner := newResilientTransferTuner(runtime.GOOS, resilientDataLanes)
-	profile := tuner.current()
-	s.setCurrentTuning(profile)
-
-	var (
-		windowStart int64
-		progressAck int64
-		consecutiveFailures int
-	)
-	for windowStart < size {
-		if cause := context.Cause(ctx); cause != nil {
-			return nil, cause
-		}
-		select {
-		case <-s.closed:
-			if err := s.terminalTransportError(); err != nil {
-				return nil, err
-			}
-			return nil, errors.New("control connection closed")
-		default:
-		}
-
-		profile = tuner.current()
-		s.setCurrentTuning(profile)
-		windowBytes := resilientFlightWindowBytes(runtime.GOOS, s.linkMode)
-		windowEnd := windowStart + windowBytes
-		if windowEnd > size {
-			windowEnd = size
-		}
-
-		windowStarted := time.Now()
-		chunks, sendErr := s.readAndSendResilientWindow(
-			ctx, manager, f, h, id, fileID, windowStart, windowEnd, profile,
-		)
-		firstAttempt := true
-		for {
-			if !firstAttempt {
-				attemptCtx, cancel := context.WithTimeout(ctx, resilientAckTimeout)
-				sendErr = s.sendResilientBatch(attemptCtx, manager, chunks, profile.lanes, profile.pace)
-				cancel()
-			}
-			firstAttempt = false
-			if sendErr == nil {
-				sendErr = s.waitResilientAck(ctx, ack, windowEnd, &progressAck, p)
-			}
-			if sendErr == nil {
-				consecutiveFailures = 0
-				if next, changed := tuner.observe(windowEnd-windowStart, time.Since(windowStarted), false); changed {
-					s.setCurrentTuning(next)
-					consolePrintf("[传输] 自适应升档: %d lane, chunk=%s, pacing=%s\n",
-						next.lanes, humanBytes(int64(next.chunkSize)), next.pace)
-				}
-				break
-			}
-
-			consecutiveFailures++
-			if next, changed := tuner.observe(0, 0, true); changed {
-				profile = next
-				s.setCurrentTuning(next)
-				consolePrintf("[传输] 连续失败达到阈值，自动降档: %d lane, chunk=%s, pacing=%s\n",
-					next.lanes, humanBytes(int64(next.chunkSize)), next.pace)
-			}
-			if consecutiveFailures >= 20 {
-				return nil, fmt.Errorf("data plane failed after repeated rebuild/retransmit attempts: %w", sendErr)
-			}
-			consolePrintf("[传输] 未确认窗口 %s-%s，重建数据链路并重传（%d/%d）\n",
-				humanBytes(windowStart), humanBytes(windowEnd), consecutiveFailures, 20)
-			select {
-			case <-ctx.Done():
-				return nil, context.Cause(ctx)
-			case <-s.closed:
-				if err := s.terminalTransportError(); err != nil {
-					return nil, err
-				}
-				return nil, errors.New("control connection closed")
-			case <-time.After(150 * time.Millisecond):
-			}
-		}
-		windowStart = windowEnd
-	}
-	return h.Sum(nil), nil
+	return s.sendFileResilientSliding(ctx, manager, id, fileID, path, size, p)
 }

@@ -37,9 +37,11 @@ const (
 )
 
 type transferTuningProfile struct {
-	chunkSize int
-	lanes     int
-	pace      time.Duration
+	chunkSize   int
+	lanes       int
+	pace        time.Duration
+	queueDepth  int
+	flightBytes int64
 }
 
 // adaptiveTransferTuner 保留用于测试和未来低带宽自适应策略。
