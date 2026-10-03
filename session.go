@@ -520,7 +520,9 @@ func (s *peerSession) status() {
 				consolePrintf("  - %s\n", addr)
 			}
 		}
-		consolePrintf("QUIC streams: control=1, data=%d\n", info.Streams)
+		consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
+			maxInt(0, info.DataConnections-1), info.DataConnections)
+		consolePrintf("Data streams: %d\n", info.Streams)
 		consolePrintln("端口关系: 连通性检查、NAT 打洞、QUIC 握手和文件传输复用选中的 UDP socket。")
 	} else {
 		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
@@ -622,4 +624,12 @@ func parseCommandLine(line string) ([]string, error) {
 func formatJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
