@@ -1271,6 +1271,17 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 		t.Fatalf("apply reply: %v", err)
 	}
 
+	// Keep this protocol/authentication test independent of the CI runner's
+	// physical/container interface topology. Signal round-trip above already
+	// verified token/fingerprint/candidate encoding; use a deterministic
+	// loopback LAN pair for the actual QUIC handshake.
+	hostCand := signalCandidate{Addr: ipv4EndpointAddr(t, host), Type: "host", PrefixKnown: true, PrefixBits: 8}
+	joinCand := signalCandidate{Addr: ipv4EndpointAddr(t, join), Type: "host", PrefixKnown: true, PrefixBits: 8}
+	host.setLocalCandidates([]signalCandidate{hostCand})
+	host.setRemoteCandidates([]signalCandidate{joinCand})
+	join.setLocalCandidates([]signalCandidate{joinCand})
+	join.setRemoteCandidates([]signalCandidate{hostCand})
+
 	type result struct {
 		conn net.Conn
 		err  error
