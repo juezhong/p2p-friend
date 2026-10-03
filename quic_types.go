@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	signalVersion      = 13
+	signalVersion      = 14
 	signalInvitePrefix = "P2PF-INVITE-"
 	signalReplyPrefix  = "P2PF-REPLY-"
-	quicALPN           = "p2p-friend/13"
-	punchMagic         = "P2PF13PUNCH"
+	quicALPN           = "p2p-friend/14"
+	punchMagic         = "P2PF14PUNCH"
 
 	maxDynamicCandidates = 16
 	maxRemoteCandidates  = 32
@@ -99,7 +99,11 @@ type rtcConn struct {
 	qc       *quic.Conn
 	peer     *rtcPeer
 	outbound bool
-	once     sync.Once
+
+	stripeMu  sync.RWMutex
+	stripeQCs []*quic.Conn
+
+	once sync.Once
 }
 
 type quicAddr struct{ net.Addr }
@@ -118,7 +122,22 @@ func (c *rtcConn) RemoteAddr() net.Addr               { return quicAddr{c.qc.Rem
 func (c *rtcConn) SetReadDeadline(t time.Time) error  { return c.control.SetReadDeadline(t) }
 func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.control.SetWriteDeadline(t) }
 func (c *rtcConn) SetDeadline(t time.Time) error      { return c.control.SetDeadline(t) }
-func (c *rtcConn) DataLanes() []io.ReadWriteCloser    { return c.lanes }
+func (c *rtcConn) DataLanes() []io.ReadWriteCloser {
+	c.stripeMu.RLock()
+	defer c.stripeMu.RUnlock()
+	return append([]io.ReadWriteCloser(nil), c.lanes...)
+}
+func (c *rtcConn) DataConnectionCount() int {
+	c.stripeMu.RLock()
+	defer c.stripeMu.RUnlock()
+	return 1 + len(c.stripeQCs)
+}
+func (c *rtcConn) addStripe(qc *quic.Conn, lane io.ReadWriteCloser) {
+	c.stripeMu.Lock()
+	c.stripeQCs = append(c.stripeQCs, qc)
+	c.lanes = append(c.lanes, lane)
+	c.stripeMu.Unlock()
+}
 func (c *rtcConn) TransferCoordinator() bool          { return c.peer.server }
 func (c *rtcConn) QUICOutbound() bool                 { return c.outbound }
 
@@ -136,6 +155,13 @@ func (c *rtcConn) closeQUICOnly(reason string) error {
 func (c *rtcConn) Close() error {
 	var err error
 	c.once.Do(func() {
+		c.stripeMu.Lock()
+		stripes := append([]*quic.Conn(nil), c.stripeQCs...)
+		c.stripeQCs = nil
+		c.stripeMu.Unlock()
+		for _, qc := range stripes {
+			_ = qc.CloseWithError(0, "normal shutdown")
+		}
 		err = c.closeQUICOnly("normal shutdown")
 		_ = c.peer.Close()
 	})
@@ -328,7 +354,7 @@ func quicConfig() *quic.Config {
 		MaxStreamReceiveWindow:         128 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 64 * 1024 * 1024,
 		MaxConnectionReceiveWindow:     512 * 1024 * 1024,
-		MaxIncomingStreams:             int64(parallelLanes + 8),
+		MaxIncomingStreams:             int64(maxDataConnections + 8),
 	}
 }
 
