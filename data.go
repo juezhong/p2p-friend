@@ -24,8 +24,9 @@ const (
 	primaryDataStreams = 1
 	parallelLanes       = maxDataConnections
 
-	// 每条 lane 最多预取 16 个 1 MiB chunk，4 lane 共约 64 MiB 用户态发送缓存。
-	sendQueueDepthPerLane = 16
+	// QUIC 本身已经有拥塞控制和发送缓存。应用层只保留很浅的预取队列，
+	// 避免 Windows/Winsock 在多 QUIC lane 下被 64 MiB 级突发写入压满 UDP send queue。
+	sendQueueDepthPerLane = 2
 
 	// 接收端允许更大的有界乱序窗口，避免多 UDP flow 中某一条暂时变慢时
 	// 过早把其它 flow 全部反压停住。仍然有硬上限，不随超大文件无限增长。
@@ -207,15 +208,69 @@ func fastTransferProfile(maxLanes int) transferTuningProfile {
 	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: maxLanes}
 }
 
+// sustainedTransferProfile 用于真实长时间文件发送。
+// Windows 的 Winsock UDP send queue 在多个 QUIC connection 同时持续写大块数据时
+// 更容易出现 WSAENOBUFS。早期版本已经遇到过这个问题，因此这里恢复保守参数：
+// 较小 application chunk、最多 2 条主动 lane，并在每次成功写后留一个很短 pacing。
+// Linux/macOS 继续使用全 lane / 1 MiB，不牺牲它们的高吞吐路径。
+func sustainedTransferProfile(goos string, maxLanes int) transferTuningProfile {
+	if maxLanes < 1 {
+		maxLanes = 1
+	}
+	if maxLanes > parallelLanes {
+		maxLanes = parallelLanes
+	}
+	if goos == "windows" {
+		lanes := maxLanes
+		if lanes > 2 {
+			lanes = 2
+		}
+		return transferTuningProfile{
+			chunkSize: 128 * 1024,
+			lanes:     lanes,
+			pace:      200 * time.Microsecond,
+		}
+	}
+	return fastTransferProfile(maxLanes)
+}
+
 // dataLaneProvider 把 QUIC connection 上预先建立的多条 data stream 暴露给会话。
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
 }
 
 type sessionDataState struct {
-	lanes []io.ReadWriteCloser
-	mu    []sync.Mutex
-	seq   atomic.Uint64
+	lanes    []io.ReadWriteCloser
+	mu       []sync.Mutex
+	disabled []atomic.Bool
+	seq      atomic.Uint64
+}
+
+func (st *sessionDataState) healthyLaneIndices() []int {
+	if st == nil {
+		return nil
+	}
+	out := make([]int, 0, len(st.lanes))
+	for i := range st.lanes {
+		if i < len(st.disabled) && st.disabled[i].Load() {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
+}
+
+func (st *sessionDataState) disableLane(idx int) bool {
+	if st == nil || idx < 0 || idx >= len(st.lanes) || idx >= len(st.disabled) {
+		return false
+	}
+	if !st.disabled[idx].CompareAndSwap(false, true) {
+		return false
+	}
+	// 只关闭这一条 data stream。它可能属于主 QUIC connection，但关闭 stream
+	// 不会关闭 control stream / session；独立 stripe QUIC 也由 rtcConn 最终回收。
+	_ = st.lanes[idx].Close()
+	return true
 }
 
 type preparedDataChunk struct {
@@ -283,7 +338,11 @@ func attachDataLanes(s *peerSession, conn io.ReadWriteCloser) {
 		return
 	}
 	lanes := provider.DataLanes()
-	st := &sessionDataState{lanes: lanes, mu: make([]sync.Mutex, len(lanes))}
+	st := &sessionDataState{
+		lanes:    lanes,
+		mu:       make([]sync.Mutex, len(lanes)),
+		disabled: make([]atomic.Bool, len(lanes)),
+	}
 	sessionData.Store(s, st)
 	for _, lane := range lanes {
 		go s.dataLaneReadLoop(lane)
@@ -545,6 +604,60 @@ func (s *peerSession) writePreparedDataChunkOnLane(idx int, id uint64, chunk pre
 		err = io.ErrShortWrite
 	}
 	return err
+}
+
+
+func (s *peerSession) writePreparedDataChunkOnControl(id uint64, chunk preparedDataChunk) error {
+	if chunk.offset < 0 || chunk.payloadLen < 0 || chunk.payloadLen > maxDataChunkSize {
+		return errors.New("invalid prepared data chunk")
+	}
+	if len(chunk.buf) < dataHeaderSize+chunk.payloadLen {
+		return errors.New("prepared data buffer too small")
+	}
+	payload := make([]byte, 8+chunk.payloadLen)
+	binary.BigEndian.PutUint64(payload[:8], uint64(chunk.offset))
+	copy(payload[8:], chunk.buf[dataHeaderSize:dataHeaderSize+chunk.payloadLen])
+	return s.writeFrame(frameData, id, payload)
+}
+
+// writePreparedDataChunkResilient 优先写指定 data lane；某条 lane 发生 I/O 错误后
+// 立即永久移出当前 session 的 data 调度，并把同一 chunk 重试到其它健康 lane。
+// 如果所有 data lane 都不可用，协议已有的 frameData control-stream 路径作为最后兜底。
+// 这样独立 stripe 的瞬时/永久故障不会直接终止整个文件或整个会话。
+func (s *peerSession) writePreparedDataChunkResilient(active []int, preferred int, id uint64, chunk preparedDataChunk) error {
+	st := dataState(s)
+	if st == nil || len(active) == 0 {
+		return s.writePreparedDataChunkOnControl(id, chunk)
+	}
+
+	var firstErr error
+	for step := 0; step < len(active); step++ {
+		idx := active[(preferred+step)%len(active)]
+		if idx < 0 || idx >= len(st.lanes) {
+			continue
+		}
+		if idx < len(st.disabled) && st.disabled[idx].Load() {
+			continue
+		}
+		if err := s.writePreparedDataChunkOnLane(idx, id, chunk); err == nil {
+			return nil
+		} else {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if st.disableLane(idx) {
+				consolePrintf("[数据流] lane %d 写入失败，已移除并自动降级: %v\n", idx+1, err)
+			}
+		}
+	}
+
+	if err := s.writePreparedDataChunkOnControl(id, chunk); err != nil {
+		if firstErr != nil {
+			return fmt.Errorf("data lane failed (%v); control fallback failed: %w", firstErr, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *peerSession) writeDataChunkOnLane(idx int, id uint64, offset int64, payload []byte) error {
