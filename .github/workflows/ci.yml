@@ -72,4 +72,4 @@ jobs:
         shell: pwsh
         env:
           P2PF_LONG_TRANSFER_TEST: "1"
-        run: go test -run '^TestQUICLoopbackParallelTransfer -count=1 -timeout=8m .
+        run: go test -run TestQUICLoopbackParallelTransfer -count=1 -timeout=8m .
