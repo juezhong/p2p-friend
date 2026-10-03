@@ -641,6 +641,92 @@ func TestQUICDialWaitsForDelayedHost(t *testing.T) {
 	}
 }
 
+func TestJoinWaitConnDoesNotExpireBeforeCreatorStarts(t *testing.T) {
+	host, err := newPeer(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	join, err := newPeer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer join.Close()
+
+	join.token = append([]byte(nil), host.token...)
+	host.remoteFingerprint = append([]byte(nil), join.localFingerprint...)
+	join.remoteFingerprint = append([]byte(nil), host.localFingerprint...)
+
+	hostCand := signalCandidate{
+		Addr: ipv4EndpointAddr(t, host), Type: "host",
+		PrefixKnown: true, PrefixBits: 8,
+	}
+	joinCand := signalCandidate{
+		Addr: ipv4EndpointAddr(t, join), Type: "host",
+		PrefixKnown: true, PrefixBits: 8,
+	}
+	host.setLocalCandidates([]signalCandidate{hostCand})
+	host.setRemoteCandidates([]signalCandidate{joinCand})
+	join.setLocalCandidates([]signalCandidate{joinCand})
+	join.setRemoteCandidates([]signalCandidate{hostCand})
+	host.setRemoteCapabilities(signalCapabilitiesCurrent)
+	join.setRemoteCapabilities(signalCapabilitiesCurrent)
+
+	if len(join.mutualLANRemoteCandidates()) == 0 {
+		t.Fatal("test fixture did not produce mutual LAN")
+	}
+
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	joinCh := make(chan connResult, 1)
+	go func() {
+		conn, err := join.waitConn()
+		joinCh <- connResult{conn: conn, err: err}
+	}()
+
+	// Regression guard: v0.15.0/0.15.1 used a 3-second strict-LAN
+	// context starting immediately after printing REPLY. Waiting longer than
+	// that must still leave JOIN ready instead of reporting a LAN failure.
+	select {
+	case r := <-joinCh:
+		if r.conn != nil {
+			_ = r.conn.Close()
+		}
+		t.Fatalf("join readiness wait returned before creator started: %v", r.err)
+	case <-time.After(lanConnectTimeout + 500*time.Millisecond):
+	}
+
+	hostCh := make(chan connResult, 1)
+	go func() {
+		conn, err := host.connectQUIC()
+		hostCh <- connResult{conn: conn, err: err}
+	}()
+
+	var jc net.Conn
+	select {
+	case r := <-joinCh:
+		if r.err != nil {
+			t.Fatalf("join failed after creator actually started: %v", r.err)
+		}
+		jc = r.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("join did not connect after creator started")
+	}
+	defer jc.Close()
+
+	select {
+	case r := <-hostCh:
+		if r.err != nil {
+			t.Fatalf("creator connect failed: %v", r.err)
+		}
+		_ = r.conn.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("creator did not connect to waiting join")
+	}
+}
+
 func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	host, err := newPeer(true)
 	if err != nil {
@@ -1131,7 +1217,7 @@ func TestQUICCanConnectWithCreateCodeOnly(t *testing.T) {
 	hostCh := make(chan result, 1)
 	joinCh := make(chan result, 1)
 	go func() {
-		conn, err := host.acceptQUIC()
+		conn, err := host.connectQUIC()
 		hostCh <- result{conn: conn, err: err}
 	}()
 	go func() {
@@ -1185,6 +1271,17 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 		t.Fatalf("apply reply: %v", err)
 	}
 
+	// Keep this protocol/authentication test independent of the CI runner's
+	// physical/container interface topology. Signal round-trip above already
+	// verified token/fingerprint/candidate encoding; use a deterministic
+	// loopback LAN pair for the actual QUIC handshake.
+	hostCand := signalCandidate{Addr: ipv4EndpointAddr(t, host), Type: "host", PrefixKnown: true, PrefixBits: 8}
+	joinCand := signalCandidate{Addr: ipv4EndpointAddr(t, join), Type: "host", PrefixKnown: true, PrefixBits: 8}
+	host.setLocalCandidates([]signalCandidate{hostCand})
+	host.setRemoteCandidates([]signalCandidate{joinCand})
+	join.setLocalCandidates([]signalCandidate{joinCand})
+	join.setRemoteCandidates([]signalCandidate{hostCand})
+
 	type result struct {
 		conn net.Conn
 		err  error
@@ -1192,7 +1289,7 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 	hostCh := make(chan result, 1)
 	joinCh := make(chan result, 1)
 	go func() {
-		conn, err := host.acceptQUIC()
+		conn, err := host.connectQUIC()
 		hostCh <- result{conn: conn, err: err}
 	}()
 	go func() {
@@ -1204,30 +1301,30 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 	select {
 	case r := <-hostCh:
 		if r.err != nil {
-			t.Fatalf("creator accept failed: %v", r.err)
+			t.Fatalf("creator connect failed: %v", r.err)
 		}
 		hc = r.conn
 	case <-time.After(10 * time.Second):
-		t.Fatal("creator accept timed out")
+		t.Fatal("creator connect timed out")
 	}
 	select {
 	case r := <-joinCh:
 		if r.err != nil {
-			t.Fatalf("join dial failed: %v", r.err)
+			t.Fatalf("join wait failed: %v", r.err)
 		}
 		jc = r.conn
 	case <-time.After(10 * time.Second):
-		t.Fatal("join dial timed out")
+		t.Fatal("join wait timed out")
 	}
 	defer hc.Close()
 	defer jc.Close()
 
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- authenticateListener(hc, token, roleHost) }()
-	if err := authenticateDialer(jc, token, roleJoin); err != nil {
+	hostAuth := make(chan error, 1)
+	go func() { hostAuth <- authenticatePeerConn(hc, token, roleHost) }()
+	if err := authenticatePeerConn(jc, token, roleJoin); err != nil {
 		t.Fatalf("join auth failed: %v", err)
 	}
-	if err := <-serverErr; err != nil {
+	if err := <-hostAuth; err != nil {
 		t.Fatalf("creator auth failed: %v", err)
 	}
 }

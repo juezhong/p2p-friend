@@ -100,6 +100,12 @@ type rtcPeer struct {
 	cleanups  []func()
 
 	server    bool
+
+	// peerActivity 只表示“对端已经真正开始网络活动”（例如经过 HMAC
+	// 验证的 punch）。它不会因为本地生成/打印 REPLY 而触发。
+	peerActivity chan struct{}
+	closed       chan struct{}
+
 	primaryAcceptWG sync.WaitGroup
 	closeOnce sync.Once
 }
@@ -283,6 +289,16 @@ func (p *rtcPeer) commonCapabilities() uint64 {
 
 func (p *rtcPeer) supports(cap uint64) bool {
 	return p.commonCapabilities()&cap != 0
+}
+
+func (p *rtcPeer) signalPeerActivity() {
+	if p == nil || p.peerActivity == nil {
+		return
+	}
+	select {
+	case p.peerActivity <- struct{}{}:
+	default:
+	}
 }
 
 func (p *rtcPeer) setNetworkInfo(behavior string, stun, mappings []string) {

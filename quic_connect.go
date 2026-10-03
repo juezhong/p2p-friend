@@ -21,6 +21,7 @@ const (
 	connectionWaitTimeout = 5 * time.Minute
 	punchClockSkew        = 2 * time.Minute
 	punchRetryInterval    = 250 * time.Millisecond
+	passivePunchInterval  = 1 * time.Second
 	pathPreferenceWindow  = 600 * time.Millisecond
 	lanConnectTimeout     = 3 * time.Second
 )
@@ -107,6 +108,92 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 				return nil, fmt.Errorf("%w；最后一次候选错误: %v", connectionTimeoutError(), lastErr)
 			}
 			return nil, connectionTimeoutError()
+		}
+	}
+}
+
+// waitForPeerThenConnect 是加入方打印 REPLY 后的“等待对方准备”状态。
+//
+// 关键语义：这里没有连接超时。生成/打印 REPLY 不代表创建方已经收到它，
+// 所以不能从这个时刻开始计算 LAN/QUIC 失败。加入方只保持 listener 与必要的
+// NAT 探测状态；只有真正观察到对端网络活动后，才启动主动 QUIC Dial。
+func (p *rtcPeer) waitForPeerThenConnect() (net.Conn, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lan := p.mutualLANRemoteCandidates()
+	full := p.remoteCandidates()
+	if len(lan) > 0 {
+		p.setRemoteCandidates(lan)
+		defer p.setRemoteCandidates(full)
+	}
+
+	results := make(chan quicConnectResult, 16)
+	if p.startAcceptWorkers(ctx, results) == 0 {
+		return nil, errors.New("无法启动 QUIC UDP listener")
+	}
+
+	// mutual LAN 不需要 punch：创建方拿到 REPLY 后会直接对 LAN HOST Dial。
+	// 非 LAN 则低频维持 NAT mapping，并监听 authenticated punch。
+	if len(lan) == 0 {
+		for _, ep := range p.endpoints {
+			go punchLoopWithInterval(ctx, p, ep.transport, ep.family, passivePunchInterval)
+			go punchReadLoop(ctx, p, ep.transport, ep.family)
+		}
+	}
+
+	dialStarted := false
+	startDial := func() {
+		if dialStarted {
+			return
+		}
+		dialStarted = true
+		if len(lan) == 0 {
+			// 对端已经真实出现，切到正常 punch 频率加速穿透。
+			for _, ep := range p.endpoints {
+				go punchLoop(ctx, p, ep.transport, ep.family)
+			}
+		}
+		go func() {
+			conn, err := p.dialQUICContext(ctx)
+			select {
+			case results <- quicConnectResult{conn: conn, err: err, outbound: true}:
+			case <-ctx.Done():
+				closeRaceLoser(conn, "join readiness wait canceled")
+			}
+		}()
+	}
+
+	for {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				// 对端已经出现后，单轮 Dial 失败不是“等待超时”；继续等它的
+				// 后续 punch / QUIC Initial，或由 inbound 路径直接成功。
+				if dialStarted {
+					dialStarted = false
+				}
+				continue
+			}
+			if res.conn == nil {
+				continue
+			}
+			if len(lan) > 0 && !connUsesMutualLAN(res.conn, lan) {
+				closeRaceLoser(res.conn, "strict LAN wait rejected non-LAN path")
+				continue
+			}
+			cancel()
+			return res.conn, nil
+
+		case <-p.peerActivity:
+			// 只有经过 HMAC / nonce / role 校验的 punch 才能触发这里。
+			// 这表示创建方已经拿到 REPLY 并真正开始网络建连。
+			if len(lan) == 0 {
+				startDial()
+			}
+
+		case <-p.closed:
+			return nil, net.ErrClosed
 		}
 	}
 }
@@ -598,7 +685,11 @@ func (p *rtcPeer) verifyPunchPacket(buf []byte) bool {
 
 // punchLoop 负责持续建立/刷新 NAT 和 stateful firewall 状态，不承载文件数据。
 func punchLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int) {
-	ticker := time.NewTicker(punchRetryInterval)
+	punchLoopWithInterval(ctx, p, tr, family, punchRetryInterval)
+}
+
+func punchLoopWithInterval(ctx context.Context, p *rtcPeer, tr *quic.Transport, family int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		payload, err := buildPunchPacket(p)
@@ -631,6 +722,7 @@ func punchReadLoop(ctx context.Context, p *rtcPeer, tr *quic.Transport, family i
 		if !p.verifyPunchPacket(buf[:n]) {
 			continue
 		}
+		p.signalPeerActivity()
 		udpAddr, ok := addr.(*net.UDPAddr)
 		if !ok || udpAddr == nil || udpAddr.IP == nil || udpAddr.IP.IsUnspecified() || udpAddr.IP.IsLoopback() {
 			continue
