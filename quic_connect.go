@@ -154,7 +154,9 @@ func (p *rtcPeer) startAcceptWorkers(ctx context.Context, results chan<- quicCon
 		}
 		ep.listener = ln
 		started++
+		p.primaryAcceptWG.Add(1)
 		go func(ln *quic.Listener) {
+			defer p.primaryAcceptWG.Done()
 			for {
 				qc, err := ln.Accept(ctx)
 				if err != nil {
