@@ -17,8 +17,8 @@
 - PCP / NAT-PMP / UPnP IGD 显式 UDP 端口映射（可选增强，失败自动降级）
 - IPv6 不做地址转换映射；双方通过安全 UDP punch 尽量打开 stateful firewall
 - QUIC TLS 1.3、可靠重传、拥塞控制和多 stream
-- 1 条 control stream + 4 条 data stream
-- v13 高吞吐 data pipeline：1 MiB pooled chunk、4 lane 持久 worker、有界内存队列
+- 1 条主 QUIC（control + 1 data stream）+ 最多 3 条独立 data-only QUIC connection
+- v14 多 QUIC striping：最多 4 条独立 QUIC data path、1 MiB pooled chunk、动态共享队列、有界内存重排
 - 会话级单传输仲裁：同一时刻只运行一个文件或目录传输任务
 - 文件和目录递归传输
 - 双向 `put` / `get`
@@ -110,47 +110,49 @@ p2p[IPv4-NAT-PUNCH remote:/path]>
 
 ## 传输模型
 
-v0.13 将大文件路径改为持续流水线。发送端不再按“读一批、发一批、等待整批结束”的方式停顿，而是让磁盘读取、SHA-256、QUIC 加密/发送持续重叠：
+v0.14 在 v0.13 的有界内存流水线上进一步把网络并行从“同一个 QUIC connection 的多 stream”提升为**多个独立 QUIC connection**。
+
+主连接建立并完成 TLS / session-token 认证后，主连接的 dialer 会在同一个已经打通的 UDP socket / quic.Transport 上额外建立最多 3 条 data-only QUIC connection。它们复用同一个 NAT mapping，不重新执行 STUN、punch 或端口映射。
 
 ```text
-顺序文件读取 + SHA-256
-          ↓
-   pooled 1 MiB chunks
-          ↓
-   有界发送队列（约 64 MiB）
-          ↓
- ┌────────┼────────┐
- ↓        ↓        ↓
-lane 0   lane 1   lane 2/3
-          ↓
-      QUIC / UDP
+                       同一个 UDP socket
+                              │
+                       quic.Transport
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+主 QUIC connection       data QUIC #1         data QUIC #2/#3
+control + data stream       data stream           data stream
+        │                     │                     │
+        └─────────────── shared chunk queue ───────┘
+                              │
+                    1 MiB pooled chunks
 ```
 
-接收端的多条 QUIC data stream 只负责持续读取网络数据，不再直接抢同一个文件锁做乱序 `WriteAt`。数据进入一个有硬上限的 reorder window，只有从 offset 0 开始连续的数据才交给单一顺序 writer：
+每条 QUIC connection 有独立的 QUIC connection state / congestion state。发送端仍然只顺序读取文件一次并同步计算 SHA-256；chunk 进入共享队列后，由当前空闲的 data-connection worker 动态领取，因此较快的连接自然承担更多 chunk，不再做固定 round-robin。
+
+接收端每条 data QUIC 都有独立 reader，但最终仍进入统一的有界 reorder window：
 
 ```text
-QUIC data lanes
-       ↓
-pooled 1 MiB chunks
-       ↓
+4 x QUIC data readers
+          │
+          ▼
 有界 reorder window（约 64 MiB）
-       ↓
+          │
 连续 offset 顺序输出
-       ↓
+          │
 SHA-256 + 顺序 file.Write
-       ↓
+          │
 OS page cache / dirty pages
-       ↓
+          │
 磁盘后台 writeback
 ```
 
-这样用户态缓存不会随着 1 GiB / 100 GiB / 1 TiB 文件无限增长；内存窗口满后会停止继续消费 QUIC stream，由 QUIC flow control 自然向发送端施加 backpressure。真正的大容量写缓存继续交给 Linux / Windows / macOS 的 page cache。
+用户态缓存不会随文件大小增长。窗口满后停止继续消费 QUIC data stream，由 QUIC flow control 向发送端施加 backpressure。
 
-v13 每个 application data chunk 最大 1 MiB。QUIC 仍会按路径 MTU 拆成 UDP packet；1 MiB 只是减少应用层 Write、allocation 和 memcpy 次数，不代表发送 1 MiB UDP 数据报。
+application data chunk 仍为最大 1 MiB。QUIC 会按路径 MTU 自动拆包；1 MiB 是应用层 chunk，不是 1 MiB UDP datagram。
 
-发送和接收的 SHA-256 都已经合并进数据流水线：发送端文件只顺序读取一次，接收端数据只顺序写一次，不再在传输前/后为了 checksum 额外完整扫描大文件。
-
-QUIC connection 仍保留 4 条 data stream，共享同一个 UDP socket 和 congestion controller；多 stream 用于保持应用层数据管线连续，不把它们当成 4 条独立网络连接。
+如果额外 data QUIC 无法全部建立，主会话不会失败，会自动使用已经成功建立的数据连接继续传输。
 
 ### 单传输模式
 
@@ -164,15 +166,22 @@ QUIC connection 仍保留 4 条 data stream，共享同一个 UDP socket 和 con
 
 只有**发起当前文件操作的一端**显示正常传输进度。被动提供文件或被动接收文件的一端保持安静，避免异步日志打断命令输入。
 
-典型下载输出：
+单文件下载示例：
 
 ```text
 [GET] file.bin -> /local/path/file.bin (1.0 GiB)
 [GET] file.bin                      73.42%  751.8 MiB / 1.0 GiB  42.1 MiB/s
-[GET] file.bin                     100.00%    1.0 GiB / 1.0 GiB  41.8 MiB/s
 [GET] SHA-256 <hash>  OK
 [GET] 完成。
 ```
+
+目录下载会同时显示“当前文件”和“目录总计”，不会再把目录总大小显示成当前文件大小：
+
+```text
+[GET] dir/video.mkv  63.20%  1.9 GiB / 3.0 GiB | 总计 27.40%  4.8 GiB / 17.5 GiB  92.1 MiB/s
+```
+
+传输中的进度使用同一终端行刷新；只有当前文件真正完成、切换到下一个文件时才换行。
 
 每个文件都执行端到端校验：
 
@@ -202,7 +211,7 @@ status
 - 本机 STUN 映射（IPv6 链路时明确标为 IPv4 备用）
 - NAT 映射稳定性与显式端口映射信息
 - 对端 candidate 类型（HOST / STUN / prflx / portmap）
-- control / data stream 数量
+- 主 QUIC / data stripe connection 数量与 data stream 数量
 - 当前是否存在文件传输任务
 - 当前发送流水线参数（存在发送任务时）
 - 本地 / 远端目录与覆盖策略

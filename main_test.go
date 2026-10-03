@@ -686,6 +686,23 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 		t.Fatalf("listener auth: %v", err)
 	}
 
+	hostStripeCh := make(chan int, 1)
+	go func() { hostStripeCh <- setupDataStripes(hostConn, host.token) }()
+	joinStripes := setupDataStripes(joinConn, join.token)
+	hostStripes := <-hostStripeCh
+	if joinStripes != maxDataConnections-primaryDataStreams {
+		t.Fatalf("join data stripes=%d want=%d", joinStripes, maxDataConnections-primaryDataStreams)
+	}
+	if hostStripes != maxDataConnections-primaryDataStreams {
+		t.Fatalf("host data stripes=%d want=%d", hostStripes, maxDataConnections-primaryDataStreams)
+	}
+	if jc, ok := joinConn.(*rtcConn); !ok || jc.DataConnectionCount() != maxDataConnections {
+		t.Fatalf("join data connections=%v", joinConn)
+	}
+	if hc, ok := hostConn.(*rtcConn); !ok || hc.DataConnectionCount() != maxDataConnections {
+		t.Fatalf("host data connections=%v", hostConn)
+	}
+
 	hostDir := t.TempDir()
 	joinDir := t.TempDir()
 	payload := bytes.Repeat([]byte("quic-parallel-payload-"), 180000)
@@ -1471,5 +1488,32 @@ func TestFastTransferProfileUsesBoundedOneMiBChunks(t *testing.T) {
 	}
 	if got := parallelLanes * sendQueueDepthPerLane * maxDataChunkSize; got > 128*1024*1024 {
 		t.Fatalf("pipeline user-space buffer budget too large: %d", got)
+	}
+}
+
+
+func TestDirectoryProgressShowsCurrentFileAndTotal(t *testing.T) {
+	var out bytes.Buffer
+	restore := setConsoleWriter(&out)
+	defer restore()
+
+	p := &progress{
+		Start:       time.Now().Add(-time.Second),
+		LastPrint:   time.Time{},
+		Done:        5 * 1024 * 1024,
+		Total:       20 * 1024 * 1024,
+		Current:     "dir/current.bin",
+		CurrentDone: 3 * 1024 * 1024,
+		CurrentSize: 4 * 1024 * 1024,
+		Prefix:      "[GET]",
+		Multi:       true,
+	}
+	p.print(false)
+	got := out.String()
+	if !strings.Contains(got, "75.00%") || !strings.Contains(got, "3.0 MiB / 4.0 MiB") {
+		t.Fatalf("missing current-file progress: %q", got)
+	}
+	if !strings.Contains(got, "总计") || !strings.Contains(got, "25.00%") || !strings.Contains(got, "5.0 MiB / 20.0 MiB") {
+		t.Fatalf("missing directory-total progress: %q", got)
 	}
 }

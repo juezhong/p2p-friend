@@ -84,7 +84,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	}
 	p := &progress{
 		Start: time.Now(), LastPrint: time.Now(), Total: total,
-		Prefix: prefix, Silent: !foreground,
+		Prefix: prefix, Silent: !foreground, Multi: isDir,
 	}
 	defer p.closeLine()
 	defer s.clearCurrentTuning()
@@ -109,9 +109,7 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 			return err
 		}
 
-		p.Current = e.RelPath
-		p.CurrentDone = 0
-		p.CurrentSize = e.Size
+		p.beginFile(e.RelPath, e.Size)
 		sum, err := s.sendFileStriped(ctx, id, e.FullPath, e.Size, p)
 		if err != nil {
 			if cause := context.Cause(ctx); cause != nil {
@@ -213,13 +211,12 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 	type laneJob struct {
 		chunk preparedDataChunk
 	}
-	queues := make([]chan laneJob, profile.lanes)
+	jobs := make(chan laneJob, profile.lanes*sendQueueDepthPerLane)
 	errCh := make(chan error, profile.lanes)
 	var workers sync.WaitGroup
 	for lane := 0; lane < profile.lanes; lane++ {
-		queues[lane] = make(chan laneJob, sendQueueDepthPerLane)
 		workers.Add(1)
-		go func(lane int, jobs <-chan laneJob) {
+		go func(lane int) {
 			defer workers.Done()
 			for job := range jobs {
 				if context.Cause(ctx) != nil {
@@ -234,30 +231,23 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					default:
 					}
 					cancel(err)
-					// 不立刻退出，继续把本 lane 已排队的 pooled buffer 释放掉。
 					continue
 				}
 				p.addBytes(int64(job.chunk.payloadLen))
 			}
-		}(lane, queues[lane])
+		}(lane)
 	}
 
-	closeQueues := func() {
-		for _, q := range queues {
-			close(q)
-		}
-	}
-	queuesClosed := false
+	jobsClosed := false
 	defer func() {
-		if !queuesClosed {
-			closeQueues()
+		if !jobsClosed {
+			close(jobs)
 		}
 		workers.Wait()
 	}()
 
 	h := sha256.New()
 	var off int64
-	seq := 0
 	for off < size {
 		if cause := context.Cause(ctx); cause != nil {
 			return nil, cause
@@ -279,10 +269,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		_, _ = h.Write(buf[dataHeaderSize : dataHeaderSize+n])
 
 		job := laneJob{chunk: preparedDataChunk{buf: buf, offset: off, payloadLen: n}}
-		lane := seq % profile.lanes
-		seq++
 		select {
-		case queues[lane] <- job:
+		case jobs <- job:
 			off += int64(n)
 		case <-ctx.Done():
 			releaseDataBuffer(buf)
@@ -290,8 +278,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		}
 	}
 
-	closeQueues()
-	queuesClosed = true
+	close(jobs)
+	jobsClosed = true
 	workers.Wait()
 
 	select {
@@ -405,7 +393,7 @@ func (s *peerSession) handleTransferStart(id uint64, payload []byte) error {
 		targetRoot: root,
 		progress: &progress{
 			Start: time.Now(), LastPrint: time.Now(), Total: meta.Total,
-			Prefix: recvPrefix, Silent: !activeUI,
+			Prefix: recvPrefix, Silent: !activeUI, Multi: meta.IsDir,
 		},
 		getReqID: meta.RequestID,
 	}
@@ -556,9 +544,7 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	t.currentRemaining = e.Size
 	startInboundData(s, id, t, e.Size, tmp)
 	t.currentMode = os.FileMode(e.Mode)
-	t.progress.Current = e.Path
-	t.progress.CurrentDone = 0
-	t.progress.CurrentSize = e.Size
+	t.progress.beginFile(e.Path, e.Size)
 	if existed {
 		t.overwritten = append(t.overwritten, dst)
 	}

@@ -20,6 +20,7 @@ type quicConnectionInfo struct {
 	RemoteUDP           string
 	RemoteCandidateType string
 	Streams             int
+	DataConnections     int
 	Sockets             []udpSocketInfo
 	STUNMappings        []string
 	MappingBehavior     string
@@ -31,7 +32,8 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		LinkMode:  c.LinkMode(),
 		LocalUDP:  c.qc.LocalAddr().String(),
 		RemoteUDP: c.qc.RemoteAddr().String(),
-		Streams:   len(c.lanes),
+		Streams:   len(c.DataLanes()),
+		DataConnections: c.DataConnectionCount(),
 	}
 	if c.outbound {
 		info.QUICRole = "主动连接端"

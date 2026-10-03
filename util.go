@@ -14,6 +14,17 @@ import (
 
 var consoleOut io.Writer = os.Stdout
 
+func (p *progress) beginFile(name string, size int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.Current = name
+	p.CurrentDone = 0
+	p.CurrentSize = size
+	p.mu.Unlock()
+}
+
 func (p *progress) addBytes(n int64) {
 	if p == nil || n <= 0 {
 		return
@@ -42,12 +53,31 @@ func (p *progress) print(force bool) {
 		elapsed = 0.001
 	}
 	speed := float64(p.Done) / elapsed
+
 	var line string
-	if p.Total > 0 {
+	if p.CurrentSize > 0 {
+		currentPercent := float64(p.CurrentDone) * 100 / float64(p.CurrentSize)
+		if p.Multi && p.Total > 0 {
+			totalPercent := float64(p.Done) * 100 / float64(p.Total)
+			line = fmt.Sprintf("\r%s %-28s %6.2f%%  %s / %s | 总计 %6.2f%%  %s / %s  %s/s",
+				p.Prefix, truncate(p.Current, 28),
+				currentPercent, humanBytes(p.CurrentDone), humanBytes(p.CurrentSize),
+				totalPercent, humanBytes(p.Done), humanBytes(p.Total),
+				humanBytes(int64(speed)))
+		} else {
+			line = fmt.Sprintf("\r%s %-30s %6.2f%%  %s / %s  %s/s",
+				p.Prefix, truncate(p.Current, 30),
+				currentPercent, humanBytes(p.CurrentDone), humanBytes(p.CurrentSize),
+				humanBytes(int64(speed)))
+		}
+	} else if p.Total > 0 {
 		percent := float64(p.Done) * 100 / float64(p.Total)
-		line = fmt.Sprintf("\r%s %-30s %6.2f%%  %s / %s  %s/s", p.Prefix, truncate(p.Current, 30), percent, humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
+		line = fmt.Sprintf("\r%s %-30s %6.2f%%  %s / %s  %s/s",
+			p.Prefix, truncate(p.Current, 30), percent,
+			humanBytes(p.Done), humanBytes(p.Total), humanBytes(int64(speed)))
 	} else {
-		line = fmt.Sprintf("\r%s %-30s %s  %s/s", p.Prefix, truncate(p.Current, 30), humanBytes(p.Done), humanBytes(int64(speed)))
+		line = fmt.Sprintf("\r%s %-30s %s  %s/s",
+			p.Prefix, truncate(p.Current, 30), humanBytes(p.Done), humanBytes(int64(speed)))
 	}
 	if force {
 		line += "\n"
