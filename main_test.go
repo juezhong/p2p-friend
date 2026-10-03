@@ -1574,8 +1574,7 @@ func TestHostConnectJoinWaitUseSameRaceWinner(t *testing.T) {
 }
 
 
-func TestCandidateDialDelayGivesOnlyLANHostHeadStart(t *testing.T) {
-	// 公网/NAT candidate 不应该被误认为 LAN；它们只等待一个很短的 head start。
+func TestCandidateDialDelayDoesNotStaggerStandalonePublicCandidates(t *testing.T) {
 	cases := []struct {
 		typ  string
 		addr string
@@ -1590,8 +1589,8 @@ func TestCandidateDialDelayGivesOnlyLANHostHeadStart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := candidateDialDelay(signalCandidate{Addr: tc.addr, Type: tc.typ}, addr); got != lanCandidateHeadStart {
-			t.Fatalf("%s delay=%v want=%v", tc.typ, got, lanCandidateHeadStart)
+		if got := candidateDialDelay(signalCandidate{Addr: tc.addr, Type: tc.typ}, addr); got != 0 {
+			t.Fatalf("%s delay=%v want=0", tc.typ, got)
 		}
 	}
 }
@@ -1616,8 +1615,11 @@ func TestOverlappingPrivatePrefixesDoNotForceStrictLAN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := candidateDialDelay(signalCandidate{Addr: public.String(), Type: "srflx"}, public); got != lanCandidateHeadStart {
+	if got := candidateRaceDelay(signalCandidate{Addr: public.String(), Type: "srflx"}, public, true); got != lanCandidateHeadStart {
 		t.Fatalf("public fallback delay=%v want=%v", got, lanCandidateHeadStart)
+	}
+	if got := candidateRaceDelay(signalCandidate{Addr: public.String(), Type: "srflx"}, public, false); got != 0 {
+		t.Fatalf("public-only race delay=%v want=0", got)
 	}
 }
 
