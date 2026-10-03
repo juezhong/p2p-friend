@@ -1693,7 +1693,7 @@ func TestReplySignalIsShorterThanInvite(t *testing.T) {
 
 func TestPublicCandidateRaceHasNoArtificialDelay(t *testing.T) {
 	cases := []signalCandidate{
-		{Addr: "2001:db8::1:443", Type: "host"},
+		{Addr: "[2001:db8::1]:443", Type: "host"},
 		{Addr: "203.0.113.1:40000", Type: "host"},
 		{Addr: "203.0.113.2:40001", Type: "portmap"},
 		{Addr: "203.0.113.3:40002", Type: "prflx"},
