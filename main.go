@@ -179,7 +179,7 @@ func runJoin(in *bufio.Reader, cwd string) error {
 	consolePrintln("")
 	consolePrintln("把下面的 P2PF-REPLY 回传码发回创建方：")
 	consolePrintln(replyCode)
-	consolePrintln("发送后程序会静默等待创建方粘贴回传码并开始建连。")
+	consolePrintln("发送后程序会静默等待；不会因创建方尚未粘贴回传码而超时。")
 
 	// 加入方同样同时 Listen + Dial；最终由双方一致的方向偏好选择同一条直连路径。
 	conn, err := peer.waitConn()
