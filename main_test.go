@@ -901,6 +901,11 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	hostDir := t.TempDir()
 	joinDir := t.TempDir()
 	payload := bytes.Repeat([]byte("quic-parallel-payload-"), 180000)
+	if os.Getenv("P2PF_LONG_TRANSFER_TEST") == "1" {
+		// Windows 真机 CI 使用持续大文件压测 QUIC/UDP 发送队列。
+		// 128 MiB 足以跨过短 burst 阶段，同时保持 CI 时间和磁盘占用可控。
+		payload = bytes.Repeat([]byte{0x5a}, 128*1024*1024)
+	}
 	if err := os.WriteFile(filepath.Join(joinDir, "source.bin"), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
