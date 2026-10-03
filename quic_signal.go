@@ -33,7 +33,13 @@ func newPeer(server bool) (*rtcPeer, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &rtcPeer{token: token, server: server, cert: cert}
+	p := &rtcPeer{
+		token:        token,
+		server:       server,
+		cert:         cert,
+		peerActivity: make(chan struct{}, 1),
+		closed:       make(chan struct{}),
+	}
 	p.setLocalCapabilities(signalCapabilitiesCurrent)
 	sum := sha256.Sum256(der)
 	p.localFingerprint = append([]byte(nil), sum[:]...)
@@ -69,6 +75,9 @@ func newPeer(server bool) (*rtcPeer, error) {
 func (p *rtcPeer) Close() error {
 	var first error
 	p.closeOnce.Do(func() {
+		if p.closed != nil {
+			close(p.closed)
+		}
 		p.cleanupMu.Lock()
 		cleanups := append([]func(){}, p.cleanups...)
 		p.cleanups = nil
@@ -186,7 +195,7 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 	return nil
 }
 
-func (p *rtcPeer) waitConn() (net.Conn, error) { return p.connectQUIC() }
+func (p *rtcPeer) waitConn() (net.Conn, error) { return p.waitForPeerThenConnect() }
 
 const (
 	candidateGatherBudget = 1200 * time.Millisecond
