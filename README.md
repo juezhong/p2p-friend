@@ -348,3 +348,8 @@ HOST candidate 会携带网卡 prefix length（例如 IPv4 /24、IPv6 /64），�
 envelope version 描述的是长期二进制格式本身，不等于产品版本号。后续产品版本新增兼容能力时通过 capability bitmap 和可跳过的 record/extension 区域协商，不再因为 v0.15.1、v0.16、v1.x 这样的产品版本变化而自动让识别码失效。
 
 v0.15 是新的稳定协议基线，因此 v0.14.x 与 v0.15 之间不互通；从 v0.15 开始，目标是保持向前兼容。
+
+
+### v0.15.1 公网/NAT 路径全并发
+
+当识别码确认不存在 mutual LAN 时，不再对 host / portmap / prflx / srflx 人为 stagger。所有公网/NAT candidate 立即并发发起 QUIC Dial，首个成功握手的路径胜出。strict LAN 策略保持不变，stable signal envelope 继续兼容 v0.15.0。
