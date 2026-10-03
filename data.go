@@ -228,6 +228,7 @@ type inboundDataState struct {
 	size int64
 
 	chunks chan inboundDataChunk
+	budget chan struct{}
 	stop   chan struct{}
 	done   chan struct{}
 	writerDone chan struct{}
@@ -313,6 +314,7 @@ func startInboundData(s *peerSession, id uint64, t *inboundTransfer, size int64,
 		file:       f,
 		size:       size,
 		chunks:     make(chan inboundDataChunk, parallelLanes*sendQueueDepthPerLane),
+		budget:     make(chan struct{}, parallelLanes*sendQueueDepthPerLane),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 		writerDone: make(chan struct{}),
@@ -340,12 +342,25 @@ func (st *inboundDataState) enqueue(chunk inboundDataChunk) bool {
 	if st.stopped.Load() {
 		return false
 	}
+	// credit 覆盖 channel + reorder map 的总 chunk 数。credit 用完时停止继续
+	// 消费 QUIC stream，由 QUIC flow control 自然向发送端施加背压。
+	select {
+	case st.budget <- struct{}{}:
+	case <-st.stop:
+		return false
+	}
 	select {
 	case st.chunks <- chunk:
 		return true
 	case <-st.stop:
+		<-st.budget
 		return false
 	}
+}
+
+func (st *inboundDataState) releaseChunk(chunk inboundDataChunk) {
+	releaseDataBuffer(chunk.buf)
+	<-st.budget
 }
 
 func (st *inboundDataState) finish(written int64, sum []byte, err error) {
@@ -373,11 +388,11 @@ func clearInboundData(t *inboundTransfer) {
 	<-st.writerDone
 }
 
-func drainInboundBuffers(ch <-chan inboundDataChunk) {
+func drainInboundBuffers(st *inboundDataState) {
 	for {
 		select {
-		case chunk := <-ch:
-			releaseDataBuffer(chunk.buf)
+		case chunk := <-st.chunks:
+			st.releaseChunk(chunk)
 		default:
 			return
 		}
@@ -393,9 +408,9 @@ func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inbou
 	releasePending := func() {
 		for off, chunk := range pending {
 			delete(pending, off)
-			releaseDataBuffer(chunk.buf)
+			st.releaseChunk(chunk)
 		}
-		drainInboundBuffers(st.chunks)
+		drainInboundBuffers(st)
 	}
 	fail := func(err error) {
 		st.stopAccepting()
@@ -422,17 +437,17 @@ func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inbou
 			if chunk.offset < 0 || chunk.payloadLen < 0 ||
 				chunk.payloadLen > maxDataChunkSize ||
 				chunk.offset+int64(chunk.payloadLen) > st.size {
-				releaseDataBuffer(chunk.buf)
+				st.releaseChunk(chunk)
 				fail(errors.New("received data outside declared file range"))
 				return
 			}
 			if chunk.offset < next {
 				// QUIC 本身可靠，这里只把完全落在已写区域的重复块安全丢弃。
-				releaseDataBuffer(chunk.buf)
+				st.releaseChunk(chunk)
 				continue
 			}
 			if old, exists := pending[chunk.offset]; exists {
-				releaseDataBuffer(chunk.buf)
+				st.releaseChunk(chunk)
 				if old.payloadLen != chunk.payloadLen {
 					fail(errors.New("duplicate chunk has different size"))
 					return
@@ -454,7 +469,7 @@ func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inbou
 					next += int64(n)
 					t.progress.addBytes(int64(n))
 				}
-				releaseDataBuffer(cur.buf)
+				st.releaseChunk(cur)
 				if err != nil {
 					fail(err)
 					return
