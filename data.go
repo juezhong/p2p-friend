@@ -232,8 +232,7 @@ type inboundDataState struct {
 	done   chan struct{}
 	writerDone chan struct{}
 
-	enqueueMu sync.Mutex
-	stopped   bool
+	stopped   atomic.Bool
 	stopOnce  sync.Once
 	doneOnce  sync.Once
 
@@ -332,18 +331,13 @@ func getInboundData(t *inboundTransfer) *inboundDataState {
 }
 
 func (st *inboundDataState) stopAccepting() {
-	st.enqueueMu.Lock()
-	if !st.stopped {
-		st.stopped = true
+	if st.stopped.CompareAndSwap(false, true) {
 		st.stopOnce.Do(func() { close(st.stop) })
 	}
-	st.enqueueMu.Unlock()
 }
 
 func (st *inboundDataState) enqueue(chunk inboundDataChunk) bool {
-	st.enqueueMu.Lock()
-	defer st.enqueueMu.Unlock()
-	if st.stopped {
+	if st.stopped.Load() {
 		return false
 	}
 	select {
