@@ -1689,3 +1689,23 @@ func TestReplySignalIsShorterThanInvite(t *testing.T) {
 		t.Fatalf("reply should be shorter than invite: reply=%d invite=%d", len(reply), len(invite))
 	}
 }
+
+
+func TestPublicCandidateRaceHasNoArtificialDelay(t *testing.T) {
+	cases := []signalCandidate{
+		{Addr: "2001:db8::1:443", Type: "host"},
+		{Addr: "203.0.113.1:40000", Type: "host"},
+		{Addr: "203.0.113.2:40001", Type: "portmap"},
+		{Addr: "203.0.113.3:40002", Type: "prflx"},
+		{Addr: "203.0.113.4:40003", Type: "srflx"},
+	}
+	for _, cand := range cases {
+		addr, _, err := parseCandidate(cand)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := candidateDialDelay(cand, addr); got != 0 {
+			t.Fatalf("candidate %s/%s delay=%v want=0", cand.Type, cand.Addr, got)
+		}
+	}
+}
