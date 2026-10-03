@@ -17,10 +17,12 @@ const (
 	frameEntryReady = byte(11)
 	dataHeaderSize  = 20
 
-	// v13 单块提升到 1 MiB。QUIC 仍会按路径 MTU 分包；这里的较大 chunk
+	// v14 继续使用 1 MiB application chunk。QUIC 仍会按路径 MTU 分包；这里的较大 chunk
 	// 只是减少应用层 Write / allocation / copy 次数。
-	maxDataChunkSize = 1024 * 1024
-	parallelLanes    = 4
+	maxDataChunkSize   = 1024 * 1024
+	maxDataConnections = 4
+	primaryDataStreams = 1
+	parallelLanes       = maxDataConnections
 
 	// 每条 lane 最多预取 16 个 1 MiB chunk，4 lane 共约 64 MiB 用户态发送缓存。
 	// 接收端由同一发送窗口天然形成背压，避免缓存随文件大小无限增长。
