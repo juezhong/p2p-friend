@@ -834,11 +834,27 @@ func TestResilientLinuxLANRestoresDeepFlightWindow(t *testing.T) {
 	if got := resilientFlightWindowBytes("linux", "IPv6-DIRECT"); got != resilientDefaultWindowBytes {
 		t.Fatalf("linux WAN/direct flight window=%d want=%d", got, resilientDefaultWindowBytes)
 	}
-	if got := resilientSendQueueDepth("linux", "IPv4-LAN", 4); got != 64 {
-		t.Fatalf("linux LAN queue depth=%d want=64", got)
+	if got := resilientSendQueueDepth("linux", "IPv4-LAN", 4); got != 128 {
+		t.Fatalf("linux LAN queue depth=%d want=128", got)
 	}
-	if got := resilientSendQueueDepth("windows", "IPv4-LAN", 4); got != 8 {
-		t.Fatalf("windows LAN queue depth=%d want=8", got)
+	if got := resilientSendQueueDepth("linux", "IPv6-DIRECT", 4); got != 32 {
+		t.Fatalf("linux WAN queue depth=%d want=32", got)
+	}
+	if got := resilientSendQueueDepth("windows", "IPv4-LAN", 4); got != 16 {
+		t.Fatalf("windows LAN queue depth=%d want=16", got)
+	}
+
+	flow := newResilientFlowTuner("linux", "IPv6-LAN")
+	if flow.current != 64*1024*1024 || flow.max != 256*1024*1024 {
+		t.Fatalf("linux LAN flow=%#v", flow)
+	}
+	flow.observe(32*1024*1024, 100*time.Millisecond, false)
+	if flow.current != 128*1024*1024 {
+		t.Fatalf("first healthy sample window=%d want=128MiB", flow.current)
+	}
+	flow.observe(32*1024*1024, 100*time.Millisecond, false)
+	if flow.current != 256*1024*1024 {
+		t.Fatalf("second healthy sample window=%d want=256MiB", flow.current)
 	}
 }
 
@@ -949,22 +965,22 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 		t.Fatalf("v0.16 primary join QUIC unexpectedly has %d data streams", len(jc.lanes))
 	}
 
-	hostStripeCh := make(chan int, 1)
-	go func() { hostStripeCh <- setupDataStripes(hostConn, host.token) }()
-	joinStripes := setupDataStripes(joinConn, join.token)
-	hostStripes := <-hostStripeCh
-	if joinStripes != resilientDataLanes {
-		t.Fatalf("join data stripes=%d want=%d", joinStripes, resilientDataLanes)
+	setupDataStripes(hostConn, host.token)
+	setupDataStripes(joinConn, join.token)
+
+	waitDataLanes := func(name string, rc *rtcConn) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if rc.DataConnectionCount() == resilientDataLanes {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("%s data connections=%d want=%d", name, rc.DataConnectionCount(), resilientDataLanes)
 	}
-	if hostStripes != resilientDataLanes {
-		t.Fatalf("host data stripes=%d want=%d", hostStripes, resilientDataLanes)
-	}
-	if jc, ok := joinConn.(*rtcConn); !ok || jc.DataConnectionCount() != maxDataConnections {
-		t.Fatalf("join data connections=%v", joinConn)
-	}
-	if hc, ok := hostConn.(*rtcConn); !ok || hc.DataConnectionCount() != maxDataConnections {
-		t.Fatalf("host data connections=%v", hostConn)
-	}
+	waitDataLanes("join", joinConn.(*rtcConn))
+	waitDataLanes("host", hostConn.(*rtcConn))
 	jc := joinConn.(*rtcConn)
 	ports := map[int]struct{}{}
 	for _, qc := range jc.dataQUICs() {
