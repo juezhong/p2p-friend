@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,9 +23,14 @@ const (
 	resilientRepairBackoff   = 500 * time.Millisecond
 	resilientInitialWait     = 4 * time.Second
 	resilientAckStep         = 2 * 1024 * 1024
-	resilientAckTimeout      = 5 * time.Second
-	resilientWindowBytes     = 4 * 1024 * 1024
+	resilientAckTimeout       = 5 * time.Second
 	resilientFailureThreshold = 3
+
+	// v0.16.0 固定 4 MiB stop-and-wait 窗口会让低 RTT 的 Linux LAN
+	// 在每 4 MiB 都停下来等待 ACK，破坏 v0.15.3 的深流水。
+	// v0.16.1 对本地高速链路恢复 64 MiB 有界 flight window。
+	resilientDefaultWindowBytes = 8 * 1024 * 1024
+	resilientLANWindowBytes     = 64 * 1024 * 1024
 	resilientLaneWriteTimeout = 30 * time.Second
 )
 
@@ -496,6 +502,26 @@ func (t *resilientTransferTuner) current() transferTuningProfile {
 	return t.levels[t.level]
 }
 
+
+func resilientFlightWindowBytes(goos, linkMode string) int64 {
+	if goos == "linux" && strings.HasSuffix(linkMode, "-LAN") {
+		return resilientLANWindowBytes
+	}
+	return resilientDefaultWindowBytes
+}
+
+func resilientSendQueueDepth(goos, linkMode string, lanes int) int {
+	if lanes < 1 {
+		lanes = 1
+	}
+	// 恢复 v0.15.3 Linux LAN 的 16 chunk/lane 预取深度。
+	// Windows 继续维持浅队列，避免 Winsock UDP send queue 被突发写满。
+	if goos == "linux" && strings.HasSuffix(linkMode, "-LAN") {
+		return lanes * 16
+	}
+	return lanes * 2
+}
+
 func (t *resilientTransferTuner) observe(bytes int64, elapsed time.Duration, failed bool) (transferTuningProfile, bool) {
 	old := t.current()
 	if failed {
@@ -541,14 +567,19 @@ type resilientSendChunk struct {
 	size  int
 }
 
-func buildResilientChunk(id, fileID uint64, offset int64, payload []byte) resilientSendChunk {
-	frame := make([]byte, resilientDataHeaderSize+len(payload))
+func newResilientChunk(id, fileID uint64, offset int64, payloadLen int) resilientSendChunk {
+	frame := make([]byte, resilientDataHeaderSize+payloadLen)
 	binary.BigEndian.PutUint64(frame[0:8], id)
 	binary.BigEndian.PutUint64(frame[8:16], fileID)
 	binary.BigEndian.PutUint64(frame[16:24], uint64(offset))
-	binary.BigEndian.PutUint32(frame[24:28], uint32(len(payload)))
-	copy(frame[resilientDataHeaderSize:], payload)
-	return resilientSendChunk{frame: frame, size: len(payload)}
+	binary.BigEndian.PutUint32(frame[24:28], uint32(payloadLen))
+	return resilientSendChunk{frame: frame, size: payloadLen}
+}
+
+func buildResilientChunk(id, fileID uint64, offset int64, payload []byte) resilientSendChunk {
+	chunk := newResilientChunk(id, fileID, offset, len(payload))
+	copy(chunk.frame[resilientDataHeaderSize:], payload)
+	return chunk
 }
 
 func (s *peerSession) sendResilientBatch(
@@ -609,6 +640,113 @@ func (s *peerSession) sendResilientBatch(
 	default:
 		return nil
 	}
+}
+
+
+func (s *peerSession) readAndSendResilientWindow(
+	ctx context.Context,
+	manager *resilientStripeState,
+	f *os.File,
+	h io.Writer,
+	id, fileID uint64,
+	windowStart, windowEnd int64,
+	profile transferTuningProfile,
+) ([]resilientSendChunk, error) {
+	workers := profile.lanes
+	if workers < 1 {
+		workers = 1
+	}
+	queueDepth := resilientSendQueueDepth(runtime.GOOS, s.linkMode, workers)
+	jobs := make(chan resilientSendChunk, queueDepth)
+	errCh := make(chan error, workers)
+
+	sendCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for chunk := range jobs {
+				if context.Cause(sendCtx) != nil {
+					continue
+				}
+				if err := manager.writeChunk(sendCtx, worker, chunk.frame); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel(err)
+					continue
+				}
+				if profile.pace > 0 {
+					select {
+					case <-sendCtx.Done():
+						return
+					case <-time.After(profile.pace):
+					}
+				}
+			}
+		}(w)
+	}
+
+	chunks := make([]resilientSendChunk, 0, int((windowEnd-windowStart)/int64(profile.chunkSize))+1)
+	for off := windowStart; off < windowEnd; {
+		if cause := context.Cause(sendCtx); cause != nil {
+			close(jobs)
+			wg.Wait()
+			return nil, cause
+		}
+		want := int64(profile.chunkSize)
+		if want <= 0 || want > maxDataChunkSize {
+			want = maxDataChunkSize
+		}
+		if windowEnd-off < want {
+			want = windowEnd - off
+		}
+
+		chunk := newResilientChunk(id, fileID, off, int(want))
+		payload := chunk.frame[resilientDataHeaderSize:]
+		n, rerr := f.ReadAt(payload, off)
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
+			close(jobs)
+			wg.Wait()
+			return nil, rerr
+		}
+		if n != len(payload) {
+			close(jobs)
+			wg.Wait()
+			return nil, io.ErrUnexpectedEOF
+		}
+		if _, err := h.Write(payload); err != nil {
+			close(jobs)
+			wg.Wait()
+			return nil, err
+		}
+
+		chunks = append(chunks, chunk)
+		select {
+		case jobs <- chunk:
+			off += int64(n)
+		case <-sendCtx.Done():
+			close(jobs)
+			wg.Wait()
+			return nil, context.Cause(sendCtx)
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return chunks, err
+	default:
+	}
+	if cause := context.Cause(sendCtx); cause != nil {
+		return chunks, cause
+	}
+	return chunks, nil
 }
 
 func (s *peerSession) waitResilientAck(
@@ -702,38 +840,24 @@ func (s *peerSession) sendFileResilient(
 
 		profile = tuner.current()
 		s.setCurrentTuning(profile)
-		windowEnd := windowStart + resilientWindowBytes
+		windowBytes := resilientFlightWindowBytes(runtime.GOOS, s.linkMode)
+		windowEnd := windowStart + windowBytes
 		if windowEnd > size {
 			windowEnd = size
 		}
 
-		chunks := make([]resilientSendChunk, 0, int((windowEnd-windowStart)/int64(profile.chunkSize))+1)
-		for off := windowStart; off < windowEnd; {
-			want := int64(profile.chunkSize)
-			if want <= 0 || want > maxDataChunkSize {
-				want = maxDataChunkSize
-			}
-			if windowEnd-off < want {
-				want = windowEnd - off
-			}
-			payload := make([]byte, int(want))
-			n, rerr := f.ReadAt(payload, off)
-			if rerr != nil && !errors.Is(rerr, io.EOF) {
-				return nil, rerr
-			}
-			if n != len(payload) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			_, _ = h.Write(payload)
-			chunks = append(chunks, buildResilientChunk(id, fileID, off, payload))
-			off += int64(n)
-		}
-
 		windowStarted := time.Now()
+		chunks, sendErr := s.readAndSendResilientWindow(
+			ctx, manager, f, h, id, fileID, windowStart, windowEnd, profile,
+		)
+		firstAttempt := true
 		for {
-			attemptCtx, cancel := context.WithTimeout(ctx, resilientAckTimeout)
-			sendErr := s.sendResilientBatch(attemptCtx, manager, chunks, profile.lanes, profile.pace)
-			cancel()
+			if !firstAttempt {
+				attemptCtx, cancel := context.WithTimeout(ctx, resilientAckTimeout)
+				sendErr = s.sendResilientBatch(attemptCtx, manager, chunks, profile.lanes, profile.pace)
+				cancel()
+			}
+			firstAttempt = false
 			if sendErr == nil {
 				sendErr = s.waitResilientAck(ctx, ack, windowEnd, &progressAck, p)
 			}
