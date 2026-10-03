@@ -234,7 +234,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					default:
 					}
 					cancel(err)
-					return
+					// 不立刻退出，继续把本 lane 已排队的 pooled buffer 释放掉。
+					continue
 				}
 				p.addBytes(int64(job.chunk.payloadLen))
 			}
