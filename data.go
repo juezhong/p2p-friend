@@ -524,8 +524,12 @@ func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inbou
 				return
 			}
 			if chunk.offset < next {
-				// QUIC 本身可靠，这里只把完全落在已写区域的重复块安全丢弃。
+				// v0.16 允许 ACK 丢失后重传整个未确认窗口。已写入的重复块直接丢弃，
+				// 同时重新发送当前累计 ACK，避免发送端因上一条 ACK 丢失而永久等待。
 				st.releaseChunk(chunk)
+				if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
+					_ = s.sendDataAck(id, st.fileID, next)
+				}
 				continue
 			}
 			if old, exists := pending[chunk.offset]; exists {
