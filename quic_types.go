@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	signalVersion      = 12
+	signalVersion      = 13
 	signalInvitePrefix = "P2PF-INVITE-"
 	signalReplyPrefix  = "P2PF-REPLY-"
-	quicALPN           = "p2p-friend/12"
-	punchMagic         = "P2PF12PUNCH"
+	quicALPN           = "p2p-friend/13"
+	punchMagic         = "P2PF13PUNCH"
 
 	maxDynamicCandidates = 16
 	maxRemoteCandidates  = 32
@@ -324,10 +324,10 @@ func quicConfig() *quic.Config {
 		HandshakeIdleTimeout:           12 * time.Second,
 		MaxIdleTimeout:                 60 * time.Second,
 		KeepAlivePeriod:                15 * time.Second,
-		InitialStreamReceiveWindow:     16 * 1024 * 1024,
-		MaxStreamReceiveWindow:         64 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     256 * 1024 * 1024,
+		InitialStreamReceiveWindow:     32 * 1024 * 1024,
+		MaxStreamReceiveWindow:         128 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 64 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     512 * 1024 * 1024,
 		MaxIncomingStreams:             int64(parallelLanes + 8),
 	}
 }

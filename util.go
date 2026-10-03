@@ -14,6 +14,17 @@ import (
 
 var consoleOut io.Writer = os.Stdout
 
+func (p *progress) addBytes(n int64) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	p.Done += n
+	p.CurrentDone += n
+	p.mu.Unlock()
+	p.print(false)
+}
+
 func (p *progress) print(force bool) {
 	if p == nil || p.Silent {
 		return

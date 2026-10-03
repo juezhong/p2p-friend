@@ -138,7 +138,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 
 	consolePrintln("识别码交换完成，正在建立 P2P 连接...")
 	token := append([]byte(nil), peer.token...)
-	// v12 双方都会同时 Listen + Dial；创建/加入身份只用于传输仲裁和路径决胜，
+	// v13 继续保持双方同时 Listen + Dial；创建/加入身份只用于传输仲裁和路径决胜，
 	// 不再决定谁必须充当 QUIC client/server。
 	conn, err := peer.connectQUIC()
 	if err != nil {

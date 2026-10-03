@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -12,10 +14,17 @@ import (
 )
 
 const (
-	frameEntryReady  = byte(11)
-	dataHeaderSize   = 20
-	maxDataChunkSize = 256 * 1024
+	frameEntryReady = byte(11)
+	dataHeaderSize  = 20
+
+	// v13 单块提升到 1 MiB。QUIC 仍会按路径 MTU 分包；这里的较大 chunk
+	// 只是减少应用层 Write / allocation / copy 次数。
+	maxDataChunkSize = 1024 * 1024
 	parallelLanes    = 4
+
+	// 每条 lane 最多预取 16 个 1 MiB chunk，4 lane 共约 64 MiB 用户态发送缓存。
+	// 接收端由同一发送窗口天然形成背压，避免缓存随文件大小无限增长。
+	sendQueueDepthPerLane = 16
 )
 
 type transferTuningProfile struct {
@@ -24,6 +33,8 @@ type transferTuningProfile struct {
 	pace      time.Duration
 }
 
+// adaptiveTransferTuner 保留用于测试和未来低带宽自适应策略。
+// v13 大文件热路径默认直接使用 1 MiB / 全 data lanes / 无人工 pacing。
 type adaptiveTransferTuner struct {
 	goos     string
 	maxLanes int
@@ -68,8 +79,6 @@ func transferTuningLevels(maxLanes int) []transferTuningProfile {
 func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner {
 	levels := transferTuningLevels(maxLanes)
 	if goos == "windows" {
-		// 高档位仅保留极轻的 burst pacing，目标是避免 Winsock 短时队列峰值，
-		// 而不是限速。真正的链路拥塞仍完全交给 QUIC congestion control。
 		for i := range levels {
 			switch levels[i].lanes {
 			case 3:
@@ -80,8 +89,6 @@ func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner 
 		}
 	}
 	initial := len(levels) - 1
-	// Windows 从 2 lane / 128 KiB 起步，避免一次把 Winsock 队列压满；
-	// Linux/macOS 从 3 lane 左右起步。之后都按实际吞吐探测到最高档。
 	if goos == "windows" {
 		for i, p := range levels {
 			if p.lanes >= 2 && p.chunkSize >= 128*1024 {
@@ -97,12 +104,7 @@ func newAdaptiveTransferTuner(goos string, maxLanes int) *adaptiveTransferTuner 
 			}
 		}
 	}
-	return &adaptiveTransferTuner{
-		goos:     goos,
-		maxLanes: maxLanes,
-		levels:   levels,
-		level:    initial,
-	}
+	return &adaptiveTransferTuner{goos: goos, maxLanes: maxLanes, levels: levels, level: initial}
 }
 
 func (t *adaptiveTransferTuner) current() transferTuningProfile {
@@ -122,10 +124,7 @@ func (t *adaptiveTransferTuner) resetWindow() {
 
 func (t *adaptiveTransferTuner) observe(bytes int64, elapsed time.Duration, err error) (transferTuningProfile, bool) {
 	old := t.current()
-
 	if err != nil {
-		// 真正的 socket / QUIC 写错误优先降档。正常网络拥塞由 QUIC 自己处理，
-		// 不再用“某一批写了多久”这种绝对阈值误判慢链路。
 		if t.level > 0 {
 			t.level--
 		}
@@ -135,15 +134,12 @@ func (t *adaptiveTransferTuner) observe(bytes int64, elapsed time.Duration, err 
 		t.resetWindow()
 		return t.current(), old != t.current()
 	}
-
 	if bytes > 0 {
 		t.windowBytes += bytes
 	}
 	if elapsed > 0 {
 		t.windowElapsed += elapsed
 	}
-	// 以吞吐窗口而不是单次 Write 延迟做判断。这样 1 MiB/s 和 100 MiB/s
-	// 链路都能正常升档，不会因为 WAN RTT 或接收端背压被错误降到 1 lane。
 	if t.windowElapsed < 800*time.Millisecond && t.windowBytes < 4*1024*1024 {
 		return old, false
 	}
@@ -151,16 +147,12 @@ func (t *adaptiveTransferTuner) observe(bytes int64, elapsed time.Duration, err 
 		t.resetWindow()
 		return old, false
 	}
-
 	rate := float64(t.windowBytes) / t.windowElapsed.Seconds()
 	t.resetWindow()
 	if rate > t.bestBps {
 		t.bestBps = rate
 	}
-
 	if t.probing {
-		// 探测更高档后，只要吞吐没有明显恶化就保留；若下降超过约 10%，
-		// 回到上一档并冷却几个窗口，避免在两个档位间频繁振荡。
 		if t.probeBase > 0 && rate < t.probeBase*0.90 {
 			if t.level > 0 {
 				t.level--
@@ -174,19 +166,15 @@ func (t *adaptiveTransferTuner) observe(bytes int64, elapsed time.Duration, err 
 		t.stable = 0
 		return t.current(), old != t.current()
 	}
-
 	if t.baselineBps == 0 {
 		t.baselineBps = rate
 	} else {
-		// 平滑基线，只用于下一次升档探测比较，不作为“网络拥塞”判断。
 		t.baselineBps = t.baselineBps*0.70 + rate*0.30
 	}
-
 	if t.cooldown > 0 {
 		t.cooldown--
 		return old, false
 	}
-
 	t.stable++
 	if t.stable >= 2 && t.level+1 < len(t.levels) {
 		t.stable = 0
@@ -202,9 +190,17 @@ func currentTransferTuner(maxLanes int) *adaptiveTransferTuner {
 	return newAdaptiveTransferTuner(runtime.GOOS, maxLanes)
 }
 
+func fastTransferProfile(maxLanes int) transferTuningProfile {
+	if maxLanes < 1 {
+		maxLanes = 1
+	}
+	if maxLanes > parallelLanes {
+		maxLanes = parallelLanes
+	}
+	return transferTuningProfile{chunkSize: maxDataChunkSize, lanes: maxLanes}
+}
+
 // dataLaneProvider 把 QUIC connection 上预先建立的多条 data stream 暴露给会话。
-// control stream 仍由 peerSession.conn 使用；这里只处理带 transferID/offset 的
-// 文件块，从而允许单文件按 offset 并行发送。
 type dataLaneProvider interface {
 	DataLanes() []io.ReadWriteCloser
 }
@@ -215,16 +211,64 @@ type sessionDataState struct {
 	seq   atomic.Uint64
 }
 
+type preparedDataChunk struct {
+	buf        []byte
+	offset     int64
+	payloadLen int
+}
+
+type inboundDataChunk struct {
+	buf        []byte
+	offset     int64
+	payloadLen int
+}
+
 type inboundDataState struct {
-	chunks   map[int64]int
-	received int64
-	done     chan struct{}
-	once     sync.Once
+	file *os.File
+	size int64
+
+	chunks chan inboundDataChunk
+	budget chan struct{}
+	stop   chan struct{}
+	done   chan struct{}
+	writerDone chan struct{}
+
+	stopped   atomic.Bool
+	stopOnce  sync.Once
+	doneOnce  sync.Once
+
+	resultMu sync.Mutex
+	written  int64
+	sum      []byte
+	err      error
 }
 
 var sessionData sync.Map
 var inboundData sync.Map
 var outboundReady sync.Map
+
+const pooledDataBufferSize = dataHeaderSize + maxDataChunkSize
+
+var dataBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, pooledDataBufferSize)
+	},
+}
+
+func acquireDataBuffer() []byte {
+	b := dataBufferPool.Get().([]byte)
+	if cap(b) < pooledDataBufferSize {
+		return make([]byte, pooledDataBufferSize)
+	}
+	return b[:pooledDataBufferSize]
+}
+
+func releaseDataBuffer(b []byte) {
+	if cap(b) < pooledDataBufferSize {
+		return
+	}
+	dataBufferPool.Put(b[:pooledDataBufferSize])
+}
 
 func attachDataLanes(s *peerSession, conn io.ReadWriteCloser) {
 	provider, ok := conn.(dataLaneProvider)
@@ -265,12 +309,18 @@ func getOutboundReady(ot *outboundTransfer) chan string {
 
 func clearOutboundReady(ot *outboundTransfer) { outboundReady.Delete(ot) }
 
-func resetInboundData(t *inboundTransfer, size int64) *inboundDataState {
-	st := &inboundDataState{chunks: make(map[int64]int), done: make(chan struct{})}
-	if size == 0 {
-		st.once.Do(func() { close(st.done) })
+func startInboundData(s *peerSession, id uint64, t *inboundTransfer, size int64, f *os.File) *inboundDataState {
+	st := &inboundDataState{
+		file:       f,
+		size:       size,
+		chunks:     make(chan inboundDataChunk, parallelLanes*sendQueueDepthPerLane),
+		budget:     make(chan struct{}, parallelLanes*sendQueueDepthPerLane),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		writerDone: make(chan struct{}),
 	}
 	inboundData.Store(t, st)
+	go s.inboundWriterLoop(id, t, st)
 	return st
 }
 
@@ -282,15 +332,162 @@ func getInboundData(t *inboundTransfer) *inboundDataState {
 	return v.(*inboundDataState)
 }
 
-func clearInboundData(t *inboundTransfer) {
-	if st := getInboundData(t); st != nil {
-		st.once.Do(func() { close(st.done) })
+func (st *inboundDataState) stopAccepting() {
+	if st.stopped.CompareAndSwap(false, true) {
+		st.stopOnce.Do(func() { close(st.stop) })
 	}
-	inboundData.Delete(t)
 }
 
-// writeDataChunk 优先把文件块分配到独立 data stream；只有底层连接没有提供
-// data lanes 时才回退到 control stream 的 frameData，主要用于测试/兼容路径。
+func (st *inboundDataState) enqueue(chunk inboundDataChunk) bool {
+	if st.stopped.Load() {
+		return false
+	}
+	// credit 覆盖 channel + reorder map 的总 chunk 数。credit 用完时停止继续
+	// 消费 QUIC stream，由 QUIC flow control 自然向发送端施加背压。
+	select {
+	case st.budget <- struct{}{}:
+	case <-st.stop:
+		return false
+	}
+	select {
+	case st.chunks <- chunk:
+		return true
+	case <-st.stop:
+		<-st.budget
+		return false
+	}
+}
+
+func (st *inboundDataState) releaseChunk(chunk inboundDataChunk) {
+	releaseDataBuffer(chunk.buf)
+	<-st.budget
+}
+
+func (st *inboundDataState) finish(written int64, sum []byte, err error) {
+	st.resultMu.Lock()
+	st.written = written
+	st.sum = append([]byte(nil), sum...)
+	st.err = err
+	st.resultMu.Unlock()
+	st.doneOnce.Do(func() { close(st.done) })
+}
+
+func (st *inboundDataState) result() (int64, []byte, error) {
+	st.resultMu.Lock()
+	defer st.resultMu.Unlock()
+	return st.written, append([]byte(nil), st.sum...), st.err
+}
+
+func clearInboundData(t *inboundTransfer) {
+	v, ok := inboundData.LoadAndDelete(t)
+	if !ok {
+		return
+	}
+	st := v.(*inboundDataState)
+	st.stopAccepting()
+	<-st.writerDone
+}
+
+func drainInboundBuffers(st *inboundDataState) {
+	for {
+		select {
+		case chunk := <-st.chunks:
+			st.releaseChunk(chunk)
+		default:
+			return
+		}
+	}
+}
+
+func (s *peerSession) inboundWriterLoop(id uint64, t *inboundTransfer, st *inboundDataState) {
+	defer close(st.writerDone)
+	h := sha256.New()
+	pending := make(map[int64]inboundDataChunk)
+	next := int64(0)
+
+	releasePending := func() {
+		for off, chunk := range pending {
+			delete(pending, off)
+			st.releaseChunk(chunk)
+		}
+		drainInboundBuffers(st)
+	}
+	fail := func(err error) {
+		st.stopAccepting()
+		releasePending()
+		st.finish(next, nil, err)
+		if err != nil {
+			go s.cancelInbound(id, "write pipeline failed: "+err.Error(), true)
+		}
+	}
+
+	if st.size == 0 {
+		st.stopAccepting()
+		st.finish(0, h.Sum(nil), nil)
+		return
+	}
+
+	for next < st.size {
+		select {
+		case <-st.stop:
+			releasePending()
+			st.finish(next, nil, errors.New("receive pipeline stopped"))
+			return
+		case chunk := <-st.chunks:
+			if chunk.offset < 0 || chunk.payloadLen < 0 ||
+				chunk.payloadLen > maxDataChunkSize ||
+				chunk.offset+int64(chunk.payloadLen) > st.size {
+				st.releaseChunk(chunk)
+				fail(errors.New("received data outside declared file range"))
+				return
+			}
+			if chunk.offset < next {
+				// QUIC 本身可靠，这里只把完全落在已写区域的重复块安全丢弃。
+				st.releaseChunk(chunk)
+				continue
+			}
+			if old, exists := pending[chunk.offset]; exists {
+				st.releaseChunk(chunk)
+				if old.payloadLen != chunk.payloadLen {
+					fail(errors.New("duplicate chunk has different size"))
+					return
+				}
+				continue
+			}
+			pending[chunk.offset] = chunk
+
+			for {
+				cur, ok := pending[next]
+				if !ok {
+					break
+				}
+				delete(pending, next)
+				payload := cur.buf[dataHeaderSize : dataHeaderSize+cur.payloadLen]
+				n, err := st.file.Write(payload)
+				if n > 0 {
+					_, _ = h.Write(payload[:n])
+					next += int64(n)
+					t.progress.addBytes(int64(n))
+				}
+				st.releaseChunk(cur)
+				if err != nil {
+					fail(err)
+					return
+				}
+				if n != cur.payloadLen {
+					fail(io.ErrShortWrite)
+					return
+				}
+			}
+		}
+	}
+
+	st.stopAccepting()
+	releasePending()
+	st.finish(next, h.Sum(nil), nil)
+}
+
+// writeDataChunk 是 control-stream fallback / 测试兼容路径。
 func (s *peerSession) writeDataChunk(id uint64, offset int64, payload []byte) error {
 	if offset < 0 {
 		return errors.New("negative data offset")
@@ -306,27 +503,79 @@ func (s *peerSession) writeDataChunk(id uint64, offset int64, payload []byte) er
 	return s.writeDataChunkOnLane(idx, id, offset, payload)
 }
 
-func (s *peerSession) writeDataChunkOnLane(idx int, id uint64, offset int64, payload []byte) error {
+func (s *peerSession) writePreparedDataChunkOnLane(idx int, id uint64, chunk preparedDataChunk) error {
 	st := dataState(s)
 	if st == nil || idx < 0 || idx >= len(st.lanes) {
 		return fmt.Errorf("invalid data lane: %d", idx)
 	}
-	if len(payload) > maxDataChunkSize {
-		return fmt.Errorf("data chunk too large: %d", len(payload))
+	if chunk.offset < 0 || chunk.payloadLen < 0 || chunk.payloadLen > maxDataChunkSize {
+		return errors.New("invalid prepared data chunk")
 	}
-	buf := make([]byte, dataHeaderSize+len(payload))
-	binary.BigEndian.PutUint64(buf[0:8], id)
-	binary.BigEndian.PutUint64(buf[8:16], uint64(offset))
-	binary.BigEndian.PutUint32(buf[16:20], uint32(len(payload)))
-	copy(buf[dataHeaderSize:], payload)
+	if len(chunk.buf) < dataHeaderSize+chunk.payloadLen {
+		return errors.New("prepared data buffer too small")
+	}
+	binary.BigEndian.PutUint64(chunk.buf[0:8], id)
+	binary.BigEndian.PutUint64(chunk.buf[8:16], uint64(chunk.offset))
+	binary.BigEndian.PutUint32(chunk.buf[16:20], uint32(chunk.payloadLen))
 
 	st.mu[idx].Lock()
 	defer st.mu[idx].Unlock()
-	n, err := st.lanes[idx].Write(buf)
-	if err == nil && n != len(buf) {
+	frame := chunk.buf[:dataHeaderSize+chunk.payloadLen]
+	n, err := st.lanes[idx].Write(frame)
+	if err == nil && n != len(frame) {
 		err = io.ErrShortWrite
 	}
 	return err
+}
+
+func (s *peerSession) writeDataChunkOnLane(idx int, id uint64, offset int64, payload []byte) error {
+	if len(payload) > maxDataChunkSize {
+		return fmt.Errorf("data chunk too large: %d", len(payload))
+	}
+	buf := acquireDataBuffer()
+	copy(buf[dataHeaderSize:], payload)
+	err := s.writePreparedDataChunkOnLane(idx, id, preparedDataChunk{
+		buf: buf, offset: offset, payloadLen: len(payload),
+	})
+	releaseDataBuffer(buf)
+	return err
+}
+
+func (s *peerSession) handleTransferDataOwned(id uint64, offset int64, buf []byte, payloadLen int) error {
+	t := s.getInbound(id)
+	if t == nil {
+		releaseDataBuffer(buf)
+		return fmt.Errorf("data for unknown transfer %d", id)
+	}
+
+	t.mu.Lock()
+	if t.cancelled || t.currentFile == nil {
+		cancelled := t.cancelled
+		t.mu.Unlock()
+		releaseDataBuffer(buf)
+		if cancelled {
+			return nil
+		}
+		return errors.New("data arrived without active file")
+	}
+	size := t.currentRemaining
+	st := getInboundData(t)
+	t.mu.Unlock()
+
+	if st == nil {
+		releaseDataBuffer(buf)
+		return errors.New("data state missing")
+	}
+	if offset < 0 || payloadLen < 0 || payloadLen > maxDataChunkSize ||
+		offset+int64(payloadLen) > size {
+		releaseDataBuffer(buf)
+		s.cancelInbound(id, "received data outside declared file range", true)
+		return nil
+	}
+	if !st.enqueue(inboundDataChunk{buf: buf, offset: offset, payloadLen: payloadLen}) {
+		releaseDataBuffer(buf)
+	}
+	return nil
 }
 
 func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
@@ -341,16 +590,19 @@ func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
 		id := binary.BigEndian.Uint64(header[0:8])
 		offset := int64(binary.BigEndian.Uint64(header[8:16]))
 		want := int(binary.BigEndian.Uint32(header[16:20]))
-		if want > maxDataChunkSize {
+		if want < 0 || want > maxDataChunkSize {
 			consolePrintf("[数据流] 无效数据长度: %d\n", want)
 			return
 		}
-		data := make([]byte, want)
-		if _, err := io.ReadFull(lane, data); err != nil {
+
+		buf := acquireDataBuffer()
+		copy(buf[:dataHeaderSize], header)
+		if _, err := io.ReadFull(lane, buf[dataHeaderSize:dataHeaderSize+want]); err != nil {
+			releaseDataBuffer(buf)
 			s.reportTransportError("数据流", err)
 			return
 		}
-		if err := s.handleTransferDataAt(id, offset, data); err != nil {
+		if err := s.handleTransferDataOwned(id, offset, buf, want); err != nil {
 			consolePrintf("[数据流] 数据处理失败: %v\n", err)
 		}
 	}

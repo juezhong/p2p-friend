@@ -44,20 +44,6 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 	if foreground {
 		consolePrintf("[PUT] %s -> %s (%s)\n", source, remoteDisplay(remoteDest), humanBytes(total))
 	}
-	hashes := make(map[string][]byte)
-	for _, e := range entries {
-		if e.IsDir {
-			continue
-		}
-		sum, err := fileSHA256(e.FullPath)
-		if err != nil {
-			return fmt.Errorf("hash %s: %w", e.FullPath, err)
-		}
-		hashes[e.RelPath] = sum
-		if foreground {
-			consolePrintf("[PUT] SHA-256 %s  %x\n", e.RelPath, sum)
-		}
-	}
 
 	id := fixedID
 	if id == 0 {
@@ -126,14 +112,18 @@ func (s *peerSession) sendTransfer(source, remoteDest string, requestID uint64, 
 		p.Current = e.RelPath
 		p.CurrentDone = 0
 		p.CurrentSize = e.Size
-		if err := s.sendFileStriped(ctx, id, e.FullPath, e.Size, p); err != nil {
+		sum, err := s.sendFileStriped(ctx, id, e.FullPath, e.Size, p)
+		if err != nil {
 			if cause := context.Cause(ctx); cause != nil {
 				return s.finishCancelledOutbound(ot, cause)
 			}
 			return fmt.Errorf("send %s: %w", e.RelPath, err)
 		}
 		p.print(true)
-		if err := s.writeFrame(frameEntryEnd, id, hashes[e.RelPath]); err != nil {
+		if foreground {
+			consolePrintf("[PUT] SHA-256 %s  %x\n", e.RelPath, sum)
+		}
+		if err := s.writeFrame(frameEntryEnd, id, sum); err != nil {
 			return fmt.Errorf("send checksum %s: %w", e.RelPath, err)
 		}
 	}
@@ -174,105 +164,147 @@ func (s *peerSession) waitEntryReady(ot *outboundTransfer, path string) error {
 	}
 }
 
-func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path string, size int64, p *progress) error {
+func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path string, size int64, p *progress) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
 	ds := dataState(s)
-	maxLanes := 1
-	if ds != nil && len(ds.lanes) > 0 {
-		maxLanes = len(ds.lanes)
-	}
-	tuner := currentTransferTuner(maxLanes)
-	nextOff := int64(0)
-	for nextOff < size {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		default:
-		}
-
-		profile := tuner.current()
-		if ds == nil || len(ds.lanes) == 0 {
-			profile.lanes = 1
-		}
-		s.setCurrentTuning(profile)
-
-		type chunkJob struct {
-			lane int
-			off  int64
-			data []byte
-		}
-		jobs := make([]chunkJob, 0, profile.lanes)
-		for lane := 0; lane < profile.lanes && nextOff < size; lane++ {
-			nwant := int64(profile.chunkSize)
-			if size-nextOff < nwant {
-				nwant = size - nextOff
-			}
-			buf := make([]byte, int(nwant))
-			n, rerr := f.ReadAt(buf, nextOff)
-			if rerr != nil && !errors.Is(rerr, io.EOF) {
-				return rerr
-			}
-			if n == 0 {
-				return io.ErrUnexpectedEOF
-			}
-			buf = buf[:n]
-			jobs = append(jobs, chunkJob{lane: lane, off: nextOff, data: buf})
-			nextOff += int64(n)
-		}
-
-		start := time.Now()
-		errCh := make(chan error, len(jobs))
-		var wg sync.WaitGroup
-		for _, job := range jobs {
-			job := job
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if ds == nil || len(ds.lanes) == 0 {
-					errCh <- s.writeDataChunk(id, job.off, job.data)
-					return
-				}
-				errCh <- s.writeDataChunkOnLane(job.lane, id, job.off, job.data)
-			}()
-		}
-		wg.Wait()
-		close(errCh)
-
-		var batchErr error
-		for werr := range errCh {
-			if werr != nil && batchErr == nil {
-				batchErr = werr
-			}
-		}
-		elapsed := time.Since(start)
-		var batchBytes int64
-		for _, job := range jobs {
-			batchBytes += int64(len(job.data))
-		}
-		newProfile, _ := tuner.observe(batchBytes, elapsed, batchErr)
-		s.setCurrentTuning(newProfile)
-		if batchErr != nil {
-			return batchErr
-		}
-
-		p.Done += batchBytes
-		p.CurrentDone += batchBytes
-		p.print(false)
-
-		if newProfile.pace > 0 {
+	if ds == nil || len(ds.lanes) == 0 {
+		h := sha256.New()
+		buf := make([]byte, maxDataChunkSize)
+		var off int64
+		for off < size {
 			select {
 			case <-ctx.Done():
-				return context.Cause(ctx)
-			case <-time.After(newProfile.pace):
+				return nil, context.Cause(ctx)
+			default:
 			}
+			want := int64(len(buf))
+			if size-off < want {
+				want = size - off
+			}
+			n, rerr := f.Read(buf[:want])
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return nil, rerr
+			}
+			if n == 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			_, _ = h.Write(buf[:n])
+			if err := s.writeDataChunk(id, off, buf[:n]); err != nil {
+				return nil, err
+			}
+			off += int64(n)
+			p.addBytes(int64(n))
+		}
+		return h.Sum(nil), nil
+	}
+
+	profile := fastTransferProfile(len(ds.lanes))
+	s.setCurrentTuning(profile)
+	defer s.clearCurrentTuning()
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	type laneJob struct {
+		chunk preparedDataChunk
+	}
+	queues := make([]chan laneJob, profile.lanes)
+	errCh := make(chan error, profile.lanes)
+	var workers sync.WaitGroup
+	for lane := 0; lane < profile.lanes; lane++ {
+		queues[lane] = make(chan laneJob, sendQueueDepthPerLane)
+		workers.Add(1)
+		go func(lane int, jobs <-chan laneJob) {
+			defer workers.Done()
+			for job := range jobs {
+				if context.Cause(ctx) != nil {
+					releaseDataBuffer(job.chunk.buf)
+					continue
+				}
+				err := s.writePreparedDataChunkOnLane(lane, id, job.chunk)
+				releaseDataBuffer(job.chunk.buf)
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel(err)
+					// 不立刻退出，继续把本 lane 已排队的 pooled buffer 释放掉。
+					continue
+				}
+				p.addBytes(int64(job.chunk.payloadLen))
+			}
+		}(lane, queues[lane])
+	}
+
+	closeQueues := func() {
+		for _, q := range queues {
+			close(q)
 		}
 	}
-	return nil
+	queuesClosed := false
+	defer func() {
+		if !queuesClosed {
+			closeQueues()
+		}
+		workers.Wait()
+	}()
+
+	h := sha256.New()
+	var off int64
+	seq := 0
+	for off < size {
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, cause
+		}
+		buf := acquireDataBuffer()
+		want := int64(maxDataChunkSize)
+		if size-off < want {
+			want = size - off
+		}
+		n, rerr := f.Read(buf[dataHeaderSize:dataHeaderSize+int(want)])
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
+			releaseDataBuffer(buf)
+			return nil, rerr
+		}
+		if n == 0 {
+			releaseDataBuffer(buf)
+			return nil, io.ErrUnexpectedEOF
+		}
+		_, _ = h.Write(buf[dataHeaderSize : dataHeaderSize+n])
+
+		job := laneJob{chunk: preparedDataChunk{buf: buf, offset: off, payloadLen: n}}
+		lane := seq % profile.lanes
+		seq++
+		select {
+		case queues[lane] <- job:
+			off += int64(n)
+		case <-ctx.Done():
+			releaseDataBuffer(buf)
+			return nil, context.Cause(ctx)
+		}
+	}
+
+	closeQueues()
+	queuesClosed = true
+	workers.Wait()
+
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			return nil, werr
+		}
+	default:
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, cause
+	}
+	return h.Sum(nil), nil
 }
 
 func (s *peerSession) handleEntryReady(id uint64, payload []byte) {
@@ -522,7 +554,7 @@ func (s *peerSession) handleEntryStart(id uint64, payload []byte) error {
 	t.currentFile = tmp
 	t.currentTemp = tmp.Name()
 	t.currentRemaining = e.Size
-	resetInboundData(t, e.Size)
+	startInboundData(s, id, t, e.Size, tmp)
 	t.currentMode = os.FileMode(e.Mode)
 	t.progress.Current = e.Path
 	t.progress.CurrentDone = 0
@@ -544,55 +576,12 @@ func (s *peerSession) handleTransferData(id uint64, payload []byte) error {
 }
 
 func (s *peerSession) handleTransferDataAt(id uint64, offset int64, payload []byte) error {
-	t := s.getInbound(id)
-	if t == nil {
-		return fmt.Errorf("data for unknown transfer %d", id)
+	if len(payload) > maxDataChunkSize {
+		return fmt.Errorf("data chunk too large: %d", len(payload))
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.cancelled {
-		return nil
-	}
-	if t.currentFile == nil {
-		t.markCancelledLocked("data arrived without active file")
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	if offset < 0 || offset+int64(len(payload)) > t.currentRemaining {
-		t.markCancelledLocked("received data outside declared file range")
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	st := getInboundData(t)
-	if st == nil {
-		t.markCancelledLocked("data state missing")
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	if old, exists := st.chunks[offset]; exists {
-		if old != len(payload) {
-			t.markCancelledLocked("duplicate chunk has different size")
-			go s.sendCancel(id, t.cancelWhy)
-		}
-		return nil
-	}
-	if _, err := t.currentFile.WriteAt(payload, offset); err != nil {
-		t.markCancelledLocked("write failed: " + err.Error())
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	st.chunks[offset] = len(payload)
-	st.received += int64(len(payload))
-	t.progress.Done += int64(len(payload))
-	t.progress.CurrentDone += int64(len(payload))
-	t.progress.print(false)
-	if st.received == t.currentRemaining {
-		st.once.Do(func() { close(st.done) })
-	} else if st.received > t.currentRemaining {
-		t.markCancelledLocked("received more bytes than declared")
-		go s.sendCancel(id, t.cancelWhy)
-	}
-	return nil
+	buf := acquireDataBuffer()
+	copy(buf[dataHeaderSize:], payload)
+	return s.handleTransferDataOwned(id, offset, buf, len(payload))
 }
 
 func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
@@ -634,12 +623,17 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 		return nil
 	}
 	st = getInboundData(t)
-	if st == nil || st.received != t.currentRemaining {
-		received := int64(0)
-		if st != nil {
-			received = st.received
+	if st == nil {
+		t.markCancelledLocked("data state missing")
+		go s.sendCancel(id, t.cancelWhy)
+		return nil
+	}
+	written, actual, writeErr := st.result()
+	if writeErr != nil || written != t.currentRemaining {
+		if writeErr == nil {
+			writeErr = fmt.Errorf("file ended with %d/%d bytes", written, t.currentRemaining)
 		}
-		t.markCancelledLocked(fmt.Sprintf("file ended with %d/%d bytes", received, t.currentRemaining))
+		t.markCancelledLocked(writeErr.Error())
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
@@ -658,18 +652,6 @@ func (s *peerSession) handleEntryEnd(id uint64, payload []byte) error {
 		go s.sendCancel(id, t.cancelWhy)
 		return nil
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		t.markCancelledLocked(err.Error())
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	h := sha256.New()
-	if _, err := io.CopyBuffer(h, f, make([]byte, 1024*1024)); err != nil {
-		t.markCancelledLocked("verify read failed: " + err.Error())
-		go s.sendCancel(id, t.cancelWhy)
-		return nil
-	}
-	actual := h.Sum(nil)
 	t.progress.print(true)
 	if !equalBytes(actual, payload) {
 		if !t.progress.Silent {

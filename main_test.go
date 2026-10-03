@@ -1380,3 +1380,96 @@ func TestCandidateDialDelayPrefersLANBeforeFallbacks(t *testing.T) {
 		t.Fatalf("unexpected fallback delays: prflx=%v portmap=%v srflx=%v", prflx, portmap, srflx)
 	}
 }
+
+
+func TestInboundPipelineReordersBeforeSequentialWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reorder.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	chunk := maxDataChunkSize
+	size := int64(3 * chunk)
+	if err := file.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+
+	session := &peerSession{}
+	in := &inboundTransfer{
+		currentFile:      file,
+		currentRemaining: size,
+		progress:         &progress{Silent: true, Total: size},
+	}
+	st := startInboundData(session, 1, in, size, file)
+
+	expected := make([]byte, size)
+	for block := 0; block < 3; block++ {
+		for i := 0; i < chunk; i++ {
+			expected[block*chunk+i] = byte(0x31 + block)
+		}
+	}
+
+	for _, block := range []int{2, 0, 1} {
+		buf := acquireDataBuffer()
+		copy(buf[dataHeaderSize:dataHeaderSize+chunk], expected[block*chunk:(block+1)*chunk])
+		if !st.enqueue(inboundDataChunk{
+			buf:        buf,
+			offset:     int64(block * chunk),
+			payloadLen: chunk,
+		}) {
+			releaseDataBuffer(buf)
+			t.Fatal("pipeline rejected valid out-of-order chunk")
+		}
+	}
+
+	select {
+	case <-st.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipeline did not finish")
+	}
+	written, sum, err := st.result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != size {
+		t.Fatalf("written=%d want=%d", written, size)
+	}
+	clearInboundData(in)
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, expected) {
+		t.Fatal("reordered pipeline did not produce sequential file contents")
+	}
+	wantSum, err := fileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sum, wantSum) {
+		t.Fatalf("pipeline hash=%x want=%x", sum, wantSum)
+	}
+}
+
+func TestFastTransferProfileUsesBoundedOneMiBChunks(t *testing.T) {
+	p := fastTransferProfile(parallelLanes)
+	if p.chunkSize != 1024*1024 {
+		t.Fatalf("chunk size=%d want=%d", p.chunkSize, 1024*1024)
+	}
+	if p.lanes != parallelLanes {
+		t.Fatalf("lanes=%d want=%d", p.lanes, parallelLanes)
+	}
+	if p.pace != 0 {
+		t.Fatalf("unexpected artificial pacing: %v", p.pace)
+	}
+	if got := parallelLanes * sendQueueDepthPerLane * maxDataChunkSize; got > 128*1024*1024 {
+		t.Fatalf("pipeline user-space buffer budget too large: %d", got)
+	}
+}
