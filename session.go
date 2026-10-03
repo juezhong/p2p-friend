@@ -523,7 +523,13 @@ func (s *peerSession) status() {
 		consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
 			maxInt(0, info.DataConnections-1), info.DataConnections)
 		consolePrintf("Data streams: %d\n", info.Streams)
-		consolePrintln("端口关系: 连通性检查、NAT 打洞、QUIC 握手和文件传输复用选中的 UDP socket。")
+		if len(info.DataPaths) > 0 {
+			consolePrintln("Data UDP flows:")
+			for _, path := range info.DataPaths {
+				consolePrintf("  - %s\n", path)
+			}
+		}
+		consolePrintln("端口关系: 主 QUIC 继续复用打洞 UDP socket；额外 data stripe 优先使用独立 UDP source port，失败时自动回退共享 socket。")
 	} else {
 		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
 	}

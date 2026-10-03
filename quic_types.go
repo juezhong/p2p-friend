@@ -101,8 +101,9 @@ type rtcConn struct {
 	peer     *rtcPeer
 	outbound bool
 
-	stripeMu  sync.RWMutex
-	stripeQCs []*quic.Conn
+	stripeMu     sync.RWMutex
+	stripeQCs    []*quic.Conn
+	stripeOwners []io.Closer
 
 	once sync.Once
 }
@@ -133,11 +134,21 @@ func (c *rtcConn) DataConnectionCount() int {
 	defer c.stripeMu.RUnlock()
 	return 1 + len(c.stripeQCs)
 }
-func (c *rtcConn) addStripe(qc *quic.Conn, lane io.ReadWriteCloser) {
+func (c *rtcConn) addStripe(qc *quic.Conn, lane io.ReadWriteCloser, owner io.Closer) {
 	c.stripeMu.Lock()
 	c.stripeQCs = append(c.stripeQCs, qc)
+	c.stripeOwners = append(c.stripeOwners, owner)
 	c.lanes = append(c.lanes, lane)
 	c.stripeMu.Unlock()
+}
+
+func (c *rtcConn) dataQUICs() []*quic.Conn {
+	c.stripeMu.RLock()
+	defer c.stripeMu.RUnlock()
+	out := make([]*quic.Conn, 0, 1+len(c.stripeQCs))
+	out = append(out, c.qc)
+	out = append(out, c.stripeQCs...)
+	return out
 }
 func (c *rtcConn) TransferCoordinator() bool          { return c.peer.server }
 func (c *rtcConn) QUICOutbound() bool                 { return c.outbound }
@@ -158,10 +169,17 @@ func (c *rtcConn) Close() error {
 	c.once.Do(func() {
 		c.stripeMu.Lock()
 		stripes := append([]*quic.Conn(nil), c.stripeQCs...)
+		owners := append([]io.Closer(nil), c.stripeOwners...)
 		c.stripeQCs = nil
+		c.stripeOwners = nil
 		c.stripeMu.Unlock()
 		for _, qc := range stripes {
 			_ = qc.CloseWithError(0, "normal shutdown")
+		}
+		for _, owner := range owners {
+			if owner != nil {
+				_ = owner.Close()
+			}
 		}
 		err = c.closeQUICOnly("normal shutdown")
 		_ = c.peer.Close()

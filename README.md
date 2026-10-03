@@ -112,26 +112,22 @@ p2p[IPv4-NAT-PUNCH remote:/path]>
 
 v0.14 在 v0.13 的有界内存流水线上进一步把网络并行从“同一个 QUIC connection 的多 stream”提升为**多个独立 QUIC connection**。
 
-主连接建立并完成 TLS / session-token 认证后，主连接的 dialer 会在同一个已经打通的 UDP socket / quic.Transport 上额外建立最多 3 条 data-only QUIC connection。它们复用同一个 NAT mapping，不重新执行 STUN、punch 或端口映射。
+主连接建立并完成 TLS / session-token 认证后，主连接的 dialer 会额外建立最多 3 条 data-only QUIC connection。v0.14.1 起这些 stripe **优先使用独立 UDP source port**，从而形成不同 UDP 5-tuple；目标 endpoint 仍复用主连接已经验证可达的地址，因此不需要重新执行 STUN、punch 或端口映射。若独立 source port 不可用，会自动回退到 v0.14.0 的共享 UDP socket 模式。
 
 ```text
-                       同一个 UDP socket
-                              │
-                       quic.Transport
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
+主 QUIC UDP port        stripe UDP port #1     stripe UDP port #2/#3
+       │                        │                       │
 主 QUIC connection       data QUIC #1         data QUIC #2/#3
 control + data stream       data stream           data stream
-        │                     │                     │
-        └─────────────── shared chunk queue ───────┘
+       │                        │                       │
+       └─────────────── shared chunk queue ────────────┘
                               │
                     1 MiB pooled chunks
 ```
 
 每条 QUIC connection 有独立的 QUIC connection state / congestion state。发送端仍然只顺序读取文件一次并同步计算 SHA-256；chunk 进入共享队列后，由当前空闲的 data-connection worker 动态领取，因此较快的连接自然承担更多 chunk，不再做固定 round-robin。
 
-接收端每条 data QUIC 都有独立 reader，但最终仍进入统一的有界 reorder window：
+接收端每条 data QUIC 都有独立 reader，但最终仍进入统一的有界 reorder window。v0.14.1 会按文件大小在 64 / 128 / 256 MiB 三档中选择窗口，避免某条 UDP flow 短时变慢后过早把其它 flow 全部反压停住，同时仍保持固定硬上限：
 
 ```text
 4 x QUIC data readers
@@ -152,7 +148,7 @@ OS page cache / dirty pages
 
 application data chunk 仍为最大 1 MiB。QUIC 会按路径 MTU 自动拆包；1 MiB 是应用层 chunk，不是 1 MiB UDP datagram。
 
-如果额外 data QUIC 无法全部建立，主会话不会失败，会自动使用已经成功建立的数据连接继续传输。
+如果额外 data QUIC 无法全部建立，主会话不会失败，会自动使用已经成功建立的数据连接继续传输。v0.14.1 与 v0.14.0 保持 v14 wire protocol 兼容。
 
 ### 单传输模式
 

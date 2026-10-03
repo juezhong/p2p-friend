@@ -21,6 +21,7 @@ type quicConnectionInfo struct {
 	RemoteCandidateType string
 	Streams             int
 	DataConnections     int
+	DataPaths           []string
 	Sockets             []udpSocketInfo
 	STUNMappings        []string
 	MappingBehavior     string
@@ -94,6 +95,9 @@ func (c *rtcConn) ConnectionInfo() quicConnectionInfo {
 		if strings.EqualFold(cand.Type, "srflx") {
 			info.STUNMappings = append(info.STUNMappings, cand.Addr)
 		}
+	}
+	for _, qc := range c.dataQUICs() {
+		info.DataPaths = append(info.DataPaths, fmt.Sprintf("%s -> %s", qc.LocalAddr(), qc.RemoteAddr()))
 	}
 	info.MappingBehavior, _, info.PortMappings = c.peer.networkInfo()
 	return info

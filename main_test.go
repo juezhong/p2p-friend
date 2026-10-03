@@ -702,6 +702,18 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	if hc, ok := hostConn.(*rtcConn); !ok || hc.DataConnectionCount() != maxDataConnections {
 		t.Fatalf("host data connections=%v", hostConn)
 	}
+	jc := joinConn.(*rtcConn)
+	ports := map[int]struct{}{}
+	for _, qc := range jc.dataQUICs() {
+		addr, ok := qc.LocalAddr().(*net.UDPAddr)
+		if !ok || addr == nil {
+			t.Fatalf("unexpected QUIC local addr: %T %v", qc.LocalAddr(), qc.LocalAddr())
+		}
+		ports[addr.Port] = struct{}{}
+	}
+	if len(ports) != maxDataConnections {
+		t.Fatalf("data QUICs did not use distinct UDP source ports: %v", ports)
+	}
 
 	hostDir := t.TempDir()
 	joinDir := t.TempDir()
@@ -1515,5 +1527,26 @@ func TestDirectoryProgressShowsCurrentFileAndTotal(t *testing.T) {
 	}
 	if !strings.Contains(got, "总计") || !strings.Contains(got, "25.00%") || !strings.Contains(got, "5.0 MiB / 20.0 MiB") {
 		t.Fatalf("missing directory-total progress: %q", got)
+	}
+}
+
+
+func TestReceiveWindowScalesButStaysBounded(t *testing.T) {
+	cases := []struct {
+		size int64
+		want int
+	}{
+		{64 * 1024 * 1024, minReceiveWindowChunks},
+		{512 * 1024 * 1024, midReceiveWindowChunks},
+		{2 * 1024 * 1024 * 1024, maxReceiveWindowChunks},
+		{100 * 1024 * 1024 * 1024, maxReceiveWindowChunks},
+	}
+	for _, tc := range cases {
+		if got := receiveWindowChunks(tc.size); got != tc.want {
+			t.Fatalf("receiveWindowChunks(%d)=%d want=%d", tc.size, got, tc.want)
+		}
+	}
+	if maxReceiveWindowChunks*maxDataChunkSize > 256*1024*1024 {
+		t.Fatalf("receive reorder window exceeds 256 MiB: %d", maxReceiveWindowChunks*maxDataChunkSize)
 	}
 }
