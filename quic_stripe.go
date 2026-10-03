@@ -29,6 +29,9 @@ func setupDataStripes(conn net.Conn, token []byte) int {
 	if !ok || len(token) != 32 {
 		return 0
 	}
+	if !rc.peer.supports(capMultiUDPStripe) {
+		return 0
+	}
 	want := maxDataConnections - primaryDataStreams
 	if want <= 0 {
 		return 0
