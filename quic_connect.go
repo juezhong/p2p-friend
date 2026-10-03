@@ -23,6 +23,7 @@ const (
 	punchRetryInterval    = 250 * time.Millisecond
 	passivePunchInterval  = 1 * time.Second
 	pathPreferenceWindow  = 600 * time.Millisecond
+	lanCandidateHeadStart = 150 * time.Millisecond
 	lanConnectTimeout     = 3 * time.Second
 )
 
@@ -36,12 +37,10 @@ type quicConnectResult struct {
 // candidates 拨号。创建方优先保留 inbound，加入方优先保留 outbound，从而在两条
 // 方向同时成功时稳定选中同一条 connection；首选方向不可达时短暂等待后使用反向路径。
 func (p *rtcPeer) connectQUIC() (net.Conn, error) {
-	// v0.15: 信令阶段已经携带双方 HOST prefix。只要能确认 mutual LAN，
-	// 主连接就严格走 LAN，不让 srflx / portmap / punch 参与竞速。
-	if lan := p.mutualLANRemoteCandidates(); len(lan) > 0 {
-		return p.connectStrictLAN(lan)
-	}
-
+	// HOST prefix 相同只能说明“可能在同一 LAN”，不能证明双方真的共享二层网络。
+	// 两个不同 NAT 后面的家庭网络经常同时使用 192.168.1.0/24。
+	// 因此所有 candidate 始终保留在竞速中；疑似 LAN HOST 只获得很短的 head start，
+	// 真正不可达时公网 IPv6 / portmap / srflx / prflx 会自动接管。
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
 
@@ -121,39 +120,31 @@ func (p *rtcPeer) waitForPeerThenConnect() (net.Conn, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	lan := p.mutualLANRemoteCandidates()
-	full := p.remoteCandidates()
-	if len(lan) > 0 {
-		p.setRemoteCandidates(lan)
-		defer p.setRemoteCandidates(full)
-	}
-
 	results := make(chan quicConnectResult, 16)
 	if p.startAcceptWorkers(ctx, results) == 0 {
 		return nil, errors.New("无法启动 QUIC UDP listener")
 	}
 
-	// mutual LAN 不需要 punch：创建方拿到 REPLY 后会直接对 LAN HOST Dial。
-	// 非 LAN 则低频维持 NAT mapping，并监听 authenticated punch。
-	if len(lan) == 0 {
-		for _, ep := range p.endpoints {
-			go punchLoopWithInterval(ctx, p, ep.transport, ep.family, passivePunchInterval)
-			go punchReadLoop(ctx, p, ep.transport, ep.family)
-		}
+	// Prefix overlap 不是 LAN 的可靠证明，因此等待阶段始终保留全部 candidate。
+	// 低频 authenticated punch 既能维持 NAT mapping，也能在真实 LAN 上直接触达对端。
+	for _, ep := range p.endpoints {
+		go punchLoopWithInterval(ctx, p, ep.transport, ep.family, passivePunchInterval)
+		go punchReadLoop(ctx, p, ep.transport, ep.family)
 	}
 
 	dialStarted := false
+	var fastPunchOnce sync.Once
 	startDial := func() {
 		if dialStarted {
 			return
 		}
 		dialStarted = true
-		if len(lan) == 0 {
-			// 对端已经真实出现，切到正常 punch 频率加速穿透。
+		// 对端已经真实出现后只启动一组高频 punch，避免 Dial 重试时累积 goroutine。
+		fastPunchOnce.Do(func() {
 			for _, ep := range p.endpoints {
 				go punchLoop(ctx, p, ep.transport, ep.family)
 			}
-		}
+		})
 		go func() {
 			conn, err := p.dialQUICContext(ctx)
 			select {
@@ -164,13 +155,18 @@ func (p *rtcPeer) waitForPeerThenConnect() (net.Conn, error) {
 		}()
 	}
 
+	// 与 connectQUIC 使用同一套方向仲裁。JOIN 偏好 outbound，HOST 偏好 inbound，
+	// 因此双方最终会选中同一条 QUIC connection，而不是各自拿到不同 race winner。
+	preferOutbound := !p.server
+	var fallback net.Conn
+	var fallbackTimer <-chan time.Time
+
 	for {
 		select {
 		case res := <-results:
 			if res.err != nil {
-				// 对端已经出现后，单轮 Dial 失败不是“等待超时”；继续等它的
-				// 后续 punch / QUIC Initial，或由 inbound 路径直接成功。
-				if dialStarted {
+				// 只有主动 Dial 自己结束时才能允许后续重新启动。
+				if res.outbound {
 					dialStarted = false
 				}
 				continue
@@ -178,21 +174,33 @@ func (p *rtcPeer) waitForPeerThenConnect() (net.Conn, error) {
 			if res.conn == nil {
 				continue
 			}
-			if len(lan) > 0 && !connUsesMutualLAN(res.conn, lan) {
-				closeRaceLoser(res.conn, "strict LAN wait rejected non-LAN path")
-				continue
+
+			preferred := res.outbound == preferOutbound
+			if preferred {
+				closeRaceLoser(fallback, "preferred path won")
+				cancel()
+				return res.conn, nil
 			}
-			cancel()
-			return res.conn, nil
+			if fallback == nil {
+				fallback = res.conn
+				fallbackTimer = time.After(pathPreferenceWindow)
+			} else {
+				closeRaceLoser(res.conn, "another path won")
+			}
+
+		case <-fallbackTimer:
+			if fallback != nil {
+				cancel()
+				return fallback, nil
+			}
 
 		case <-p.peerActivity:
 			// 只有经过 HMAC / nonce / role 校验的 punch 才能触发这里。
 			// 这表示创建方已经拿到 REPLY 并真正开始网络建连。
-			if len(lan) == 0 {
-				startDial()
-			}
+			startDial()
 
 		case <-p.closed:
+			closeRaceLoser(fallback, "peer closed")
 			return nil, net.ErrClosed
 		}
 	}
@@ -317,6 +325,14 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			}
 		}
 
+		preferLAN := false
+		for _, t := range targets {
+			if isSameSubnetHostCandidate(t.raw, t.addr) {
+				preferLAN = true
+				break
+			}
+		}
+
 		result := make(chan *quic.Conn, 1)
 		roundCtx, stopRound := context.WithCancel(ctx)
 		var wg sync.WaitGroup
@@ -325,7 +341,7 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				if delay := candidateDialDelay(t.raw, t.addr); delay > 0 {
+				if delay := candidateRaceDelay(t.raw, t.addr, preferLAN); delay > 0 {
 					select {
 					case <-roundCtx.Done():
 						return
@@ -547,14 +563,20 @@ func connectionTimeoutError() error {
 	return errors.New("P2P UDP/QUIC 连接超时；当前网络的 NAT/防火墙没有形成可用直连路径")
 }
 
-// candidateDialDelay 给真正的 LAN 路径一个短 head start，同时保留公网直连、
-// portmap、STUN 和运行时 prflx 作为自动 fallback。这里不是永久屏蔽后续路径，
-// 只是避免同一局域网中公网 hairpin/NAT 路径抢先赢得 QUIC race。
+// candidateDialDelay 保留 v0.15.1 的语义：单独看一个 candidate 时不引入延迟。
+// 是否给疑似 LAN 路径 head start 必须结合整轮 candidate 集合判断。
 func candidateDialDelay(c signalCandidate, addr *net.UDPAddr) time.Duration {
-	// v0.15.1: mutual LAN 已在 connectQUIC 入口单独判定并严格直连。
-	// 走到公网/NAT race 时不再人为 stagger，所有可用 candidate 同时 Dial，
-	// 第一个成功完成 QUIC handshake 的路径直接胜出。
 	return 0
+}
+
+// candidateRaceDelay 只有在本轮确实存在疑似 LAN HOST 时，才给其它公网/NAT
+// candidate 一个很短的延迟。这样纯公网场景仍保持全并发，而重叠私网即使误判
+// 也只损失一个很小的 head start，随后会自动 fallback。
+func candidateRaceDelay(c signalCandidate, addr *net.UDPAddr, preferLAN bool) time.Duration {
+	if !preferLAN || isSameSubnetHostCandidate(c, addr) {
+		return 0
+	}
+	return lanCandidateHeadStart
 }
 
 func isSameSubnetIP(remote net.IP) bool {

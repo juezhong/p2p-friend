@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	dataStripeTag       = byte(0xF0)
-	dataStripeSetupWait = 3 * time.Second
+	dataStripeTag           = byte(0xF0)
+	dataStripeSetupWait     = 5 * time.Second
+	dataStripeDedicatedWait = 1200 * time.Millisecond
 )
 
 // setupDataStripes 在主 QUIC 完成 TLS + 应用 token 认证后扩展额外 data-only
@@ -83,9 +84,13 @@ func (c *rtcConn) dialDataStripes(ctx context.Context, token []byte, want int) i
 		go func(index byte) {
 			defer wg.Done()
 
-			qc, st, owner, err := c.dialOneDataStripe(ctx, ep, remote, token, index, true)
-			if err != nil {
-				// 兼容 v0.14.0 / 严格 NAT：独立 source port 不通时退回原共享 UDP socket。
+			// 独立 source port 只是优化，不允许吃完整个 stripe setup deadline。
+			// 严格 NAT / stateful firewall 下它可能一直等到超时，因此给它单独短预算，
+			// 剩余时间留给共享主 UDP socket 的可靠 fallback。
+			dedicatedCtx, dedicatedCancel := context.WithTimeout(ctx, dataStripeDedicatedWait)
+			qc, st, owner, err := c.dialOneDataStripe(dedicatedCtx, ep, remote, token, index, true)
+			dedicatedCancel()
+			if err != nil && ctx.Err() == nil {
 				qc, st, owner, err = c.dialOneDataStripe(ctx, ep, remote, token, index, false)
 			}
 			if err != nil {

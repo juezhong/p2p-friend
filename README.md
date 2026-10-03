@@ -343,7 +343,7 @@ length-prefixed candidate records
 extension area
 ```
 
-HOST candidate 会携带网卡 prefix length（例如 IPv4 /24、IPv6 /64），用于在识别码解析阶段对称判断 mutual LAN。
+HOST candidate 会携带网卡 prefix length（例如 IPv4 /24、IPv6 /64），用于给可能的 LAN 路径提供短暂优先级。前缀重叠本身不再被视为“已确认同一局域网”，因为不同 NAT 后的家庭网络经常同时使用 192.168.1.0/24 等私网。
 
 envelope version 描述的是长期二进制格式本身，不等于产品版本号。后续产品版本新增兼容能力时通过 capability bitmap 和可跳过的 record/extension 区域协商，不再因为 v0.15.1、v0.16、v1.x 这样的产品版本变化而自动让识别码失效。
 
@@ -352,15 +352,21 @@ v0.15 是新的稳定协议基线，因此 v0.14.x 与 v0.15 之间不互通；�
 
 ### v0.15.1 公网/NAT 路径全并发
 
-当识别码确认不存在 mutual LAN 时，不再对 host / portmap / prflx / srflx 人为 stagger。所有公网/NAT candidate 立即并发发起 QUIC Dial，首个成功握手的路径胜出。strict LAN 策略保持不变，stable signal envelope 继续兼容 v0.15.0。
+公网/NAT candidate 继续参与自动竞速；疑似同网段 HOST 路径只获得很短的优先窗口，不会永久屏蔽公网 fallback。stable signal envelope 继续兼容 v0.15.0。
 
 
 ### v0.15.2 加入方等待改为事件驱动
 
 加入方生成 `P2PF-REPLY` 后不再立即启动 LAN/QUIC 连接超时。此时只保持 listener 和必要的低频 authenticated punch 状态，等待创建方真正开始网络活动。
 
-mutual LAN 场景下，加入方只被动监听 LAN QUIC，可无限期等待创建方粘贴 REPLY；创建方真正开始 Dial 后才建立连接。
-
-非 LAN / NAT 场景下，加入方低频维持 NAT mapping，并监听经过 HMAC/nonce/role 校验的 punch。只有收到创建方的合法 punch 后，才切换到高频 punch + 主动 candidate race。
+加入方等待期间始终保留 listener，并低频维持必要的 NAT mapping。收到经过 HMAC/nonce/role 校验的对端活动后，切换到正常 candidate race；疑似 LAN 和公网/NAT 路径都保留自动 fallback。
 
 因此“用户还没粘贴回传码”和“链路已经开始建立但失败”被彻底分成两个状态，不再依靠延长 timeout 猜测。
+
+
+### v0.15.3 路径竞态与 LAN 误判修复
+
+- 修复创建方 `connectQUIC()` 与加入方 `waitConn()` winner 仲裁不一致，避免一端已经开始认证时另一端把同一 QUIC 连接以 `preferred path won` 关闭。
+- 私网 HOST prefix 重叠不再直接判定为“同一局域网”；例如两个不同 NAT 后都使用 `192.168.1.0/24` 时，会继续尝试公网 IPv6 / portmap / STUN / NAT punch fallback。
+- 疑似 LAN HOST 仍获得很短的建连优先级，真实同局域网场景不会失去快速直连。
+- data stripe 独立 UDP source port 失败时，为共享主 UDP socket fallback 预留明确时间预算，减少 `data-stripes=0` 的偶发退化。
