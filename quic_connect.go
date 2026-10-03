@@ -325,6 +325,14 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			}
 		}
 
+		preferLAN := false
+		for _, t := range targets {
+			if isSameSubnetHostCandidate(t.raw, t.addr) {
+				preferLAN = true
+				break
+			}
+		}
+
 		result := make(chan *quic.Conn, 1)
 		roundCtx, stopRound := context.WithCancel(ctx)
 		var wg sync.WaitGroup
@@ -333,7 +341,7 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				if delay := candidateDialDelay(t.raw, t.addr); delay > 0 {
+				if delay := candidateRaceDelay(t.raw, t.addr, preferLAN); delay > 0 {
 					select {
 					case <-roundCtx.Done():
 						return
@@ -555,11 +563,17 @@ func connectionTimeoutError() error {
 	return errors.New("P2P UDP/QUIC 连接超时；当前网络的 NAT/防火墙没有形成可用直连路径")
 }
 
-// candidateDialDelay 给“疑似同网段 HOST”一个很短的 head start，但绝不把它
-// 当作已确认 LAN。RFC1918 网段会在不同 NAT 后重复，所以公网/NAT candidate
-// 仍会在短延迟后并发启动，避免 192.168.1.0/24 之类的重叠私网误判卡死连接。
+// candidateDialDelay 保留 v0.15.1 的语义：单独看一个 candidate 时不引入延迟。
+// 是否给疑似 LAN 路径 head start 必须结合整轮 candidate 集合判断。
 func candidateDialDelay(c signalCandidate, addr *net.UDPAddr) time.Duration {
-	if isSameSubnetHostCandidate(c, addr) {
+	return 0
+}
+
+// candidateRaceDelay 只有在本轮确实存在疑似 LAN HOST 时，才给其它公网/NAT
+// candidate 一个很短的延迟。这样纯公网场景仍保持全并发，而重叠私网即使误判
+// 也只损失一个很小的 head start，随后会自动 fallback。
+func candidateRaceDelay(c signalCandidate, addr *net.UDPAddr, preferLAN bool) time.Duration {
+	if !preferLAN || isSameSubnetHostCandidate(c, addr) {
 		return 0
 	}
 	return lanCandidateHeadStart
