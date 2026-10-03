@@ -211,13 +211,12 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 	type laneJob struct {
 		chunk preparedDataChunk
 	}
-	queues := make([]chan laneJob, profile.lanes)
+	jobs := make(chan laneJob, profile.lanes*sendQueueDepthPerLane)
 	errCh := make(chan error, profile.lanes)
 	var workers sync.WaitGroup
 	for lane := 0; lane < profile.lanes; lane++ {
-		queues[lane] = make(chan laneJob, sendQueueDepthPerLane)
 		workers.Add(1)
-		go func(lane int, jobs <-chan laneJob) {
+		go func(lane int) {
 			defer workers.Done()
 			for job := range jobs {
 				if context.Cause(ctx) != nil {
@@ -232,30 +231,23 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 					default:
 					}
 					cancel(err)
-					// 不立刻退出，继续把本 lane 已排队的 pooled buffer 释放掉。
 					continue
 				}
 				p.addBytes(int64(job.chunk.payloadLen))
 			}
-		}(lane, queues[lane])
+		}(lane)
 	}
 
-	closeQueues := func() {
-		for _, q := range queues {
-			close(q)
-		}
-	}
-	queuesClosed := false
+	jobsClosed := false
 	defer func() {
-		if !queuesClosed {
-			closeQueues()
+		if !jobsClosed {
+			close(jobs)
 		}
 		workers.Wait()
 	}()
 
 	h := sha256.New()
 	var off int64
-	seq := 0
 	for off < size {
 		if cause := context.Cause(ctx); cause != nil {
 			return nil, cause
@@ -277,10 +269,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		_, _ = h.Write(buf[dataHeaderSize : dataHeaderSize+n])
 
 		job := laneJob{chunk: preparedDataChunk{buf: buf, offset: off, payloadLen: n}}
-		lane := seq % profile.lanes
-		seq++
 		select {
-		case queues[lane] <- job:
+		case jobs <- job:
 			off += int64(n)
 		case <-ctx.Done():
 			releaseDataBuffer(buf)
@@ -288,8 +278,8 @@ func (s *peerSession) sendFileStriped(ctx context.Context, id uint64, path strin
 		}
 	}
 
-	closeQueues()
-	queuesClosed = true
+	close(jobs)
+	jobsClosed = true
 	workers.Wait()
 
 	select {
