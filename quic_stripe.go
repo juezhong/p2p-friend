@@ -36,6 +36,7 @@ func setupDataStripes(conn net.Conn, token []byte) int {
 	ctx, cancel := context.WithTimeout(context.Background(), dataStripeSetupWait)
 	defer cancel()
 
+	rc.peer.primaryAcceptWG.Wait()
 	if rc.outbound {
 		return rc.dialDataStripes(ctx, token, want)
 	}
