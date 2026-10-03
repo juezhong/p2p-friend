@@ -54,9 +54,10 @@ func printHelp() {
   quit / exit           断开并退出
 
 说明：
-  * 连接流程固定交换两类短识别码：P2PF-INVITE-... 邀请码和 P2PF-REPLY-... 回传码。
+  * 连接流程固定交换 P2PF-INVITE-... / P2PF-REPLY-...；v0.15 起内部使用稳定 binary envelope + capability 协商，产品版本升级不再自动更换识别码协议。
   * 两个识别码都交换完成后才开始真实 QUIC 建连，不再使用“先试几秒再决定是否需要回传码”的启发式流程。
-  * 双方拿齐 candidate 后会同时 QUIC Listen + Dial；公网 IPv6、显式端口映射和 IPv4 NAT 打洞会自动竞争。
+  * 识别码会携带 HOST 的子网前缀；确认双方处于同一 LAN 时直接只走 LAN，不让公网 hairpin 抢主路径。
+  * 不存在 mutual LAN 时，公网 IPv6、显式端口映射和 IPv4 NAT 打洞继续并发竞争。
   * UDP punch 包带会话 HMAC、时间戳和 nonce；合法探测到达后可学习真实 peer-reflexive 地址。
   * IPv4 会使用多个 STUN endpoint 判断公网映射是否稳定，并尝试 PCP / NAT-PMP / UPnP 显式端口映射。
   * 同一会话一次只运行一个文件/目录传输任务，避免双向任务争抢带宽。
@@ -138,7 +139,7 @@ func runHost(in *bufio.Reader, cwd string) error {
 
 	consolePrintln("识别码交换完成，正在建立 P2P 连接...")
 	token := append([]byte(nil), peer.token...)
-	// v14 继续保持双方同时 Listen + Dial；创建/加入身份只用于传输仲裁和路径决胜，
+	// stable baseline 继续保持双方同时 Listen + Dial；创建/加入身份只用于传输仲裁和路径决胜，
 	// 不再决定谁必须充当 QUIC client/server。
 	conn, err := peer.connectQUIC()
 	if err != nil {
