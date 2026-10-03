@@ -22,7 +22,7 @@ const (
 	punchClockSkew        = 2 * time.Minute
 	punchRetryInterval    = 250 * time.Millisecond
 	pathPreferenceWindow  = 600 * time.Millisecond
-	lanExclusiveWindow    = 1200 * time.Millisecond
+	lanConnectTimeout     = 3 * time.Second
 )
 
 type quicConnectResult struct {
@@ -35,14 +35,14 @@ type quicConnectResult struct {
 // candidates 拨号。创建方优先保留 inbound，加入方优先保留 outbound，从而在两条
 // 方向同时成功时稳定选中同一条 connection；首选方向不可达时短暂等待后使用反向路径。
 func (p *rtcPeer) connectQUIC() (net.Conn, error) {
+	// v0.15: 信令阶段已经携带双方 HOST prefix。只要能确认 mutual LAN，
+	// 主连接就严格走 LAN，不让 srflx / portmap / punch 参与竞速。
+	if lan := p.mutualLANRemoteCandidates(); len(lan) > 0 {
+		return p.connectStrictLAN(lan)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), connectionWaitTimeout)
 	defer cancel()
-
-	preferLAN := p.hasSameSubnetHostCandidate()
-	lanDeadline := time.Time{}
-	if preferLAN {
-		lanDeadline = time.Now().Add(lanExclusiveWindow)
-	}
 
 	results := make(chan quicConnectResult, 16)
 	startedListeners := p.startAcceptWorkers(ctx, results)
@@ -70,15 +70,6 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 	preferOutbound := !p.server
 	var fallback net.Conn
 	var fallbackTimer <-chan time.Time
-	var nonLANFallback net.Conn
-	var lanTimer <-chan time.Time
-	if preferLAN {
-		d := time.Until(lanDeadline)
-		if d < 0 {
-			d = 0
-		}
-		lanTimer = time.After(d)
-	}
 	var lastErr error
 
 	for {
@@ -91,20 +82,9 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 			if res.conn == nil {
 				continue
 			}
-			isLAN := connUsesSameSubnet(res.conn)
-			if preferLAN && time.Now().Before(lanDeadline) && !isLAN {
-				if nonLANFallback == nil {
-					nonLANFallback = res.conn
-				} else {
-					closeRaceLoser(res.conn, "LAN path has priority")
-				}
-				continue
-			}
-
 			preferred := res.outbound == preferOutbound
 			if preferred {
 				closeRaceLoser(fallback, "preferred path won")
-				closeRaceLoser(nonLANFallback, "preferred path won")
 				cancel()
 				return res.conn, nil
 			}
@@ -114,29 +94,14 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 			} else {
 				closeRaceLoser(res.conn, "another path won")
 			}
-		case <-lanTimer:
-			// LAN 独占窗口结束后，如果期间只有公网/NAT 路径成功，
-			// 才把它提升为正常 fallback；之后继续沿用方向决胜规则。
-			preferLAN = false
-			lanTimer = nil
-			if fallback == nil && nonLANFallback != nil {
-				fallback = nonLANFallback
-				nonLANFallback = nil
-				fallbackTimer = time.After(pathPreferenceWindow)
-			}
 		case <-fallbackTimer:
 			if fallback != nil {
-				closeRaceLoser(nonLANFallback, "fallback path selected")
 				cancel()
 				return fallback, nil
 			}
 		case <-ctx.Done():
 			if fallback != nil {
-				closeRaceLoser(nonLANFallback, "context ended with fallback")
 				return fallback, nil
-			}
-			if nonLANFallback != nil {
-				return nonLANFallback, nil
 			}
 			if lastErr != nil {
 				return nil, fmt.Errorf("%w；最后一次候选错误: %v", connectionTimeoutError(), lastErr)
@@ -236,17 +201,11 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 		key  string
 	}
 
-	lanOnlyUntil := time.Time{}
-	if p.hasSameSubnetHostCandidate() {
-		lanOnlyUntil = time.Now().Add(lanExclusiveWindow)
-	}
-
 	for {
 		if ctx.Err() != nil {
 			return nil, connectionTimeoutError()
 		}
-		var allTargets []target
-		var lanTargets []target
+		var targets []target
 		seen := map[string]struct{}{}
 		for _, ep := range p.endpoints {
 			for _, raw := range p.remoteCandidates() {
@@ -259,17 +218,8 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 					continue
 				}
 				seen[key] = struct{}{}
-				t := target{ep: ep, addr: addr, raw: raw, key: key}
-				allTargets = append(allTargets, t)
-				if isSameSubnetHostCandidate(raw, addr) {
-					lanTargets = append(lanTargets, t)
-				}
+				targets = append(targets, target{ep: ep, addr: addr, raw: raw, key: key})
 			}
-		}
-
-		targets := allTargets
-		if len(lanTargets) > 0 && !lanOnlyUntil.IsZero() && time.Now().Before(lanOnlyUntil) {
-			targets = lanTargets
 		}
 		if len(targets) == 0 {
 			select {
@@ -288,27 +238,14 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			wg.Add(1)
 			go func(t target) {
 				defer wg.Done()
-				delay := time.Duration(0)
-				if targets != nil && !(len(lanTargets) > 0 && !lanOnlyUntil.IsZero() && time.Now().Before(lanOnlyUntil)) {
-					delay = candidateDialDelay(t.raw, t.addr)
-				}
-				if delay > 0 {
+				if delay := candidateDialDelay(t.raw, t.addr); delay > 0 {
 					select {
 					case <-roundCtx.Done():
 						return
 					case <-time.After(delay):
 					}
 				}
-				timeout := 2 * time.Second
-				if !lanOnlyUntil.IsZero() && isSameSubnetHostCandidate(t.raw, t.addr) {
-					if remain := time.Until(lanOnlyUntil); remain > 0 && remain < timeout {
-						timeout = remain
-					}
-				}
-				if timeout <= 0 {
-					return
-				}
-				dialCtx, stop := context.WithTimeout(roundCtx, timeout)
+				dialCtx, stop := context.WithTimeout(roundCtx, 2*time.Second)
 				defer stop()
 				qc, err := t.ep.transport.Dial(dialCtx, t.addr, p.clientTLSConfig(), quicConfig())
 				if err != nil {
@@ -331,7 +268,6 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			wg.Wait()
 			close(done)
 		}()
-
 		select {
 		case qc := <-result:
 			stopRound()
@@ -351,22 +287,144 @@ func (p *rtcPeer) dialQUICContext(ctx context.Context) (net.Conn, error) {
 			return nil, connectionTimeoutError()
 		case <-done:
 			stopRound()
-			wait := 180 * time.Millisecond
-			if !lanOnlyUntil.IsZero() && time.Now().Before(lanOnlyUntil) {
-				if remain := time.Until(lanOnlyUntil); remain < wait {
-					wait = remain
-				}
-			}
-			if wait < 0 {
-				wait = 0
-			}
 			select {
 			case <-ctx.Done():
 				return nil, connectionTimeoutError()
-			case <-time.After(wait):
+			case <-time.After(180 * time.Millisecond):
 			}
 		}
 	}
+}
+
+func (p *rtcPeer) connectStrictLAN(lan []signalCandidate) (net.Conn, error) {
+	full := p.remoteCandidates()
+	p.setRemoteCandidates(lan)
+	defer p.setRemoteCandidates(full)
+
+	ctx, cancel := context.WithTimeout(context.Background(), lanConnectTimeout)
+	defer cancel()
+	results := make(chan quicConnectResult, 16)
+	if p.startAcceptWorkers(ctx, results) == 0 {
+		return nil, errors.New("无法启动 LAN QUIC listener")
+	}
+	go func() {
+		conn, err := p.dialQUICContext(ctx)
+		select {
+		case results <- quicConnectResult{conn: conn, err: err, outbound: true}:
+		case <-ctx.Done():
+			closeRaceLoser(conn, "LAN connection canceled")
+		}
+	}()
+
+	preferOutbound := !p.server
+	var fallback net.Conn
+	var timer <-chan time.Time
+	var lastErr error
+	for {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				lastErr = res.err
+				continue
+			}
+			if res.conn == nil || !connUsesMutualLAN(res.conn, lan) {
+				closeRaceLoser(res.conn, "non-LAN connection rejected")
+				continue
+			}
+			if res.outbound == preferOutbound {
+				closeRaceLoser(fallback, "preferred LAN direction won")
+				cancel()
+				return res.conn, nil
+			}
+			if fallback == nil {
+				fallback = res.conn
+				timer = time.After(pathPreferenceWindow)
+			} else {
+				closeRaceLoser(res.conn, "another LAN direction won")
+			}
+		case <-timer:
+			if fallback != nil {
+				cancel()
+				return fallback, nil
+			}
+		case <-ctx.Done():
+			if fallback != nil {
+				return fallback, nil
+			}
+			if lastErr != nil {
+				return nil, fmt.Errorf("检测到同一局域网，但 LAN QUIC 建连失败: %v", lastErr)
+			}
+			return nil, errors.New("检测到同一局域网，但 LAN QUIC 建连失败；请检查 AP/VLAN 隔离和本机防火墙")
+		}
+	}
+}
+
+func candidateIPNet(c signalCandidate) (*net.UDPAddr, *net.IPNet, bool) {
+	if !strings.EqualFold(c.Type, "host") || !c.PrefixKnown {
+		return nil, nil, false
+	}
+	addr, _, err := parseCandidate(c)
+	if err != nil || addr == nil || addr.IP == nil {
+		return nil, nil, false
+	}
+	ip := addr.IP
+	bits := 128
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+		bits = 32
+	}
+	if int(c.PrefixBits) > bits {
+		return nil, nil, false
+	}
+	mask := net.CIDRMask(int(c.PrefixBits), bits)
+	return addr, &net.IPNet{IP: ip.Mask(mask), Mask: mask}, true
+}
+
+func candidatesShareLAN(local, remote signalCandidate) bool {
+	la, ln, ok := candidateIPNet(local)
+	if !ok {
+		return false
+	}
+	ra, rn, ok := candidateIPNet(remote)
+	if !ok || (la.IP.To4() == nil) != (ra.IP.To4() == nil) {
+		return false
+	}
+	return ln.Contains(ra.IP) && rn.Contains(la.IP)
+}
+
+func (p *rtcPeer) mutualLANRemoteCandidates() []signalCandidate {
+	local := p.localCandidates()
+	remote := p.remoteCandidates()
+	var out []signalCandidate
+	seen := map[string]struct{}{}
+	for _, rc := range remote {
+		for _, lc := range local {
+			if !candidatesShareLAN(lc, rc) {
+				continue
+			}
+			if _, ok := seen[rc.Addr]; !ok {
+				seen[rc.Addr] = struct{}{}
+				out = append(out, rc)
+			}
+			break
+		}
+	}
+	sortCandidates(out)
+	return out
+}
+
+func connUsesMutualLAN(conn net.Conn, lan []signalCandidate) bool {
+	rc, ok := conn.(*rtcConn)
+	if !ok || rc == nil || rc.qc == nil {
+		return false
+	}
+	remote := rc.qc.RemoteAddr().String()
+	for _, cand := range lan {
+		if sameUDPAddress(cand.Addr, remote) {
+			return true
+		}
+	}
+	return false
 }
 
 func isSameSubnetHostCandidate(c signalCandidate, addr *net.UDPAddr) bool {
@@ -375,13 +433,7 @@ func isSameSubnetHostCandidate(c signalCandidate, addr *net.UDPAddr) bool {
 }
 
 func (p *rtcPeer) hasSameSubnetHostCandidate() bool {
-	for _, cand := range p.remoteCandidates() {
-		addr, _, err := parseCandidate(cand)
-		if err == nil && isSameSubnetHostCandidate(cand, addr) {
-			return true
-		}
-	}
-	return false
+	return len(p.mutualLANRemoteCandidates()) > 0
 }
 
 func connUsesSameSubnet(conn net.Conn) bool {

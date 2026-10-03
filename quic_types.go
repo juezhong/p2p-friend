@@ -20,11 +20,17 @@ import (
 )
 
 const (
-	signalVersion      = 14
-	signalInvitePrefix = "P2PF-INVITE-"
-	signalReplyPrefix  = "P2PF-REPLY-"
-	quicALPN           = "p2p-friend/14"
-	punchMagic         = "P2PF14PUNCH"
+	// v0.15 起信令 envelope / ALPN / punch magic 不再跟随产品版本变化。
+	// 后续兼容功能通过 capability bitmap 协商，而不是让识别码每版失效。
+	signalEnvelopeVersion = 1
+	signalInvitePrefix    = "P2PF-INVITE-"
+	signalReplyPrefix     = "P2PF-REPLY-"
+	quicALPN              = "p2p-friend/stable"
+	punchMagic            = "P2PFPUNCH"
+
+	capHostPrefix     uint64 = 1 << 0
+	capMultiUDPStripe uint64 = 1 << 1
+	signalCapabilitiesCurrent = capHostPrefix | capMultiUDPStripe
 
 	maxDynamicCandidates = 16
 	maxRemoteCandidates  = 32
@@ -33,16 +39,20 @@ const (
 // signalCandidate / signalCode 只是在进程内表示识别码内容；线上格式由
 // encodeSignal/decodeSignal 的紧凑二进制编码定义。
 type signalCandidate struct {
-	Addr string
-	Type string
+	Addr        string
+	Type        string
+	PrefixBits  uint8
+	PrefixKnown bool
 }
 
 type signalCode struct {
-	Version     int
-	Kind        string
-	Token       string
-	Candidates  []signalCandidate
-	Fingerprint string
+	Version        int
+	Capabilities   uint64
+	Kind           string
+	Token          string
+	SessionBinding string
+	Candidates     []signalCandidate
+	Fingerprint    string
 }
 
 type udpEndpoint struct {
@@ -76,6 +86,10 @@ type rtcPeer struct {
 
 	remoteMu sync.RWMutex
 	remote   []signalCandidate
+
+	capabilityMu       sync.RWMutex
+	localCapabilities  uint64
+	remoteCapabilities uint64
 
 	networkInfoMu    sync.RWMutex
 	mappingBehavior  string
@@ -247,6 +261,28 @@ func (p *rtcPeer) remoteCandidates() []signalCandidate {
 	p.remoteMu.RLock()
 	defer p.remoteMu.RUnlock()
 	return append([]signalCandidate(nil), p.remote...)
+}
+
+func (p *rtcPeer) setRemoteCapabilities(caps uint64) {
+	p.capabilityMu.Lock()
+	p.remoteCapabilities = caps
+	p.capabilityMu.Unlock()
+}
+
+func (p *rtcPeer) setLocalCapabilities(caps uint64) {
+	p.capabilityMu.Lock()
+	p.localCapabilities = caps
+	p.capabilityMu.Unlock()
+}
+
+func (p *rtcPeer) commonCapabilities() uint64 {
+	p.capabilityMu.RLock()
+	defer p.capabilityMu.RUnlock()
+	return p.localCapabilities & p.remoteCapabilities
+}
+
+func (p *rtcPeer) supports(cap uint64) bool {
+	return p.commonCapabilities()&cap != 0
 }
 
 func (p *rtcPeer) setNetworkInfo(behavior string, stun, mappings []string) {

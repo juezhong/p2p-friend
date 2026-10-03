@@ -325,3 +325,26 @@ SHA256SUMS.txt
 - 成功连接的一方可以在对方当前系统用户权限范围内浏览、读取和写入文件系统。
 
 连接码属于临时访问凭据，只应发送给可信任的人。
+
+
+## 稳定识别码协议（v0.15+）
+
+v0.15 起外部前缀长期固定为 `P2PF-INVITE-` / `P2PF-REPLY-`。内部不使用 JSON，也没有引入 protobuf 依赖，而是采用更紧凑的稳定 binary envelope：
+
+```text
+envelope-version
+kind
+capability bitmap (uvarint)
+candidate count
+INVITE: 32-byte session token
+REPLY:  16-byte session binding
+32-byte TLS certificate fingerprint
+length-prefixed candidate records
+extension area
+```
+
+HOST candidate 会携带网卡 prefix length（例如 IPv4 /24、IPv6 /64），用于在识别码解析阶段对称判断 mutual LAN。
+
+envelope version 描述的是长期二进制格式本身，不等于产品版本号。后续产品版本新增兼容能力时通过 capability bitmap 和可跳过的 record/extension 区域协商，不再因为 v0.15.1、v0.16、v1.x 这样的产品版本变化而自动让识别码失效。
+
+v0.15 是新的稳定协议基线，因此 v0.14.x 与 v0.15 之间不互通；从 v0.15 开始，目标是保持向前兼容。
