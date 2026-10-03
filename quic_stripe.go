@@ -80,58 +80,15 @@ func (c *rtcConn) dialDataStripes(ctx context.Context, token []byte, want int) i
 		go func(index byte) {
 			defer wg.Done()
 
-			dialCtx, cancel := context.WithTimeout(ctx, dataStripeSetupWait)
-			defer cancel()
-
-			// 独立 UDP socket 让每条 data QUIC 拥有不同 source port / 5-tuple。
-			// 这能避开某些单 UDP flow 的整形、队列和路径哈希瓶颈。
-			network := "udp6"
-			bind := &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
-			if remote.IP.To4() != nil {
-				network = "udp4"
-				bind = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+			qc, st, owner, err := c.dialOneDataStripe(ctx, ep, remote, token, index, true)
+			if err != nil {
+				// 兼容 v0.14.0 / 严格 NAT：独立 source port 不通时退回原共享 UDP socket。
+				qc, st, owner, err = c.dialOneDataStripe(ctx, ep, remote, token, index, false)
 			}
-			udpConn, err := net.ListenUDP(network, bind)
 			if err != nil {
 				return
 			}
-			_ = udpConn.SetReadBuffer(16 * 1024 * 1024)
-			_ = udpConn.SetWriteBuffer(16 * 1024 * 1024)
-			tr := &quic.Transport{Conn: udpConn}
-
-			qc, err := tr.Dial(dialCtx, remote, c.peer.clientTLSConfig(), quicConfig())
-			if err != nil {
-				_ = tr.Close()
-				_ = udpConn.Close()
-				return
-			}
-			st, err := qc.OpenStreamSync(dialCtx)
-			if err != nil {
-				_ = qc.CloseWithError(0, "data stripe stream failed")
-				_ = tr.Close()
-				_ = udpConn.Close()
-				return
-			}
-
-			header := make([]byte, 2+len(token))
-			header[0] = dataStripeTag
-			header[1] = index
-			copy(header[2:], token)
-			if _, err := st.Write(header); err != nil {
-				_ = qc.CloseWithError(0, "data stripe auth failed")
-				_ = tr.Close()
-				_ = udpConn.Close()
-				return
-			}
-			var ack [2]byte
-			if _, err := io.ReadFull(st, ack[:]); err != nil || string(ack[:]) != "OK" {
-				_ = qc.CloseWithError(0, "data stripe rejected")
-				_ = tr.Close()
-				_ = udpConn.Close()
-				return
-			}
-
-			c.addStripe(qc, &quicStreamConn{st}, tr)
+			c.addStripe(qc, &quicStreamConn{st}, owner)
 			mu.Lock()
 			added++
 			mu.Unlock()
@@ -139,6 +96,81 @@ func (c *rtcConn) dialDataStripes(ctx context.Context, token []byte, want int) i
 	}
 	wg.Wait()
 	return added
+}
+
+func (c *rtcConn) dialOneDataStripe(
+	ctx context.Context,
+	ep *udpEndpoint,
+	remote *net.UDPAddr,
+	token []byte,
+	index byte,
+	dedicated bool,
+) (*quic.Conn, *quic.Stream, io.Closer, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, dataStripeSetupWait)
+	defer cancel()
+
+	tr := ep.transport
+	var owner io.Closer
+	var udpConn *net.UDPConn
+	if dedicated {
+		network := "udp6"
+		bind := &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
+		if remote.IP.To4() != nil {
+			network = "udp4"
+			bind = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+		}
+		var err error
+		udpConn, err = net.ListenUDP(network, bind)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		_ = udpConn.SetReadBuffer(16 * 1024 * 1024)
+		_ = udpConn.SetWriteBuffer(16 * 1024 * 1024)
+		ownedTransport := &quic.Transport{Conn: udpConn}
+		tr = ownedTransport
+		owner = ownedTransport
+	}
+
+	cleanup := func() {
+		if owner != nil {
+			_ = owner.Close()
+		}
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+	}
+
+	qc, err := tr.Dial(dialCtx, remote, c.peer.clientTLSConfig(), quicConfig())
+	if err != nil {
+		cleanup()
+		return nil, nil, nil, err
+	}
+	st, err := qc.OpenStreamSync(dialCtx)
+	if err != nil {
+		_ = qc.CloseWithError(0, "data stripe stream failed")
+		cleanup()
+		return nil, nil, nil, err
+	}
+
+	header := make([]byte, 2+len(token))
+	header[0] = dataStripeTag
+	header[1] = index
+	copy(header[2:], token)
+	if _, err := st.Write(header); err != nil {
+		_ = qc.CloseWithError(0, "data stripe auth failed")
+		cleanup()
+		return nil, nil, nil, err
+	}
+	var ack [2]byte
+	if _, err := io.ReadFull(st, ack[:]); err != nil || string(ack[:]) != "OK" {
+		_ = qc.CloseWithError(0, "data stripe rejected")
+		cleanup()
+		if err == nil {
+			err = errors.New("data stripe rejected")
+		}
+		return nil, nil, nil, err
+	}
+	return qc, st, owner, nil
 }
 
 func (c *rtcConn) acceptDataStripes(ctx context.Context, token []byte, want int) int {
