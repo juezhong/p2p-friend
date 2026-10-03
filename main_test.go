@@ -822,6 +822,47 @@ func TestJoinWaitConnDoesNotExpireBeforeCreatorStarts(t *testing.T) {
 }
 
 
+
+func TestResilientLinuxLANRestoresDeepFlightWindow(t *testing.T) {
+	if got := resilientFlightWindowBytes("linux", "IPv4-LAN"); got != 64*1024*1024 {
+		t.Fatalf("linux IPv4 LAN flight window=%d want=%d", got, 64*1024*1024)
+	}
+	if got := resilientFlightWindowBytes("linux", "IPv6-LAN"); got != 64*1024*1024 {
+		t.Fatalf("linux IPv6 LAN flight window=%d want=%d", got, 64*1024*1024)
+	}
+	if got := resilientFlightWindowBytes("linux", "IPv6-DIRECT"); got != resilientDefaultWindowBytes {
+		t.Fatalf("linux WAN/direct flight window=%d want=%d", got, resilientDefaultWindowBytes)
+	}
+	if got := resilientSendQueueDepth("linux", "IPv4-LAN", 4); got != 64 {
+		t.Fatalf("linux LAN queue depth=%d want=64", got)
+	}
+	if got := resilientSendQueueDepth("windows", "IPv4-LAN", 4); got != 8 {
+		t.Fatalf("windows LAN queue depth=%d want=8", got)
+	}
+}
+
+func TestNewResilientChunkWritesPayloadInPlace(t *testing.T) {
+	chunk := newResilientChunk(7, 9, 11, 32)
+	if len(chunk.frame) != resilientDataHeaderSize+32 {
+		t.Fatalf("frame len=%d", len(chunk.frame))
+	}
+	if binary.BigEndian.Uint64(chunk.frame[0:8]) != 7 ||
+		binary.BigEndian.Uint64(chunk.frame[8:16]) != 9 ||
+		binary.BigEndian.Uint64(chunk.frame[16:24]) != 11 ||
+		binary.BigEndian.Uint32(chunk.frame[24:28]) != 32 {
+		t.Fatal("resilient frame header mismatch")
+	}
+	payload := chunk.frame[resilientDataHeaderSize:]
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	for i := range payload {
+		if chunk.frame[resilientDataHeaderSize+i] != byte(i) {
+			t.Fatal("payload is not backed by frame buffer")
+		}
+	}
+}
+
 func TestResilientWindowsTunerAcceleratesAndRequiresRepeatedFailures(t *testing.T) {
 	tuner := newResilientTransferTuner("windows", 4)
 	if p := tuner.current(); p.lanes != 2 || p.chunkSize != 128*1024 {
