@@ -23,7 +23,7 @@ import (
 func TestSignalCodeRoundTrip(t *testing.T) {
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
 	in := signalCode{
-		Version: signalVersion,
+		Version: signalEnvelopeVersion,
 		Kind:    "connect",
 		Token:   token,
 		Candidates: []signalCandidate{
@@ -1036,7 +1036,7 @@ func TestShutdownRemovesPartialReceive(t *testing.T) {
 func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x24}, 32))
 	invite := signalCode{
-		Version: signalVersion, Kind: "connect", Token: token,
+		Version: signalEnvelopeVersion, Kind: "connect", Token: token,
 		Candidates:  []signalCandidate{{Addr: "192.0.2.1:41001", Type: "host"}},
 		Fingerprint: strings.Repeat("cd", 32),
 	}
@@ -1051,8 +1051,10 @@ func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
 		t.Fatalf("wrong-role INVITE code should be explained, got %v", err)
 	}
 
+	rawToken, _ := base64.RawURLEncoding.DecodeString(token)
 	reply := signalCode{
-		Version: signalVersion, Kind: "confirm", Token: token,
+		Version: signalEnvelopeVersion, Kind: "confirm",
+		SessionBinding: base64.RawURLEncoding.EncodeToString(makeSignalBinding(rawToken)),
 		Candidates:  []signalCandidate{{Addr: "198.51.100.2:42002", Type: "srflx"}},
 		Fingerprint: strings.Repeat("dc", 32),
 	}
@@ -1074,7 +1076,7 @@ func TestSignalCodePrefixesIdentifyRoles(t *testing.T) {
 func TestSignalCandidateDeduplication(t *testing.T) {
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
 	in := signalCode{
-		Version: signalVersion, Kind: "connect", Token: token,
+		Version: signalEnvelopeVersion, Kind: "connect", Token: token,
 		Fingerprint: strings.Repeat("ef", 32),
 		Candidates: []signalCandidate{
 			{Addr: "203.0.113.9:45678", Type: "srflx"},
@@ -1229,10 +1231,11 @@ func TestDeterministicInviteReplyHandshake(t *testing.T) {
 
 func TestSignalPortmapCandidateRoundTrip(t *testing.T) {
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x33}, 32))
+	rawToken, _ := base64.RawURLEncoding.DecodeString(token)
 	in := signalCode{
-		Version: signalVersion,
+		Version: signalEnvelopeVersion,
 		Kind: "confirm",
-		Token: token,
+		SessionBinding: base64.RawURLEncoding.EncodeToString(makeSignalBinding(rawToken)),
 		Fingerprint: strings.Repeat("12", 32),
 		Candidates: []signalCandidate{
 			{Addr: "198.51.100.20:45670", Type: "portmap"},
@@ -1597,5 +1600,88 @@ func TestSameSubnetHostCandidateDetection(t *testing.T) {
 	}
 	if ipInSameSubnet(net.ParseIP("118.112.118.32"), []*net.IPNet{localNet}) {
 		t.Fatal("public srflx address incorrectly recognized as LAN")
+	}
+}
+
+
+func TestStableSignalCarriesHostPrefixAndCapabilities(t *testing.T) {
+	token := bytes.Repeat([]byte{0x51}, 32)
+	in := signalCode{
+		Version:      signalEnvelopeVersion,
+		Capabilities: signalCapabilitiesCurrent,
+		Kind:         "connect",
+		Token:        base64.RawURLEncoding.EncodeToString(token),
+		Fingerprint:  strings.Repeat("34", 32),
+		Candidates: []signalCandidate{
+			{Addr: "192.168.1.6:50000", Type: "host", PrefixKnown: true, PrefixBits: 24},
+			{Addr: "[2001:db8:1::6]:50001", Type: "host", PrefixKnown: true, PrefixBits: 64},
+			{Addr: "203.0.113.6:40000", Type: "srflx"},
+		},
+	}
+	code, err := encodeSignal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := decodeSignal(code, "connect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Capabilities != signalCapabilitiesCurrent {
+		t.Fatalf("capabilities=%x want=%x", out.Capabilities, signalCapabilitiesCurrent)
+	}
+	foundV4, foundV6 := false, false
+	for _, cand := range out.Candidates {
+		if cand.Addr == "192.168.1.6:50000" {
+			foundV4 = cand.PrefixKnown && cand.PrefixBits == 24
+		}
+		if cand.Addr == "[2001:db8:1::6]:50001" {
+			foundV6 = cand.PrefixKnown && cand.PrefixBits == 64
+		}
+	}
+	if !foundV4 || !foundV6 {
+		t.Fatalf("host prefixes were not preserved: %#v", out.Candidates)
+	}
+}
+
+func TestMutualLANRequiresBothPrefixesToAgree(t *testing.T) {
+	a := signalCandidate{Addr: "192.168.1.6:5000", Type: "host", PrefixKnown: true, PrefixBits: 24}
+	b := signalCandidate{Addr: "192.168.1.100:6000", Type: "host", PrefixKnown: true, PrefixBits: 24}
+	if !candidatesShareLAN(a, b) {
+		t.Fatal("same /24 HOST candidates should be mutual LAN")
+	}
+	c := signalCandidate{Addr: "192.168.2.100:6000", Type: "host", PrefixKnown: true, PrefixBits: 24}
+	if candidatesShareLAN(a, c) {
+		t.Fatal("different /24 HOST candidates must not be treated as LAN")
+	}
+	d := signalCandidate{Addr: "192.168.1.100:6000", Type: "host"}
+	if candidatesShareLAN(a, d) {
+		t.Fatal("missing remote prefix must not force strict LAN mode")
+	}
+}
+
+func TestReplySignalIsShorterThanInvite(t *testing.T) {
+	token := bytes.Repeat([]byte{0x52}, 32)
+	commonCandidates := []signalCandidate{
+		{Addr: "192.168.1.6:5000", Type: "host", PrefixKnown: true, PrefixBits: 24},
+		{Addr: "203.0.113.6:40000", Type: "srflx"},
+	}
+	invite, err := encodeSignal(signalCode{
+		Version: signalEnvelopeVersion, Capabilities: signalCapabilitiesCurrent, Kind: "connect",
+		Token: base64.RawURLEncoding.EncodeToString(token),
+		Fingerprint: strings.Repeat("56", 32), Candidates: commonCandidates,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := encodeSignal(signalCode{
+		Version: signalEnvelopeVersion, Capabilities: signalCapabilitiesCurrent, Kind: "confirm",
+		SessionBinding: base64.RawURLEncoding.EncodeToString(makeSignalBinding(token)),
+		Fingerprint: strings.Repeat("78", 32), Candidates: commonCandidates,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reply) >= len(invite) {
+		t.Fatalf("reply should be shorter than invite: reply=%d invite=%d", len(reply), len(invite))
 	}
 }
