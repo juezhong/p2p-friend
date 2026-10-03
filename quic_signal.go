@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
@@ -180,14 +181,22 @@ func (p *rtcPeer) applyConfirmation(raw string) error {
 
 func (p *rtcPeer) waitConn() (net.Conn, error) { return p.connectQUIC() }
 
-// gatherCandidates 收集 host、多个 STUN srflx 和可用的显式端口映射。
-// 端口映射是可选增强；失败时不会阻止 STUN/直连候选继续工作。
+const candidateGatherBudget = 1500 * time.Millisecond
+
+type candidateGatherResult struct {
+	mapped  []*net.UDPAddr
+	cand    signalCandidate
+	cleanup func()
+	method  string
+}
+
+// gatherCandidates 先立即收集本机 host candidate，再把 Multi-STUN 与端口映射并行执行。
+// 所有“增强候选”共享统一时间预算，避免某个不支持 PCP/NAT-PMP/UPnP 的路由器
+// 或不可达 STUN server 串行拖慢邀请码 / 回传码生成。
 func gatherCandidates(p *rtcPeer) []signalCandidate {
 	set := map[string]signalCandidate{}
 	ifaces, _ := net.Interfaces()
-	var observations []string
-	behavior := "unknown"
-	var mappings []string
+	var ipv4Endpoint *udpEndpoint
 
 	for _, ep := range p.endpoints {
 		port := ep.conn.LocalAddr().(*net.UDPAddr).Port
@@ -217,30 +226,62 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 				set["host|"+addr] = signalCandidate{Addr: addr, Type: "host"}
 			}
 		}
-		if ep.family != 4 {
-			continue
+		if ep.family == 4 {
+			ipv4Endpoint = ep
 		}
+	}
 
-		mapped := stunMappedAddresses(ep.conn)
-		if len(mapped) > 0 {
-			unique := map[string]struct{}{}
-			for _, a := range mapped {
-				s := a.String()
-				unique[s] = struct{}{}
-				observations = append(observations, s)
-				set["srflx|"+s] = signalCandidate{Addr: s, Type: "srflx"}
-			}
-			if len(unique) == 1 {
-				behavior = "stable"
-			} else {
-				behavior = "endpoint-dependent"
-			}
-		}
+	behavior := "unknown"
+	var observations, mappings []string
+	if ipv4Endpoint != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
+		defer cancel()
 
-		if cand, cleanup, method, err := discoverPortMapping(ep); err == nil && cand.Addr != "" {
-			set["portmap|"+cand.Addr] = cand
-			mappings = append(mappings, method+" "+cand.Addr)
-			p.addCleanup(cleanup)
+		results := make(chan candidateGatherResult, 2)
+		go func() {
+			results <- candidateGatherResult{mapped: stunMappedAddressesContext(ctx, ipv4Endpoint.conn)}
+		}()
+		go func() {
+			cand, cleanup, method, err := discoverPortMappingContext(ctx, ipv4Endpoint)
+			if err != nil {
+				results <- candidateGatherResult{}
+				return
+			}
+			select {
+			case results <- candidateGatherResult{cand: cand, cleanup: cleanup, method: method}:
+			case <-ctx.Done():
+				if cleanup != nil {
+					cleanup()
+				}
+			}
+		}()
+
+		for received := 0; received < 2; {
+			select {
+			case result := <-results:
+				received++
+				if len(result.mapped) > 0 {
+					unique := map[string]struct{}{}
+					for _, a := range result.mapped {
+						s := a.String()
+						unique[s] = struct{}{}
+						observations = append(observations, s)
+						set["srflx|"+s] = signalCandidate{Addr: s, Type: "srflx"}
+					}
+					if len(unique) == 1 {
+						behavior = "stable"
+					} else {
+						behavior = "endpoint-dependent"
+					}
+				}
+				if result.cand.Addr != "" {
+					set["portmap|"+result.cand.Addr] = result.cand
+					mappings = append(mappings, result.method+" "+result.cand.Addr)
+					p.addCleanup(result.cleanup)
+				}
+			case <-ctx.Done():
+				received = 2
+			}
 		}
 	}
 
@@ -296,50 +337,93 @@ func candidateRank(c signalCandidate) int {
 	return 6
 }
 
-// stunMappedAddresses 对同一个 UDP socket 查询多个 STUN endpoint。
-// 如果不同目标看到不同公网端口，说明单个 srflx 不能代表所有目标的真实映射。
-func stunMappedAddresses(conn *net.UDPConn) []*net.UDPAddr {
+// stunMappedAddressesContext 会先并行发出多个 STUN Binding Request，再在同一 UDP
+// socket 上用 transaction ID 分流响应。总耗时由 ctx 控制，不再按 server 串行叠加超时。
+func stunMappedAddressesContext(ctx context.Context, conn *net.UDPConn) []*net.UDPAddr {
 	servers := []string{
 		"stun.cloudflare.com:3478",
 		"stun.l.google.com:19302",
 		"stun1.l.google.com:19302",
 	}
-	var out []*net.UDPAddr
-	seen := map[string]struct{}{}
+	type transactionID [stun.TransactionIDSize]byte
+	pending := make(map[transactionID]struct{})
+
 	for _, server := range servers {
-		addr, err := net.ResolveUDPAddr("udp4", server)
+		addr, err := resolveUDP4Context(ctx, server)
 		if err != nil {
 			continue
 		}
 		req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-		_ = conn.SetDeadline(time.Now().Add(900 * time.Millisecond))
+		var id transactionID
+		copy(id[:], req.TransactionID[:])
 		if _, err := conn.WriteToUDP(req.Raw, addr); err != nil {
 			continue
 		}
-		buf := make([]byte, 2048)
-		for {
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				break
-			}
-			res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
-			if err := res.Decode(); err != nil || res.TransactionID != req.TransactionID {
-				continue
-			}
-			var xor stun.XORMappedAddress
-			if err := xor.GetFrom(res); err != nil {
-				continue
-			}
-			mapped := &net.UDPAddr{IP: xor.IP, Port: xor.Port}
-			if _, ok := seen[mapped.String()]; !ok {
-				seen[mapped.String()] = struct{}{}
-				out = append(out, mapped)
-			}
+		pending[id] = struct{}{}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(candidateGatherBudget)
+	}
+	_ = conn.SetReadDeadline(deadline)
+	defer conn.SetReadDeadline(time.Time{})
+
+	var out []*net.UDPAddr
+	seen := map[string]struct{}{}
+	buf := make([]byte, 2048)
+	for len(pending) > 0 {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
 			break
 		}
+		res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if err := res.Decode(); err != nil {
+			continue
+		}
+		var id transactionID
+		copy(id[:], res.TransactionID[:])
+		if _, ok := pending[id]; !ok {
+			continue
+		}
+		delete(pending, id)
+
+		var xor stun.XORMappedAddress
+		if err := xor.GetFrom(res); err != nil {
+			continue
+		}
+		mapped := &net.UDPAddr{IP: xor.IP, Port: xor.Port}
+		if _, ok := seen[mapped.String()]; !ok {
+			seen[mapped.String()] = struct{}{}
+			out = append(out, mapped)
+		}
 	}
-	_ = conn.SetDeadline(time.Time{})
 	return out
+}
+
+func resolveUDP4Context(ctx context.Context, server string) (*net.UDPAddr, error) {
+	host, portText, err := net.SplitHostPort(server)
+	if err != nil {
+		return nil, err
+	}
+	port, err := net.LookupPort("udp", portText)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("STUN DNS lookup failed")
+	}
+	return &net.UDPAddr{IP: ips[0], Port: port}, nil
+}
+
+func stunMappedAddresses(conn *net.UDPConn) []*net.UDPAddr {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateGatherBudget)
+	defer cancel()
+	return stunMappedAddressesContext(ctx, conn)
 }
 
 func stunMappedAddress(conn *net.UDPConn) (*net.UDPAddr, error) {
