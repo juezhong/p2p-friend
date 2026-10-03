@@ -548,8 +548,13 @@ func (s *peerSession) status() {
 				consolePrintf("  - %s\n", addr)
 			}
 		}
-		consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
-			maxInt(0, info.DataConnections-1), info.DataConnections)
+		if info.ControlOnlyPrimary {
+			consolePrintf("QUIC connections: control-only=1, data-only=%d, total=%d\n",
+				info.DataConnections, info.DataConnections+1)
+		} else {
+			consolePrintf("QUIC connections: control/data-primary=1, data-stripes=%d, total=%d\n",
+				maxInt(0, info.DataConnections-1), info.DataConnections)
+		}
 		consolePrintf("Data streams: %d\n", info.Streams)
 		if len(info.DataPaths) > 0 {
 			consolePrintln("Data UDP flows:")
@@ -557,7 +562,11 @@ func (s *peerSession) status() {
 				consolePrintf("  - %s\n", path)
 			}
 		}
-		consolePrintln("端口关系: 主 QUIC 继续复用打洞 UDP socket；额外 data stripe 优先使用独立 UDP source port，失败时自动回退共享 socket。")
+		if info.ControlOnlyPrimary {
+			consolePrintln("端口关系: 主 QUIC 仅维持控制/RPC/ACK；文件数据只走可重建 data-only QUIC，单条失败不会关闭主会话。")
+		} else {
+			consolePrintln("端口关系: 主 QUIC 继续复用打洞 UDP socket；额外 data stripe 优先使用独立 UDP source port，失败时自动回退共享 socket。")
+		}
 	} else {
 		consolePrintf("连接: %s <-> %s\n", s.conn.LocalAddr(), s.conn.RemoteAddr())
 	}
