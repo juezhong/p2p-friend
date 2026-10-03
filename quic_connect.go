@@ -51,7 +51,9 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 		select {
 		case results <- quicConnectResult{conn: conn, err: err, outbound: true}:
 		case <-ctx.Done():
-			if conn != nil {
+			if loser, ok := conn.(*rtcConn); ok {
+				_ = loser.closeQUICOnly("connection race canceled")
+			} else if conn != nil {
 				_ = conn.Close()
 			}
 		}
@@ -75,7 +77,11 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 			preferred := res.outbound == preferOutbound
 			if preferred {
 				if fallback != nil {
-					_ = fallback.Close()
+					if loser, ok := fallback.(*rtcConn); ok {
+						_ = loser.closeQUICOnly("preferred path won")
+					} else {
+						_ = fallback.Close()
+					}
 				}
 				cancel()
 				return res.conn, nil
@@ -84,7 +90,11 @@ func (p *rtcPeer) connectQUIC() (net.Conn, error) {
 				fallback = res.conn
 				fallbackTimer = time.After(pathPreferenceWindow)
 			} else {
-				_ = res.conn.Close()
+				if loser, ok := res.conn.(*rtcConn); ok {
+					_ = loser.closeQUICOnly("another path won")
+				} else {
+					_ = res.conn.Close()
+				}
 			}
 		case <-fallbackTimer:
 			if fallback != nil {
@@ -157,7 +167,9 @@ func (p *rtcPeer) startAcceptWorkers(ctx context.Context, results chan<- quicCon
 					select {
 					case results <- quicConnectResult{conn: conn, err: err, outbound: false}:
 					case <-ctx.Done():
-						if conn != nil {
+						if loser, ok := conn.(*rtcConn); ok {
+							_ = loser.closeQUICOnly("connection race canceled")
+						} else if conn != nil {
 							_ = conn.Close()
 						}
 					}
