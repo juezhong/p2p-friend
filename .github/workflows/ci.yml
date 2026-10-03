@@ -51,3 +51,25 @@ jobs:
 
       - name: Build macOS arm64
         run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /tmp/p2p-friend-darwin-arm64 .
+
+  windows-long-transfer:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Sustained QUIC transfer
+        shell: pwsh
+        env:
+          P2PF_LONG_TRANSFER_TEST: "1"
+        run: go test -run TestQUICLoopbackParallelTransfer -count=1 -timeout=8m .

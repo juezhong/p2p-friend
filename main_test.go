@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -455,6 +456,99 @@ func newMultiLaneSessionPair(t *testing.T, aCwd, bCwd string) (*peerSession, *pe
 	return a, b
 }
 
+
+type failWriteLane struct {
+	io.ReadWriteCloser
+	once sync.Once
+}
+
+func (f *failWriteLane) Write(p []byte) (int, error) {
+	failed := false
+	f.once.Do(func() { failed = true })
+	if failed {
+		return 0, errors.New("injected data lane write failure")
+	}
+	return f.ReadWriteCloser.Write(p)
+}
+
+func newFailingLaneSessionPair(t *testing.T, aCwd, bCwd string) (*peerSession, *peerSession) {
+	t.Helper()
+	ca, cb := net.Pipe()
+	aLanes := make([]io.ReadWriteCloser, 0, parallelLanes)
+	bLanes := make([]io.ReadWriteCloser, 0, parallelLanes)
+	for i := 0; i < parallelLanes; i++ {
+		la, lb := net.Pipe()
+		if i == 0 {
+			aLanes = append(aLanes, &failWriteLane{ReadWriteCloser: la})
+		} else {
+			aLanes = append(aLanes, la)
+		}
+		bLanes = append(bLanes, lb)
+	}
+	a := initPeerSession(&multiLaneTestConn{Conn: ca, lanes: aLanes}, "A", aCwd)
+	b := initPeerSession(&multiLaneTestConn{Conn: cb, lanes: bLanes}, "B", bCwd)
+	go a.readLoop()
+	go b.readLoop()
+	return a, b
+}
+
+func TestDataLaneFailureDegradesWithoutClosingSession(t *testing.T) {
+	aLocal := t.TempDir()
+	bLocal := t.TempDir()
+
+	payload := bytes.Repeat([]byte("lane-fallback-"), 1024*1024)
+	if err := os.WriteFile(filepath.Join(aLocal, "source.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, b := newFailingLaneSessionPair(t, aLocal, bLocal)
+	defer a.close(false)
+	defer b.close(false)
+
+	if err := a.put("source.bin", "received.bin"); err != nil {
+		t.Fatalf("transfer should survive one failed data lane: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(bLocal, "received.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("fallback transfer payload mismatch")
+	}
+
+	select {
+	case <-a.closed:
+		t.Fatal("sender session closed after data-lane degradation")
+	default:
+	}
+	select {
+	case <-b.closed:
+		t.Fatal("receiver session closed after data-lane degradation")
+	default:
+	}
+}
+
+func TestSustainedTransferProfileBoundsWindowsPressure(t *testing.T) {
+	p := sustainedTransferProfile("windows", 4)
+	if p.lanes != 2 {
+		t.Fatalf("windows sustained lanes=%d want=2", p.lanes)
+	}
+	if p.chunkSize != 128*1024 {
+		t.Fatalf("windows sustained chunk=%d want=%d", p.chunkSize, 128*1024)
+	}
+	if p.pace <= 0 {
+		t.Fatalf("windows sustained pacing=%v want >0", p.pace)
+	}
+	if got := p.lanes * sendQueueDepthPerLane * p.chunkSize; got > 2*1024*1024 {
+		t.Fatalf("windows application send queue too large: %d", got)
+	}
+
+	linux := sustainedTransferProfile("linux", 4)
+	if linux.lanes != 4 || linux.chunkSize != maxDataChunkSize || linux.pace != 0 {
+		t.Fatalf("unexpected linux sustained profile: %#v", linux)
+	}
+}
+
 func TestParallelDataLanesTransferAndHash(t *testing.T) {
 	aLocal := t.TempDir()
 	bLocal := t.TempDir()
@@ -808,6 +902,11 @@ func TestQUICLoopbackParallelTransfer(t *testing.T) {
 	hostDir := t.TempDir()
 	joinDir := t.TempDir()
 	payload := bytes.Repeat([]byte("quic-parallel-payload-"), 180000)
+	if os.Getenv("P2PF_LONG_TRANSFER_TEST") == "1" {
+		// Windows 真机 CI 使用持续大文件压测 QUIC/UDP 发送队列。
+		// 128 MiB 足以跨过短 burst 阶段，同时保持 CI 时间和磁盘占用可控。
+		payload = bytes.Repeat([]byte{0x5a}, 128*1024*1024)
+	}
 	if err := os.WriteFile(filepath.Join(joinDir, "source.bin"), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}

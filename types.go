@@ -165,6 +165,8 @@ type peerSession struct {
 	closed           chan struct{}
 	closeOnce        sync.Once
 	transportErrOnce sync.Once
+	transportErrMu   sync.Mutex
+	transportErr     error
 	closing          atomic.Bool
 	remoteBye        atomic.Bool
 
