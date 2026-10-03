@@ -33,6 +33,7 @@ func newPeer(server bool) (*rtcPeer, error) {
 		return nil, err
 	}
 	p := &rtcPeer{token: token, server: server, cert: cert}
+	p.setLocalCapabilities(signalCapabilitiesCurrent)
 	sum := sha256.Sum256(der)
 	p.localFingerprint = append([]byte(nil), sum[:]...)
 	if server {
@@ -212,9 +213,15 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 			addrs, _ := iface.Addrs()
 			for _, raw := range addrs {
 				var ip net.IP
+				var prefixBits uint8
+				var prefixKnown bool
 				switch v := raw.(type) {
 				case *net.IPNet:
 					ip = v.IP
+					if ones, bits := v.Mask.Size(); ones >= 0 && (bits == 32 || bits == 128) {
+						prefixBits = uint8(ones)
+						prefixKnown = true
+					}
 				case *net.IPAddr:
 					ip = v.IP
 				}
@@ -228,7 +235,7 @@ func gatherCandidates(p *rtcPeer) []signalCandidate {
 					continue
 				}
 				addr := net.JoinHostPort(ip.String(), fmt.Sprint(port))
-				set["host|"+addr] = signalCandidate{Addr: addr, Type: "host"}
+				set["host|"+addr] = signalCandidate{Addr: addr, Type: "host", PrefixBits: prefixBits, PrefixKnown: prefixKnown}
 			}
 		}
 		if ep.family == 4 {
