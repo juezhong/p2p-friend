@@ -86,6 +86,7 @@ type rtcPeer struct {
 	cleanups  []func()
 
 	server    bool
+	primaryAcceptWG sync.WaitGroup
 	closeOnce sync.Once
 }
 
