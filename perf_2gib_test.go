@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -280,4 +282,39 @@ func perfTimeTransfer(t *testing.T, direction string, size int64, fn func() erro
 	t.Logf("P2PF_PERF %s: %.2f MiB/s; %.3fs; Go allocations %.1f MiB; GC %d",
 		direction, result.MiBPerSecond, result.Seconds, result.AllocatedMiB, result.NumGC)
 	return result
+}
+
+func TestResilientSlidingCancellationDoesNotWaitForUnavailableLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	managerCtx, managerCancel := context.WithCancel(context.Background())
+	defer managerCancel()
+	manager := &resilientStripeState{
+		ctx: managerCtx,
+		notify: make(chan struct{}, 1),
+		slots: make(map[int]*managedDataLane),
+	}
+	path := filepath.Join(t.TempDir(), "source.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x5a}, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &peerSession{
+		closed: make(chan struct{}),
+		pendingAck: make(map[uint64]*transferAckState),
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.sendFileResilientSliding(ctx, manager, 1, 1, path, 1<<20, &progress{Silent: true})
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sendFileResilientSliding failed to stop after context cancellation")
+	}
 }
