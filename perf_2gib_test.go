@@ -142,8 +142,12 @@ func TestPerfQUIC2GiBLoopback(t *testing.T) {
 		t.Fatalf("data QUICs did not use distinct UDP source ports: %v", ports)
 	}
 
-	hostDir := t.TempDir()
-	joinDir := t.TempDir()
+	// macOS 的 /var 常是指向 /private/var 的符号链接。
+	// 此处规范化测试沙箱根目录，以测试实际 QUIC 传输，而不绕过生产路径安全检查。
+	hostDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil { t.Fatal(err) }
+	joinDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil { t.Fatal(err) }
 
 	generationStarted := time.Now()
 	sourceFile := filepath.Join(joinDir, "source.bin")
