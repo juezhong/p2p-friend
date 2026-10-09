@@ -97,7 +97,6 @@ jobs:
 
 
   perf-2gib-loopback:
-    # 在已有 CI PR 触发器下执行跨系统环回性能测试。
     name: 2GiB QUIC ${{ matrix.os }} loopback
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -124,17 +123,9 @@ jobs:
           go env GOOS GOARCH
           python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
       - name: Run 2 GiB PUT + GET performance regression
-        run: go test -run '^TestPerfQUIC2GiBLoopback      - name: Upload performance results and CPU profiles
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: p2pf-performance-${{ matrix.os }}
-          path: ${{ runner.temp }}/p2pf-performance/
-          if-no-files-found: warn
-          retention-days: 14
- -count=1 -timeout=40m -v .
         env:
           P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
+        run: go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=40m -v .
       - name: Upload performance results and CPU profiles
         if: always()
         uses: actions/upload-artifact@v4
