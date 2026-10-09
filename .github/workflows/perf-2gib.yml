@@ -23,7 +23,6 @@ jobs:
     env:
       P2PF_PERF_TEST: '1'
       P2PF_PERF_BYTES: '2147483648'
-      P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -38,7 +37,17 @@ jobs:
       - name: Download dependencies
         run: go mod download
       - name: Transfer 2 GiB both directions
-        run: go test -run '^TestPerfQUIC2GiBLoopback$' -count=1 -timeout=40m -v .
+        run: go test -run '^TestPerfQUIC2GiBLoopback      - name: Upload performance data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ matrix.os }}
+          path: ${{ runner.temp }}/p2pf-performance/
+          if-no-files-found: warn
+          retention-days: 14
+ -count=1 -timeout=40m -v .
+        env:
+          P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
       - name: Upload performance data
         if: always()
         uses: actions/upload-artifact@v4
