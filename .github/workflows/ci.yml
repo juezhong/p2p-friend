@@ -94,3 +94,43 @@ jobs:
         env:
           P2PF_LONG_TRANSFER_TEST: "1"
         run: go test -run TestQUICLoopbackParallelTransfer -count=1 -timeout=8m .
+
+
+  perf-2gib-loopback:
+    # 在已有 CI PR 触发器下执行跨系统环回性能测试。
+    name: 2GiB QUIC ${{ matrix.os }} loopback
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      P2PF_PERF_TEST: "1"
+      P2PF_PERF_BYTES: "2147483648"
+      P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Download dependencies
+        run: go mod download
+      - name: Record runner environment
+        run: |
+          go version
+          go env GOOS GOARCH
+          python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
+      - name: Run 2 GiB PUT + GET performance regression
+        run: go test -run '^TestPerfQUIC2GiBLoopback$' -count=1 -timeout=40m -v .
+      - name: Upload performance results and CPU profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2pf-performance-${{ matrix.os }}
+          path: ${{ runner.temp }}/p2pf-performance/
+          if-no-files-found: warn
+          retention-days: 14
