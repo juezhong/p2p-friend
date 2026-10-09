@@ -110,6 +110,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -122,10 +124,26 @@ jobs:
           go version
           go env GOOS GOARCH
           python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
-      - name: Run 2 GiB PUT + GET performance regression
+      - name: A/B 2 GiB transfer on same runner (A-B-B-A)
+        shell: bash
         env:
-          P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
-        run: go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=40m -v .
+          P2PF_PERF_BASELINE_SHA: "5f95d303aa82394d70e8d434a65e1d5d3d4c4d36"
+        run: |
+          set -euo pipefail
+          git cat-file -e "${P2PF_PERF_BASELINE_SHA}:data.go"
+          iteration=0
+          for variant in baseline optimized optimized baseline; do
+            iteration=$((iteration + 1))
+            echo "=== P2PF_AB_BEGIN iteration=${iteration} variant=${variant} ==="
+            if [ "${variant}" = baseline ]; then
+              git show "${P2PF_PERF_BASELINE_SHA}:data.go" > data.go
+            else
+              git show "HEAD:data.go" > data.go
+            fi
+            P2PF_PERF_ARTIFACT_DIR="${{ runner.temp }}/p2pf-performance/${iteration}-${variant}" \
+              go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=40m -v .
+            echo "=== P2PF_AB_END iteration=${iteration} variant=${variant} ==="
+          done
       - name: Upload performance results and CPU profiles
         if: always()
         uses: actions/upload-artifact@v4
