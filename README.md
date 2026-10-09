@@ -306,6 +306,10 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o p2p-friend-darwin-arm64 .
 
 仓库根目录的 `VERSION` 保存当前发布版本。版本 PR 合并到 `main` 后，GitHub Actions 自动测试并发布：
 
+**v0.16.4**：修复 v0.16 发送 worker 故障路径中的取消/等待顺序，移除接收端一处整块数据复制，保持既有 QUIC Stream 和 SHA-256 可靠传输流程不变。三平台均完成 2 GiB 同机 PUT/GET 校验；同机 ABBA 的 PUT 观察结果为 Linux +21.3%、macOS +13.9%，Windows +1.4%（没有稳定提速结论）。这些不是与 v0.16.3 的版本间性能对比，亦不代表跨机器的公网速度。详情及全部 PUT/GET 数据见 [v0.16.4 发行说明](docs/releases/v0.16.4.md)。
+
+重型 2 GiB 性能回归现改为手动触发 `P2P 2 GiB performance`；日常 CI 继续自动执行常规单测、Race Detector、跨平台构建及长传输回归。
+
 ```text
 p2p-friend-linux-amd64
 p2p-friend-linux-arm64
