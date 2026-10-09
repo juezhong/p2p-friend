@@ -56,6 +56,8 @@ func TestPerfQUIC2GiBLoopback(t *testing.T) {
 		}
 		size = v
 	}
+	// 输出前置元数据：即使长传输超时，CI 日志也能记录测试规模和平台。
+	t.Logf("P2PF_PERF_START os=%s arch=%s go=%s bytes=%d cpus=%d", runtime.GOOS, runtime.GOARCH, runtime.Version(), size, runtime.NumCPU())
 	host, err := newPeer(true)
 	if err != nil {
 		t.Fatal(err)
