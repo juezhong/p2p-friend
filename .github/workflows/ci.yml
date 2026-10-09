@@ -124,31 +124,88 @@ jobs:
           go version
           go env GOOS GOARCH
           python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
-      - name: A/B 2 GiB transfer on same runner (A-B-B-A)
-        shell: bash
+      - name: Single 2 GiB PUT + GET regression
         env:
-          P2PF_PERF_BASELINE_SHA: "5f95d303aa82394d70e8d434a65e1d5d3d4c4d36"
-        run: |
-          set -euo pipefail
-          git cat-file -e "${P2PF_PERF_BASELINE_SHA}:data.go"
-          iteration=0
-          for variant in baseline optimized optimized baseline; do
-            iteration=$((iteration + 1))
-            echo "=== P2PF_AB_BEGIN iteration=${iteration} variant=${variant} ==="
-            if [ "${variant}" = baseline ]; then
-              git show "${P2PF_PERF_BASELINE_SHA}:data.go" > data.go
-            else
-              git show "HEAD:data.go" > data.go
-            fi
-            P2PF_PERF_ARTIFACT_DIR="${{ runner.temp }}/p2pf-performance/${iteration}-${variant}" \
-              go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=40m -v .
-            echo "=== P2PF_AB_END iteration=${iteration} variant=${variant} ==="
-          done
+          P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
+        run: go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=40m -v .
       - name: Upload performance results and CPU profiles
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: p2pf-performance-${{ matrix.os }}
           path: ${{ runner.temp }}/p2pf-performance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-perf-diagnostics:
+    # M2: Observe bottlenecks before changing WinSock/QUIC parameters.
+    name: Windows 2GiB transfer profiling (M2)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      P2PF_PERF_TEST: "1"
+      P2PF_PERF_BYTES: "2147483648"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Download dependencies
+        run: go mod download
+      - name: Runner details and UDP baseline
+        shell: pwsh
+        env:
+          P2PF_DIAG_ROOT: ${{ runner.temp }}/p2pf-windows-diag
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:P2PF_DIAG_ROOT | Out-Null
+          go version
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber | Format-List
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors | Format-List
+          netstat -s -p udp | Out-File (Join-Path $env:P2PF_DIAG_ROOT "udp-before.txt") -Encoding utf8
+      - name: Windows repeat 2GiB PUT/GET with block mutex and heap profiles
+        shell: pwsh
+        env:
+          P2PF_DIAG_ROOT: ${{ runner.temp }}/p2pf-windows-diag
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($i in 1..2) {
+            $dir = Join-Path $env:P2PF_DIAG_ROOT "repeat-$i"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $env:P2PF_PERF_ARTIFACT_DIR = $dir
+            Write-Output "=== P2PF_WINDOWS_M2_BEGIN repeat=$i commit=$env:GITHUB_SHA ==="
+            & go test -run TestPerfQUIC2GiBLoopback -count=1 -timeout=15m -v -blockprofile (Join-Path $dir "block.pprof") -blockprofilerate=1000000 -mutexprofile (Join-Path $dir "mutex.pprof") -mutexprofilefraction=10 -memprofile (Join-Path $dir "heap.pprof") .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Output "=== P2PF_WINDOWS_M2_END repeat=$i ==="
+          }
+      - name: Extract CPU and blocking hotspot tables
+        if: always()
+        shell: pwsh
+        env:
+          P2PF_DIAG_ROOT: ${{ runner.temp }}/p2pf-windows-diag
+        run: |
+          if (!(Test-Path $env:P2PF_DIAG_ROOT)) { exit 0 }
+          netstat -s -p udp | Out-File (Join-Path $env:P2PF_DIAG_ROOT "udp-after.txt") -Encoding utf8
+          Get-ChildItem -Path $env:P2PF_DIAG_ROOT -Recurse -Filter "*.pprof" | ForEach-Object {
+            $profile = $_.FullName
+            Write-Output "=== P2PF_PROFILE $profile ==="
+            $top = & go tool pprof -top -cum -nodecount=30 $profile 2>&1
+            $top | Out-File ($profile + ".cum.txt") -Encoding utf8
+            if ($_.Name -match "cpu|block|mutex") { $top | Select-Object -First 35 }
+          }
+          Get-ChildItem -Path $env:P2PF_DIAG_ROOT -Recurse -Filter "result.json" | ForEach-Object {
+            $json = Get-Content $_.FullName -Raw | ConvertFrom-Json
+            foreach ($transfer in $json.transfers) {
+              Write-Output ("P2PF_WINDOWS_M2_RESULT dir={0} mibps={1:N2} alloc_mib={2:N1} gc={3}" -f $transfer.direction, $transfer.mib_per_second, $transfer.allocated_mib, $transfer.num_gc)
+            }
+          }
+      - name: Upload Windows M2 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2pf-windows-m2-profiles
+          path: ${{ runner.temp }}/p2pf-windows-diag/
           if-no-files-found: warn
           retention-days: 14
