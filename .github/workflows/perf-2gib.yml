@@ -1,0 +1,44 @@
+name: P2P 2 GiB performance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  same-os-loopback:
+    name: ${{ matrix.os }} / QUIC loopback / 2 GiB
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      P2PF_PERF_TEST: '1'
+      P2PF_PERF_BYTES: '2147483648'
+      P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Record environment
+        run: |
+          go version
+          go env GOOS GOARCH
+          python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
+      - name: Download dependencies
+        run: go mod download
+      - name: Transfer 2 GiB both directions
+        run: go test -run '^TestPerfQUIC2GiBLoopback$' -count=1 -timeout=40m -v .
+      - name: Upload performance data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ matrix.os }}
+          path: ${{ runner.temp }}/p2pf-performance/
+          if-no-files-found: warn
+          retention-days: 14
