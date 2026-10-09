@@ -108,7 +108,6 @@ jobs:
     env:
       P2PF_PERF_TEST: "1"
       P2PF_PERF_BYTES: "2147483648"
-      P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,7 +124,17 @@ jobs:
           go env GOOS GOARCH
           python -c "import platform,os; print(platform.platform(), platform.processor(), os.cpu_count())"
       - name: Run 2 GiB PUT + GET performance regression
-        run: go test -run '^TestPerfQUIC2GiBLoopback$' -count=1 -timeout=40m -v .
+        run: go test -run '^TestPerfQUIC2GiBLoopback      - name: Upload performance results and CPU profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2pf-performance-${{ matrix.os }}
+          path: ${{ runner.temp }}/p2pf-performance/
+          if-no-files-found: warn
+          retention-days: 14
+ -count=1 -timeout=40m -v .
+        env:
+          P2PF_PERF_ARTIFACT_DIR: ${{ runner.temp }}/p2pf-performance
       - name: Upload performance results and CPU profiles
         if: always()
         uses: actions/upload-artifact@v4
