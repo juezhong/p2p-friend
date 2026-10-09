@@ -803,8 +803,15 @@ func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
 		}
 
 		buf := acquireDataBuffer()
-		copy(buf[:headerSize], header)
-		if _, err := io.ReadFull(lane, buf[headerSize:headerSize+want]); err != nil {
+		// v0.16 的 wire header 为 28 字节，但入站重排/写盘统一从
+		// dataHeaderSize (20) 开始读取 payload。直接读到最终位置，
+		// 避免每个 128 KiB–1 MiB chunk 再复制一遍完整 payload。
+		payloadStart := dataHeaderSize
+		if !v16 {
+			// Legacy data frames still carry their 20-byte header in the buffer.
+			copy(buf[:headerSize], header)
+		}
+		if _, err := io.ReadFull(lane, buf[payloadStart:payloadStart+want]); err != nil {
 			releaseDataBuffer(buf)
 			if rc, ok := s.conn.(*rtcConn); ok && rc.ResilientDataV16() {
 				if st := resilientStripeStateFor(rc); st != nil {
@@ -817,9 +824,6 @@ func (s *peerSession) dataLaneReadLoop(lane io.ReadWriteCloser) {
 		}
 		var err error
 		if v16 {
-			// 统一把 payload 对齐到旧的 pooled buffer dataHeaderSize 位置，
-			// 这样接收重排/写盘路径无需复制第二次。
-			copy(buf[dataHeaderSize:dataHeaderSize+want], buf[headerSize:headerSize+want])
 			err = s.handleTransferDataOwnedV16(id, fileID, offset, buf, want)
 		} else {
 			err = s.handleTransferDataOwned(id, offset, buf, want)

@@ -917,7 +917,6 @@ func (s *peerSession) sendFileResilientSliding(
 	jobs := make(chan resilientSendChunk, queueDepth)
 	errCh := make(chan error, resilientDataLanes)
 	sendCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
 
 	var workers sync.WaitGroup
 	for worker := 0; worker < resilientDataLanes; worker++ {
@@ -951,6 +950,9 @@ func (s *peerSession) sendFileResilientSliding(
 		}(worker)
 	}
 	defer func() {
+		// 必须先取消阻塞在 lane / flow-control 上的 worker，再等待退出。
+		// 原来 defer 的逆序执行会让故障路径永远停在 workers.Wait()。
+		cancel(nil)
 		close(jobs)
 		workers.Wait()
 	}()
